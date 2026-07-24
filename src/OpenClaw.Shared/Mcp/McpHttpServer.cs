@@ -65,6 +65,7 @@ public sealed class McpHttpServer : IDisposable, IAsyncDisposable
     private readonly int _port;
     private readonly IOpenClawLogger _logger;
     private readonly HttpListener _listener;
+    private readonly Action<HttpListenerResponse, HttpStatusCode, string, string> _writeText;
     /// <summary>
     /// Required bearer token for HTTP requests. Empty/null disables auth (the
     /// pre-auth contract — kept so existing dev configs keep working). When set,
@@ -86,9 +87,20 @@ public sealed class McpHttpServer : IDisposable, IAsyncDisposable
     public string Endpoint => $"http://127.0.0.1:{_port}/";
 
     public McpHttpServer(McpToolBridge bridge, int port, IOpenClawLogger logger, string? authToken = null)
+        : this(bridge, port, logger, authToken, WriteText)
+    {
+    }
+
+    internal McpHttpServer(
+        McpToolBridge bridge,
+        int port,
+        IOpenClawLogger logger,
+        string? authToken,
+        Action<HttpListenerResponse, HttpStatusCode, string, string> writeText)
     {
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _writeText = writeText ?? throw new ArgumentNullException(nameof(writeText));
         _port = port;
         _authToken = string.IsNullOrEmpty(authToken) ? null : authToken;
         _listener = new HttpListener();
@@ -179,10 +191,14 @@ public sealed class McpHttpServer : IDisposable, IAsyncDisposable
             // ObjectDisposedException into an unobserved task, which surfaces
             // through global unhandled-exception handlers.
             try { _handlerLimiter.Release(); }
-            // slopwatch-ignore: SW003 Shutdown cancellation or disposal is expected and the caller already preserves the safe state.
-            catch (ObjectDisposedException) { /* server torn down */ }
-            // slopwatch-ignore: SW003 Shutdown cancellation or disposal is expected and the caller already preserves the safe state.
-            catch (SemaphoreFullException) { /* defensive */ }
+            catch (ObjectDisposedException) { /* Server torn down during request; expected. */ }
+            catch (SemaphoreFullException ex)
+            {
+                // Release-without-Acquire indicates a real bug (counting imbalance);
+                // promote to Warn so it surfaces in production diagnostics. Include
+                // ex.ToString() to capture the stack since Warn has no ex overload.
+                _logger.Warn($"[MCP] Handler limiter release was already at max — possible release/acquire imbalance: {ex}");
+            }
         }
     }
 
@@ -203,6 +219,7 @@ public sealed class McpHttpServer : IDisposable, IAsyncDisposable
         // values (e.g. enter the auth branch with the old token, then compare
         // against the new one — or vice versa).
         var authToken = Volatile.Read(ref _authToken);
+        McpToolBridge.McpTransportResponse? transportResponse = null;
         try
         {
             // CSRF/browser gate — reject anything carrying a browser Origin.
@@ -250,7 +267,7 @@ public sealed class McpHttpServer : IDisposable, IAsyncDisposable
             {
                 // Friendly probe response — useful for confirming the server is up
                 // from a curl/browser without hitting the JSON-RPC endpoint.
-                WriteText(ctx.Response, HttpStatusCode.OK,
+                _writeText(ctx.Response, HttpStatusCode.OK,
                     $"OpenClaw MCP server. POST JSON-RPC to {Endpoint}", "text/plain");
                 return;
             }
@@ -298,10 +315,11 @@ public sealed class McpHttpServer : IDisposable, IAsyncDisposable
                 return;
             }
 
-            string? responseBody;
             try
             {
-                responseBody = await _bridge.HandleRequestAsync(body, ct).ConfigureAwait(false);
+                transportResponse = await _bridge
+                    .HandleTransportRequestAsync(body, ct)
+                    .ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -309,23 +327,25 @@ public sealed class McpHttpServer : IDisposable, IAsyncDisposable
                 return;
             }
 
-            if (responseBody == null)
+            if (transportResponse.Body == null)
             {
                 // Notification — JSON-RPC says no body. 204 is the most honest signal.
                 ctx.Response.StatusCode = (int)HttpStatusCode.NoContent;
                 ctx.Response.Close();
+                transportResponse.CompleteDelivery();
                 return;
             }
 
-            WriteText(ctx.Response, HttpStatusCode.OK, responseBody, "application/json");
+            _writeText(ctx.Response, HttpStatusCode.OK, transportResponse.Body, "application/json");
+            transportResponse.CompleteDelivery();
         }
         catch (Exception ex)
         {
+            transportResponse?.CompleteDelivery(ex.GetType());
             _logger.Error("[MCP] Request failed", ex);
             // Response may already be partially written or closed; swallow.
             try { Reject(ctx, HttpStatusCode.InternalServerError, "internal error"); }
-            // slopwatch-ignore: SW003 Cleanup is best-effort; failure cannot improve caller state and the original outcome is preserved.
-            catch { /* response already disposed */ }
+            catch (Exception rejEx) { _logger.Debug($"[MCP] Reject after handler error failed (response already disposed?): {rejEx.Message}"); }
         }
     }
 
@@ -393,11 +413,17 @@ public sealed class McpHttpServer : IDisposable, IAsyncDisposable
         }
     }
 
-    private static void Reject(HttpListenerContext ctx, HttpStatusCode status, string reason)
+    private void Reject(HttpListenerContext ctx, HttpStatusCode status, string reason)
     {
-        try { WriteText(ctx.Response, status, reason, "text/plain"); }
-        // slopwatch-ignore: SW003 Cleanup is best-effort; failure cannot improve caller state and the original outcome is preserved.
-        catch { /* response already disposed */ }
+        try { _writeText(ctx.Response, status, reason, "text/plain"); }
+        catch (Exception ex)
+        {
+            // Response may already be disposed; a failed write means the client
+            // already disconnected. Most Reject call sites are validation paths
+            // outside a catch block, so emit a Trace breadcrumb here rather than
+            // relying on a (non-existent) outer log.
+            System.Diagnostics.Trace.WriteLine($"McpHttpServer.Reject: failed to write {(int)status} '{reason}': {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     private static void WriteText(HttpListenerResponse response, HttpStatusCode status, string body, string contentType)
@@ -428,10 +454,10 @@ public sealed class McpHttpServer : IDisposable, IAsyncDisposable
 
     private async Task StopCoreAsync(TimeSpan drainTimeout)
     {
-        // slopwatch-ignore: SW003 Cleanup is best-effort; failure cannot improve caller state and the original outcome is preserved.
-        try { _cts.Cancel(); } catch { /* already cancelled or disposed */ }
-        // slopwatch-ignore: SW003 Cleanup is best-effort; failure cannot improve caller state and the original outcome is preserved.
-        try { if (_listener.IsListening) _listener.Stop(); } catch { /* already stopped */ }
+        try { _cts.Cancel(); }
+        catch (Exception ex) { _logger.Debug($"[MCP] StopCore cts.Cancel threw: {ex.Message}"); }
+        try { if (_listener.IsListening) _listener.Stop(); }
+        catch (Exception ex) { _logger.Debug($"[MCP] StopCore listener.Stop threw: {ex.Message}"); }
 
         // Snapshot before awaiting — handlers remove themselves on completion,
         // and we don't want enumeration to race the continuation.
@@ -451,8 +477,7 @@ public sealed class McpHttpServer : IDisposable, IAsyncDisposable
         if (_acceptLoop != null)
         {
             try { await Task.WhenAny(_acceptLoop, Task.Delay(TimeSpan.FromSeconds(1))).ConfigureAwait(false); }
-            // slopwatch-ignore: SW003 Cleanup is best-effort; failure cannot improve caller state and the original outcome is preserved.
-            catch { /* loop may have errored */ }
+            catch (Exception ex) { _logger.Debug($"[MCP] Accept loop final await threw (loop may have errored): {ex.Message}"); }
         }
     }
 
@@ -511,8 +536,8 @@ public sealed class McpHttpServer : IDisposable, IAsyncDisposable
             _resourcesDisposed = true;
         }
 
-        // slopwatch-ignore: SW003 Cleanup is best-effort; failure cannot improve caller state and the original outcome is preserved.
-        try { _listener.Close(); } catch { /* already closed */ }
+        try { _listener.Close(); }
+        catch (Exception ex) { _logger.Debug($"[MCP] listener.Close during dispose threw: {ex.Message}"); }
         _cts.Dispose();
         _handlerLimiter.Dispose();
     }

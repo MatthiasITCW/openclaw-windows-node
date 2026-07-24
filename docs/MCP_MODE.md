@@ -4,7 +4,7 @@
 
 ## Summary
 
-The Windows tray app now ships a **local Model Context Protocol (MCP) server** alongside its existing OpenClaw gateway client. The same node capabilities the agent reaches over the OpenClaw gateway WebSocket — `system.run`, `screen.snapshot`, `canvas.*`, `camera.list`, `camera.snap`, `camera.clip`, `location.get`, `tts.speak`, `system.notify`, `system.execApprovals.*` — are advertised, on the same machine, as MCP tools over `http://127.0.0.1:8765/`.
+The Windows tray app now ships a **local Model Context Protocol (MCP) server** alongside its existing OpenClaw gateway client. The same node capabilities the agent reaches over the OpenClaw gateway WebSocket — `system.*`, `screen.*`, `canvas.*`, `camera.*`, `location.get`, `tts.*`, `stt.*`, `device.*`, and `browser.proxy` — are advertised, on the same machine, as MCP tools over `http://127.0.0.1:8765/`. Local-only `app.*` and `app.connection.*` tools are also exposed to MCP clients for tray automation and connection/pairing workflows; those are not registered with the remote gateway node transport.
 
 This means any local MCP client (Claude Desktop, Claude Code, Cursor, an MCP-aware CLI, a custom dev script) can reach into the running tray and drive Windows-native capabilities directly, without an OpenClaw gateway in the loop. The tray app can run in **MCP-only mode** with no gateway connection at all.
 
@@ -63,11 +63,39 @@ The capability list lives on `NodeService`, *not* on `WindowsNodeClient`. That s
 `OpenClaw.Shared/Mcp/McpToolBridge.cs` is transport-agnostic JSON-RPC 2.0. It implements:
 
 - `initialize` — protocol version `2024-11-05`, server info.
-- `tools/list` — flattens `_capabilities` into MCP tools. Tool name = command name (`"screen.snapshot"`); description = `"{category} capability: {command}"`; `inputSchema` is permissive.
+- `tools/list` — flattens `_capabilities` into MCP tools. Tool name = command name (`"screen.snapshot"`); known commands get curated descriptions from `McpToolBridge.CommandDescriptions`; unknown commands fall back to `"{category} capability: {command}"`. `inputSchema` is permissive.
 - `tools/call` — finds the capability via `INodeCapability.CanHandle(name)`, builds a `NodeInvokeRequest` (the same struct the gateway path uses), calls `ExecuteAsync`, wraps the result as MCP `content[].text`. Tool failures come back as `result.isError = true`, not JSON-RPC errors (per MCP spec — JSON-RPC errors are reserved for protocol issues).
 - `ping`, `notifications/initialized` — protocol housekeeping.
+- `notifications/cancelled` — cancels the active request whose JSON-RPC ID is
+  supplied as `params.requestId`. A cancelled `tools/call` completes with an MCP
+  tool error containing `cancelled`. If concurrent HTTP scheduling processes
+  cancellation just before an already-sent call registers, the notification
+  records a pending cancellation for five seconds. The first matching
+  registration atomically consumes that tombstone and returns `cancelled` before
+  capability execution begins, so correctness does not depend on scheduler
+  timing. Repeated notifications for the same pending ID do not extend its
+  original five-second lifetime. Pending cancellations and recent-completion
+  guards are each capped at 1,024 entries;
+  expired entries are pruned first and the oldest remaining entry is evicted at
+  capacity. Because JSON-RPC IDs are client-scoped but this stateless HTTP
+  transport has no client identity, duplicate active IDs are allowed and
+  cancellation is ignored when more than one active call matches; this prevents
+  one local client from cancelling another client when the collision is already
+  observable. Request matching uses the decoded JSON string value or normalized
+  arbitrary-precision JSON number value, while preserving the distinction
+  between string and numeric IDs. A tombstone cannot predict a later
+  cross-client ID collision, so it cancels the first matching registration;
+  complete isolation would require client identity in the transport. A recent
+  completion guard also prevents a late notification from poisoning immediate
+  ID reuse.
 
 The bridge takes a `Func<IReadOnlyList<INodeCapability>>` rather than a snapshot. Every `tools/list` re-reads the live list. This is what guarantees zero-cost capability addition — register a new capability after server start and it appears on the next `tools/list`.
+
+Cancellation is cooperative and uses the same `CancellationToken` capability
+contract as the gateway transport. Screen and camera operations propagate the
+token through recording consent/countdown, camera admission, capture waits, and
+recording shutdown. The HTTP request deadline remains a separate safety bound;
+no command-specific transport deadlines are applied.
 
 ### HTTP transport
 
@@ -100,16 +128,18 @@ public bool EnableNodeMode { get; set; }      // open WebSocket to gateway
 public bool EnableMcpServer { get; set; }     // run local MCP HTTP server
 ```
 
-| `EnableNodeMode` | `EnableMcpServer` | Result |
+| `EnableNodeMode` | `EnableMcpServer` | Behavior |
 |---|---|---|
-| off | off | Operator-only (legacy default) |
-| off | on | **MCP server only, no gateway** |
-| on | off | Gateway node, no MCP |
-| on | on | Gateway node + MCP |
+| false | false | Operator-only (legacy default) |
+| false | true | **MCP server only, no gateway** |
+| true | false | Gateway node, no MCP |
+| true | true | Gateway node + MCP |
 
 Settings UI exposes both toggles in the Advanced section, with the live MCP endpoint URL and current status (`Listening` / `Stopped — save and restart to start` / `Disabled`).
 
 A legacy `McpOnlyMode` field is migrated automatically on load and never re-written.
+
+MCP startup is reported from the actual listener state. `NodeService.McpStartupError` is populated when capability registration or the HTTP listener fails, and MCP-only startup is not treated as successful unless the loopback MCP server is running. Tray, Permissions, and Command Center surfaces show local MCP-only separately from gateway connectivity so a working local MCP listener is never presented as a gateway connection.
 
 ## Why this matters
 
@@ -150,6 +180,42 @@ The exact same node tools the OpenClaw gateway uses are now invocable by any loc
 - **Custom dev scripts.** Anything that can speak HTTP + JSON-RPC. A 30-line Python or Node helper can drive the entire capability surface.
 
 In all cases the user gets a Windows-native agent experience without OpenClaw infrastructure. They can be entirely offline w.r.t. an OpenClaw gateway and still hand the LLM a working set of "do something on my Windows box" tools.
+
+### Current command surface
+
+The canonical command descriptions live in `OpenClaw.Shared\Mcp\McpToolBridge.CommandDescriptions`; `OpenClaw.WinNode.Cli.Tests\SkillMdDriftTests` keeps `src\OpenClaw.WinNode.Cli\skill.md` in sync with that documented capability surface. The live `tools/list` output may also include newly registered capabilities with fallback descriptions before prose is updated.
+
+Gateway/node command groups currently include:
+
+- `system.notify`, `system.run`, `system.run.prepare`, `system.which`, `system.execApprovals.get`, `system.execApprovals.set`
+- `canvas.present`, `canvas.hide`, `canvas.navigate`, `canvas.eval`, `canvas.snapshot`, `canvas.a2ui.push`, `canvas.a2ui.reset`, `canvas.a2ui.dump`, `canvas.caps`, `canvas.a2ui.pushJSONL`
+- `screen.snapshot`, `screen.record`
+- `camera.list`, `camera.snap`, `camera.clip`
+- `stt.transcribe`, `stt.listen`, `stt.status`
+- `tts.speak`, `tts.status`
+- `location.get`
+- `device.info`, `device.status`
+- `browser.proxy`
+
+Local MCP-only app control commands currently include:
+
+- `app.navigate`, `app.status`, `app.sessions`, `app.agents`, `app.nodes`, `app.config.get`, `app.settings.get`, `app.settings.set`, `app.menu`, `app.search`, `app.dashboard.url`
+- Chat automation: `app.chat.snapshot`, `app.chat.send`, `app.chat.reset`
+- Connection diagnostics/automation: `app.connection.status`, `app.connection.gateways`, `app.connection.applySetupCode`, `app.connection.connectSharedToken`, `app.connection.pendingApprovals`, `app.connection.approveDevicePairing`, `app.connection.rejectDevicePairing`, `app.connection.approveNodePairing`, `app.connection.rejectNodePairing`, `app.connection.reconnect`, `app.connection.reconnectNode`
+
+For connection troubleshooting, prefer `app.connection.status` over the older
+`app.status` summary. It is read-only and returns the manager-owned
+operator/node snapshot, active gateway metadata, credential source/status,
+MCP listener state, browser-proxy shared-token caveat, pending approval commands,
+retry hints inferred from recent diagnostics, and recent diagnostic events.
+`app.connection.gateways` lists saved gateway records with credential presence
+booleans only; it never returns token values.
+
+Example chat automation smoke:
+
+```powershell
+winnode --command app.chat.send --params '{"message":"hello from local MCP"}'
+```
 
 ### Dev acceleration when building new features
 
@@ -270,6 +336,22 @@ curl -s -X POST http://127.0.0.1:8765/ `
 
 For a simpler local CLI smoke test, run `winnode --list-tools`; it loads the
 same token file automatically.
+
+For agent-driven validation, use the repo-local skill
+`.agents/skills/openclaw-proof-validation/SKILL.md`. MCP/node changes need live
+tool discovery plus invocation proof using `winnode` or raw MCP JSON-RPC.
+
+## Adding or changing node commands
+
+Every new Windows node command must remain first-class over local MCP. Register
+it in the capability path used by `NodeService`, update
+`McpToolBridge.CommandDescriptions`, update
+`src/OpenClaw.WinNode.Cli/skill.md`, and add focused tests. `SkillMdDriftTests`
+guards against drift between capabilities, MCP descriptions, and `winnode` docs.
+
+PR proof for a new command should paste `winnode --list-tools` plus the command
+invocation, or raw MCP `tools/list` plus `tools/call`; include gateway invoke
+output when gateway-mediated behavior changed and a gateway is available.
 
 For Claude Code, drop this into `.mcp.json` at the repo root or `~/.claude.json`:
 

@@ -16,6 +16,14 @@ OpenClaw.Tray.WinUI (net10.0-windows) — UI app, tray icon, pages, windows
 
 **OpenClaw.Shared** owns the low-level gateway clients (`OpenClawGatewayClient`, `WindowsNodeClient`, `WebSocketClientBase`), device identity/signing (`DeviceIdentity`), protocol models, and the `IOperatorGatewayClient` interface.
 
+`WindowsNodeClient` also owns gateway invocation lifetime at the transport
+boundary. Active invokes are registered by invoke ID in a focused cancellation
+registry, linked to the node connection lifetime, and cancelled individually by
+the gateway `node.invoke.cancel` event. Active invocations atomically transition
+to cancelled or completed when capability execution returns; whichever
+transition wins determines the protocol outcome. Capability implementations
+remain responsible for cooperative cancellation of their own underlying work.
+
 **OpenClaw.Connection** owns all connection management: `GatewayConnectionManager`, `GatewayRegistry`, `CredentialResolver`, `ConnectionStateMachine`, `NodeConnector`, `SshTunnelService/Manager`, `SetupCodeDecoder`, and all connection interfaces/DTOs/enums. This project has zero WinUI dependencies and is independently testable.
 
 **OpenClaw.Tray.WinUI** consumes the connection layer through interfaces. It never creates gateway clients directly — `GatewayConnectionManager` owns that entirely.
@@ -69,17 +77,21 @@ Inbound chat and agent timeline events must include the gateway's canonical `ses
 ## Startup wiring (App.xaml.cs)
 
 ```
-1. Create GatewayRegistry(dataDir)
-2. Create CredentialResolver(identityReader)
-3. Create GatewayClientFactory()
-4. Create NodeConnector(logger)
-5. Create SshTunnelManager(tunnelService, logger)
-6. Create GatewayConnectionManager(resolver, factory, registry, ...,
-                                    nodeConnector, tunnelManager)
-7. Subscribe to StateChanged → update tray icon + hub window
-8. Subscribe to OperatorClientChanged → wire/unwire 25+ data event handlers
-9. Subscribe to NodeConnector.ClientCreated → NodeService.AttachClient
-10. Call ConnectAsync() → connects to active gateway
+1. Create GatewayRegistry(SettingsManager.SettingsDirectoryPath)
+2. Load gateway registry from gateways.json
+3. Create CredentialResolver(DeviceIdentityFileReader.Instance)
+4. Create GatewayClientFactory()
+5. Create ConnectionDiagnostics()
+6. Create NodeConnector(logger, diagnostics)
+7. Wire NodeConnector.ClientCreated → NodeService.AttachClient
+8. Create SshTunnelService(logger)
+9. Create GatewayConnectionManager(resolver, factory, registry, logger,
+                                    identityStore, nodeConnector, node mode flag,
+                                    diagnostics, tunnelService)
+10. Subscribe to OperatorClientChanged → wire/unwire 25+ data event handlers
+11. Subscribe to StateChanged → update tray icon + hub window
+12. Ensure NodeService exists before gateway initialization
+13. Call InitializeGatewayClient() → connects to active gateway
 ```
 
 Settings changes are classified by `SettingsChangeClassifier.Classify()` which compares `ConnectionSettingsSnapshot` before/after to determine the minimum reconnect action:
@@ -114,7 +126,33 @@ Idle → Connecting → Connected
 | Connected | Error/Rejected | Degraded |
 | Connected | PairingRequired | PairingRequired |
 | Connected | Connecting | Connecting |
-| Connected | Disabled/Off | Connected |
+| Connected | Idle while Node mode is intended | Degraded |
+| Connected | Disabled/Off | Ready |
+
+`GatewayConnectionSnapshot.NodeConnectionIntended` records the Node mode intent used by the manager's state machine. If Node mode is enabled but node startup is skipped, blocked, or missing a node credential, the manager publishes a blocked node snapshot (`NodeState=Error`, `NodeError=...`) instead of leaving the node idle and letting tray surfaces report a healthy connection.
+
+### Status projection and legacy ledger
+
+`GatewayConnectionManager.CurrentSnapshot` is the lifecycle truth. Tray/UI state
+must treat `AppState.Status` / `ConnectionStatus` as a derived compatibility
+projection only, produced from the manager snapshot by
+`ConnectionStatusPresenter`. New connection diagnostics should read
+`GatewayConnectionSnapshot`, `GatewayRegistry`, and `ConnectionDiagnostics`
+directly instead of writing a second runtime model.
+
+Current derived compatibility debt:
+
+| Surface | Status | Notes |
+|---|---|---|
+| `AppState.Status` | Derived read-side adapter | The only writer is the manager `StateChanged` handler, which maps the snapshot through `ConnectionStatusPresenter` for older UI consumers. |
+| `ConnectionStatus` enum | Retained | Still used by shared gateway/client and tray read-side surfaces. Do not remove it until protocol/client and UI consumers are separated in a smaller migration. |
+| Command Center / tray projections | Mixed | New diagnostics use snapshot-derived DTOs. Some older warnings still read `AppStateSnapshot.Status`; those reads are compatibility gates, not lifecycle ownership. |
+
+The local MCP `app.connection.status` command is the agent-facing projection of
+this model. It reports effective mode/state, active gateway metadata,
+operator/node credential resolution, MCP runtime state, browser-proxy caveats,
+pending approval actions, retry hints from diagnostics, and recent diagnostic
+events without exposing token values.
 
 ## Gateway registry and persistence
 
@@ -126,7 +164,9 @@ Idle → Connecting → Connected
 %APPDATA%\OpenClawTray\gateways\<id>\device-key-ed25519.json  — keypair + tokens
 ```
 
-Each `GatewayRecord` contains: `Id`, `Url`, `FriendlyName`, `SharedGatewayToken`, `BootstrapToken`, `LastConnected`, `SshTunnel` config, and an `IdentityDirName`.
+Each `GatewayRecord` contains: `Id`, `Url`, `FriendlyName`, `SharedGatewayToken`, `BootstrapToken`, `LastConnected`, `SshTunnel` config, `IsLocal`, `RequiresV2Signature`, `SetupManagedDistroName`, and `BrowserControlPort`. The `IdentityDirName` property is computed from `Id`.
+
+Many gateway records may be saved, but only `ActiveId` in `gateways.json` is the effective gateway. Active gateway changes must be made through `GatewayRegistry.SetActive(...)` and saved immediately by connection flows that switch or apply credentials. `SetActive(...)` raises `GatewayRegistry.Changed`, so UI and diagnostics can observe a gateway switch even before the new connection finishes. Each active gateway resolves identity from `%APPDATA%\OpenClawTray\gateways\<id>\`; old gateway events are ignored by `GatewayConnectionManager` generation + gateway-id guards after a switch.
 
 `SettingsManager` still owns general tray settings (node mode, MCP mode, SSH tunnel toggles, notifications, UI preferences). It may read legacy `Token` / `BootstrapToken` JSON fields into memory for migration, but save must not write those legacy credential fields back.
 
@@ -141,9 +181,18 @@ Credential resolution order is intentionally strict:
 
 The invariant is that a paired device token always wins. Do not downgrade a paired operator or node to a shared/bootstrap token, because that can reduce scopes or trigger unnecessary re-pairing.
 
-**`CredentialResolver`** implements the precedence for WebSocket connections (operator and node roles).
+**`CredentialResolver`** implements the precedence for WebSocket connections (operator and node roles). It also returns a detailed `GatewayCredentialResolution` so the active snapshot and diagnostics can distinguish `Resolved`, `Missing`, `Unreadable`, `Corrupt`, `FallbackUsed`, and `BootstrapRequired`. Shared-token-only gateways are a clean resolved state when no paired device token exists. If a stored per-gateway device token is unreadable or corrupt and the resolver falls back to a shared/bootstrap token, `GatewayConnectionSnapshot` preserves that fallback status instead of reporting only the token source.
 
-**`InteractiveGatewayCredentialResolver`** resolves credentials for HTTP surfaces (chat URL `?token=` auth). It **prefers SharedGatewayToken** over DeviceToken because HTTP endpoints expect the shared token, not the per-device WebSocket token.
+Unreadable/corrupt identity fallback is an explicit same-gateway recovery path, not a silent cross-gateway downgrade. A readable stored device token still always wins. When the per-gateway identity file cannot be read or parsed, fallback may use only credentials already stored on the same active `GatewayRecord`; the snapshot and diagnostics report `FallbackUsed` with `PrimaryStatus=Unreadable` or `Corrupt` so UI/diagnostics can prompt repair or re-pair. Credential reads never fall back to another gateway's identity directory.
+
+Node credential precedence follows the same invariant with a distinct stored token:
+
+1. **Stored node device token** in the per-gateway identity directory.
+2. **`GatewayRecord.SharedGatewayToken`** — shared token fallback when no paired node token exists.
+3. **`GatewayRecord.BootstrapToken`** — one-time setup, limited scopes.
+4. **No credential** — caller logs and skips node client init.
+
+**`InteractiveGatewayCredentialResolver`** resolves credentials for HTTP surfaces (chat URL `?token=` auth). It **prefers SharedGatewayToken** over DeviceToken because HTTP endpoints expect the shared token, not the per-device WebSocket token. Browser proxy diagnostics should treat the missing shared token as a browser-control caveat, not as proof that the operator or node gateway connection is disconnected.
 
 ## Client instance lifecycle
 
@@ -166,11 +215,17 @@ Setup codes (from QR scan or paste) decode to `{ url, bootstrapToken }` via `Set
 5. Gateway returns `hello-ok.auth.deviceToken` after pairing
 6. Connection manager persists the device token to the identity file
 
-**Auto-approval**: When the node requires pairing and the operator has `operator.admin` or `operator.pairing` scope, `GatewayConnectionManager` automatically approves the node pairing request, waits 1 second, then reconnects the node.
+**Approval boundaries**: `GatewayConnectionManager` leaves node-pair command-trust requests and reapproval pending for explicit operator approval. It may automatically approve and reconnect only an explicitly typed device-pair request used for a device role upgrade.
+
+## Inbound pairing approval (operator)
+
+When **another** device or node requests pairing, the gateway broadcasts `device.pair.requested` / `node.pair.requested` to operators with pairing scope. `OpenClawGatewayClient` refreshes the pending lists and raises `DevicePairListUpdated` / `NodePairListUpdated`, which `GatewayService` forwards via its `PairListsChanged` event.
+
+`PairingApprovalCoordinator` (tray) reconciles those snapshots through the pure `PairingApprovalQueue` (OpenClaw.Connection) into add/resolve deltas, de-duplicating, suppressing already-decided requests, and filtering out the local node's own pending request (handled by the auto-approve path above). For genuinely new requests — when `ShowPairingApprovalDialog` is enabled and the operator holds pairing scope — it raises `ApprovalRequested`, and the app presents a focused **`PairingApprovalDialog`** plus an awareness toast (with a "Review" action). The dialog shows the requester's identity and the **operator scopes being granted** (mapped to friendly text by `PairingScopeDescriptions`), with Approve / Reject / Decide-later. Approve is briefly disabled on each new request to prevent click-through. Approve/Reject call the `IOperatorGatewayClient.{Device,Node}Pair{Approve,Reject}Async` RPCs; the queue advances and the dialog closes when empty. The existing Connections-page "Pending approvals" banner remains as the passive fallback when the dialog is disabled. Pure queue/scope logic is unit-tested in `OpenClaw.Connection.Tests`.
 
 ## SSH tunnel integration
 
-`SshTunnelService` manages an SSH local port-forward process. `SshTunnelManager` wraps it behind `ISshTunnelManager` for the connection manager.
+`SshTunnelService` manages an SSH local port-forward process and implements `ISshTunnelManager` directly for the connection manager.
 
 When a `GatewayRecord` has `SshTunnel` config, the connection manager starts the tunnel before connecting the WebSocket client to `ws://localhost:<localPort>`. The config stores the SSH daemon port (`sshPort`, default `22`) separately from the remote gateway port forwarded by `-L`.
 
@@ -194,8 +249,9 @@ The `EnableMcpServer=true`, `EnableNodeMode=false` path creates a local-only `No
 Tray actions should never silently no-op on common pairing/configuration issues:
 
 - Chat resolves credentials from the active registry record and per-gateway identity. If no usable credential exists, it opens Connection settings instead.
-- Canvas opens only when the Windows node is initialized and paired; otherwise it opens Connection settings.
+- Canvas opens only when the Windows node is initialized, paired, and the Canvas capability is enabled in settings; otherwise it opens Connection settings.
 - Quick Send uses the live operator client and surfaces scope/pairing errors from gateway calls.
+- `system.run` and `system.run.prepare` are gated by `NodeSystemRunEnabled` (default `true` for backward compatibility). When disabled, those commands are dropped from advertised capabilities and invocations are rejected.
 
 ## Legacy migration
 
@@ -224,7 +280,7 @@ Connection tests live in `tests/OpenClaw.Connection.Tests/`:
 - `GatewayRegistryTests` / `GatewayRegistryMigrationTests` — persistence, migration
 - `InteractiveGatewayCredentialResolverTests` — HTTP credential resolution
 - `NodeConnectorTests` — node client lifecycle
-- `PairingFlowTests` / `NodePairAutoApproveTests` — pairing lifecycle, auto-approve
+- `PairingFlowTests` / `NodePairAutoApproveTests` — pairing lifecycle, device role-upgrade auto-approval, and manual node command-trust boundary
 - `SetupCodeFlowTests` / `SetupCodeDecoderTests` — QR code → connect flow
 - `StaleEventGuardTests` — generation-guarded event handling
 - `SettingsChangeImpactTests` — settings change classification
@@ -232,4 +288,3 @@ Connection tests live in `tests/OpenClaw.Connection.Tests/`:
 - `ConnectionDiagnosticsTests` — ring buffer diagnostics
 
 The heaviest remaining gap is Windows shell UI behavior (tray clicks, tooltip visibility, WinUI menu routing). Cover pure decision logic in unit tests; use manual or integration smoke tests for shell behavior.
-

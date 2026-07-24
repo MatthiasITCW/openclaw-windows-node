@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using Xunit;
@@ -109,6 +110,318 @@ public class SystemCapabilityTests
         Assert.True(res.Ok);
         Assert.Equal("echo", runner.LastRequest!.Command);
         Assert.Equal(new[] { "hello", "world" }, runner.LastRequest.Args);
+        var payload = JsonSerializer.SerializeToElement(res.Payload);
+        Assert.True(payload.GetProperty("success").GetBoolean());
+    }
+
+    [Fact]
+    public async Task Run_ReportsUnsuccessfulExit()
+    {
+        var cap = new SystemCapability(NullLogger.Instance);
+        cap.SetCommandRunner(new FakeCommandRunner
+        {
+            Result = new CommandResult { ExitCode = 1, TimedOut = false }
+        });
+
+        var res = await cap.ExecuteAsync(new NodeInvokeRequest
+        {
+            Id = "r1-failed",
+            Command = "system.run",
+            Args = Parse("""{"command":["cmd.exe","/d","/s","/c","exit 1"]}""")
+        });
+
+        Assert.True(res.Ok);
+        var payload = JsonSerializer.SerializeToElement(res.Payload);
+        Assert.False(payload.GetProperty("success").GetBoolean());
+    }
+
+    [Fact]
+    public async Task Run_PassesApprovedEffectiveShellToRunner()
+    {
+        var cap = new SystemCapability(NullLogger.Instance);
+        var runner = new FakeCommandRunner { ForcedEffectiveShell = "cmd" };
+        cap.SetCommandRunner(runner);
+
+        var req = new NodeInvokeRequest
+        {
+            Id = "r1-shell",
+            Command = "system.run",
+            Args = Parse("""{"command":"hostname"}""")
+        };
+
+        var res = await cap.ExecuteAsync(req);
+
+        Assert.True(res.Ok);
+        Assert.Equal("cmd", runner.LastRequest!.ApprovedEffectiveShell);
+        Assert.Null(runner.LastRequest.Shell);
+    }
+
+    [Fact]
+    public async Task Run_GatewayCmdWrapper_UsesAllowedInnerCommand()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var cap = new SystemCapability(NullLogger.Instance);
+            var runner = new FakeCommandRunner();
+            cap.SetCommandRunner(runner);
+            cap.SetApprovalPolicy(new ExecApprovalPolicy(tempDir, NullLogger.Instance));
+
+            var req = new NodeInvokeRequest
+            {
+                Id = "gateway-cmd-wrapper",
+                Command = "system.run",
+                Args = Parse("""{"command":["cmd.exe","/d","/s","/c","hostname"],"rawCommand":"hostname"}""")
+            };
+
+            var res = await cap.ExecuteAsync(req);
+
+            Assert.True(res.Ok);
+            Assert.Equal("cmd.exe", runner.LastRequest!.Command);
+            Assert.Equal(new[] { "/d", "/s", "/c", "hostname" }, runner.LastRequest.Args);
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+
+    // REGRESSION (fix for the exec-approval broad-pattern bypass): a caller-set broad allow pattern
+    // ("*.*") whose executable is wildcarded must be REJECTED by execApprovals.set, so an otherwise-
+    // denied command stays gated. Pre-fix this rule was accepted and granted blanket exec.
+    [Fact]
+    public async Task ExecApprovals_BroadDotStar_IsRejected_ExecStaysGated()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var cap = new SystemCapability(NullLogger.Instance);
+            var runner = new FakeCommandRunner();
+            var policy = new ExecApprovalPolicy(tempDir, NullLogger.Instance);
+            cap.SetCommandRunner(runner);
+            cap.SetApprovalPolicy(policy);
+
+            // Control: default policy action is Deny; a bare arbitrary exe is NOT executed.
+            _ = await cap.ExecuteAsync(new NodeInvokeRequest
+            {
+                Id = "run-before",
+                Command = "system.run",
+                Args = Parse("""{"command":["notepad.exe"]}""")
+            });
+            Assert.Null(runner.LastRequest);
+
+            // Attacker (gateway) sets a broad allow rule the validator SHOULD reject but does not.
+            var baseHash = policy.GetPolicyHash();
+            var setRes = await cap.ExecuteAsync(new NodeInvokeRequest
+            {
+                Id = "set",
+                Command = "system.execApprovals.set",
+                Args = Parse("{\"baseHash\":\"" + baseHash + "\",\"rules\":[{\"pattern\":\"*.*\",\"action\":\"allow\"}]}")
+            });
+            Assert.False(setRes.Ok, "broad '*.*' allow rule must be rejected by the validator");
+
+            // The exe stays gated — the rule was rejected, so the default-deny still blocks it.
+            _ = await cap.ExecuteAsync(new NodeInvokeRequest
+            {
+                Id = "run-after",
+                Command = "system.run",
+                Args = Parse("""{"command":["notepad.exe"]}""")
+            });
+            Assert.Null(runner.LastRequest);
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+
+    // Sets a single allow rule via the gateway-reachable execApprovals.set path; returns whether the
+    // validator accepted it. Used to map the broad-allow-pattern gap and guard the fix.
+    private static async Task<bool> TrySetAllowRuleAsync(string pattern)
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var cap = new SystemCapability(NullLogger.Instance);
+            cap.SetCommandRunner(new FakeCommandRunner());
+            var policy = new ExecApprovalPolicy(tempDir, NullLogger.Instance);
+            cap.SetApprovalPolicy(policy);
+            var esc = pattern.Replace("\\", "\\\\").Replace("\"", "\\\"");
+            var json = "{\"baseHash\":\"" + policy.GetPolicyHash() + "\",\"rules\":[{\"pattern\":\"" + esc + "\",\"action\":\"allow\"}]}";
+            var res = await cap.ExecuteAsync(new NodeInvokeRequest { Id = "set", Command = "system.execApprovals.set", Args = Parse(json) });
+            return res.Ok;
+        }
+        finally { Directory.Delete(tempDir, true); }
+    }
+
+    // ROOT CAUSE: an allow pattern whose executable/first token is wildcarded matches nearly every
+    // command (*->.* glob), yet ValidateExecApprovalRules only blocks pure-wildcard/shell-blanket
+    // shapes. The whole class must be rejected, not just "*".
+    [Theory]
+    [InlineData("*.*")]
+    [InlineData("*e*")]
+    [InlineData("*.exe")]
+    [InlineData("*x*")]
+    [InlineData("c*")]
+    public async Task ExecApprovals_BroadAllowPattern_IsRejected(string pattern)
+        => Assert.False(await TrySetAllowRuleAsync(pattern), $"broad allow pattern '{pattern}' must be rejected");
+
+    // Guard against over-blocking: legitimate rules that pin a concrete command must still be accepted.
+    [Theory]
+    [InlineData("git *")]
+    [InlineData("npm run *")]
+    [InlineData("node *.js")]
+    public async Task ExecApprovals_SpecificAllowPattern_IsAccepted(string pattern)
+        => Assert.True(await TrySetAllowRuleAsync(pattern), $"specific allow pattern '{pattern}' must be accepted");
+
+    [Theory]
+    [InlineData("cmd /c echo ok")]
+    [InlineData("CMD.EXE /c echo ok")]
+    [InlineData(@"""cmd.exe"" /c echo ok")]
+    [InlineData(@".\cmd.exe /c echo ok")]
+    [InlineData("powershell.exe -Command Get-Date")]
+    [InlineData("pwsh -c Get-Date")]
+    [InlineData("wsl.exe --exec bash -c id")]
+    [InlineData("bash -c id")]
+    [InlineData("sh -c id")]
+    [InlineData("cscript.exe test.js")]
+    [InlineData("wscript test.vbs")]
+    public async Task ExecApprovals_CommandHostAllowRule_IsRejected(string pattern)
+        => Assert.False(
+            await TrySetAllowRuleAsync(pattern),
+            $"command host allow pattern '{pattern}' must be rejected");
+
+    [Theory]
+    [InlineData(@"""cmd /c echo ok")]
+    [InlineData(@"""C:\Program Files\Tools\evil.exe --run")]
+    [InlineData("'' --run")]
+    public async Task ExecApprovals_MalformedQuotedExecutable_IsRejected(string pattern)
+        => Assert.False(
+            await TrySetAllowRuleAsync(pattern),
+            $"malformed executable pattern '{pattern}' must be rejected");
+
+    [Theory]
+    [InlineData("mycmd.exe *")]
+    [InlineData("pwsh-helper.exe *")]
+    [InlineData("bashful.exe *")]
+    [InlineData("wsl-helper.exe *")]
+    [InlineData("cscript-runner.exe *")]
+    [InlineData("wscript-helper.exe *")]
+    [InlineData("node *.js")]
+    [InlineData("python *.py")]
+    public async Task ExecApprovals_CommandHostSubstring_IsAccepted(string pattern)
+        => Assert.True(
+            await TrySetAllowRuleAsync(pattern),
+            $"non-host executable pattern '{pattern}' must be accepted");
+
+    [Fact]
+    public async Task Run_GatewayCmdWrapper_ExplicitOuterDenyStillWins()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var cap = new SystemCapability(NullLogger.Instance);
+            var runner = new FakeCommandRunner();
+            var policy = new ExecApprovalPolicy(tempDir, NullLogger.Instance);
+            policy.InsertRule(0, new ExecApprovalRule
+            {
+                Pattern = "cmd.exe /d /s /c hostname",
+                Action = ExecApprovalAction.Deny,
+                Description = "Explicit wrapper deny"
+            });
+            cap.SetCommandRunner(runner);
+            cap.SetApprovalPolicy(policy);
+
+            var req = new NodeInvokeRequest
+            {
+                Id = "gateway-cmd-wrapper-deny",
+                Command = "system.run",
+                Args = Parse("""{"command":["cmd.exe","/d","/s","/c","hostname"],"rawCommand":"hostname"}""")
+            };
+
+            var res = await cap.ExecuteAsync(req);
+
+            Assert.False(res.Ok);
+            Assert.Contains("Explicit wrapper deny", res.Error);
+            Assert.Null(runner.LastRequest);
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task Run_GatewayCmdWrapper_ExplicitInnerDenyStillWins()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var cap = new SystemCapability(NullLogger.Instance);
+            var runner = new FakeCommandRunner();
+            var policy = new ExecApprovalPolicy(tempDir, NullLogger.Instance);
+            policy.InsertRule(0, new ExecApprovalRule
+            {
+                Pattern = "hostname",
+                Action = ExecApprovalAction.Deny,
+                Description = "Explicit inner deny"
+            });
+            cap.SetCommandRunner(runner);
+            cap.SetApprovalPolicy(policy);
+
+            var req = new NodeInvokeRequest
+            {
+                Id = "gateway-cmd-inner-deny",
+                Command = "system.run",
+                Args = Parse("""{"command":["cmd.exe","/d","/s","/c","hostname"],"rawCommand":"hostname"}""")
+            };
+
+            var res = await cap.ExecuteAsync(req);
+
+            Assert.False(res.Ok);
+            Assert.Contains("Explicit inner deny", res.Error);
+            Assert.Null(runner.LastRequest);
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task Run_GatewayCmdWrapper_BroadInnerAllowCannotHidePipeTarget()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var cap = new SystemCapability(NullLogger.Instance);
+            var runner = new FakeCommandRunner();
+            cap.SetCommandRunner(runner);
+            cap.SetApprovalPolicy(new ExecApprovalPolicy(tempDir, NullLogger.Instance));
+
+            var req = new NodeInvokeRequest
+            {
+                Id = "gateway-cmd-pipe-deny",
+                Command = "system.run",
+                Args = Parse("""{"command":["cmd.exe","/d","/s","/c","echo ok | del C:\\victim"],"rawCommand":"echo ok | del C:\\victim"}""")
+            };
+
+            var res = await cap.ExecuteAsync(req);
+
+            Assert.False(res.Ok);
+            Assert.Contains("exact allow rule", res.Error);
+            Assert.Null(runner.LastRequest);
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
     }
 
     [Fact]
@@ -370,6 +683,29 @@ public class SystemCapabilityTests
     }
 
     [Fact]
+    public async Task RunPrepare_ReturnsRequestedAndEffectiveShellFromRunner()
+    {
+        var runner = new FakeCommandRunner { ForcedEffectiveShell = "cmd" };
+        var cap = new SystemCapability(NullLogger.Instance);
+        cap.SetCommandRunner(runner);
+        var req = new NodeInvokeRequest
+        {
+            Id = "p-shell",
+            Command = "system.run.prepare",
+            Args = Parse("""{"command":"echo hi","shell":"bash"}""")
+        };
+
+        var res = await cap.ExecuteAsync(req);
+
+        Assert.True(res.Ok);
+        Assert.Equal("bash", runner.LastResolvedShell);
+        var payload = JsonSerializer.Deserialize<JsonElement>(JsonSerializer.Serialize(res.Payload));
+        var plan = payload.GetProperty("plan");
+        Assert.Equal("bash", plan.GetProperty("requestedShell").GetString());
+        Assert.Equal("cmd", plan.GetProperty("effectiveShell").GetString());
+    }
+
+    [Fact]
     public async Task RunPrepare_ReturnsError_WhenMissingCommand()
     {
         var cap = new SystemCapability(NullLogger.Instance);
@@ -598,6 +934,7 @@ public class SystemCapabilityTests
     [InlineData(@"\\server\share\tool.exe")]
     [InlineData(@"\\?\C:\evil.exe")]
     [InlineData(@"""C:\Users\Public\evil.exe""")]
+    [InlineData(@"""C:\Program Files\Tools\evil.exe"" --run")]
     [InlineData(@"'C:\Users\Public\evil.exe'")]
     [InlineData(@"""\\server\share\tool.exe""")]
     [InlineData(@"""\\?\C:\evil.exe""")]
@@ -742,18 +1079,39 @@ public class SystemCapabilityTests
     {
         public string Name => "fake";
         public CommandRequest? LastRequest { get; private set; }
+        public string? LastResolvedShell { get; private set; }
+        public string? ForcedEffectiveShell { get; set; }
+        public CommandResult Result { get; set; } = new()
+        {
+            Stdout = "ok",
+            Stderr = "",
+            ExitCode = 0,
+            TimedOut = false,
+            DurationMs = 1
+        };
+
+        public string ResolveEffectiveShell(string? requestedShell)
+        {
+            LastResolvedShell = requestedShell;
+            if (ForcedEffectiveShell != null)
+                return ForcedEffectiveShell;
+
+            if (string.IsNullOrWhiteSpace(requestedShell))
+                return "powershell";
+
+            return requestedShell.Trim().ToLowerInvariant() switch
+            {
+                "cmd" => "cmd",
+                "pwsh" => "pwsh",
+                "powershell" => "powershell",
+                _ => "powershell",
+            };
+        }
 
         public Task<CommandResult> RunAsync(CommandRequest request, CancellationToken ct = default)
         {
             LastRequest = request;
-            return Task.FromResult(new CommandResult
-            {
-                Stdout = "ok",
-                Stderr = "",
-                ExitCode = 0,
-                TimedOut = false,
-                DurationMs = 1
-            });
+            return Task.FromResult(Result);
         }
     }
 
@@ -870,6 +1228,198 @@ public class BrowserProxyCapabilityTests
         var payload = JsonSerializer.Deserialize<JsonElement>(JsonSerializer.Serialize(res.Payload));
         Assert.True(payload.TryGetProperty("result", out var result));
         Assert.True(result.GetProperty("ok").GetBoolean());
+    }
+
+    [Fact]
+    public async Task BrowserProxy_RemoteGatewayWithoutOverride_DoesNotSendTokenToLocalFallback()
+    {
+        var handler = new CapturingHandler("""{"ok":true}""");
+        var cap = new BrowserProxyCapability(
+            NullLogger.Instance,
+            "wss://gateway.example.com:18789",
+            "secret-token",
+            handler);
+
+        var res = await cap.ExecuteAsync(new NodeInvokeRequest
+        {
+            Id = "browser-remote-no-fallback",
+            Command = "browser.proxy",
+            Args = Parse("""{"method":"GET","path":"/status"}""")
+        });
+
+        Assert.False(res.Ok);
+        Assert.Contains("explicit browser-control port", res.Error);
+        Assert.Null(handler.LastRequest);
+    }
+
+    [Fact]
+    public async Task BrowserProxy_ControlPortOverride_TargetsConfiguredPort()
+    {
+        var handler = new CapturingHandler("""{"ok":true}""");
+        var cap = new BrowserProxyCapability(
+            NullLogger.Instance,
+            "ws://127.0.0.1:18790",
+            "secret-token",
+            handler,
+            controlPortOverride: 18791);
+
+        var res = await cap.ExecuteAsync(new NodeInvokeRequest
+        {
+            Id = "browser-port-override",
+            Command = "browser.proxy",
+            Args = Parse("""{"method":"GET","path":"/status"}""")
+        });
+
+        Assert.True(res.Ok);
+        Assert.NotNull(handler.LastRequest);
+        // Without the override the derived port would be 18790 + 2 = 18792; the override
+        // pins it to the tunnelled browser-control port (a WSL2 gateway forwarded to
+        // the Windows host) instead.
+        Assert.Equal("http://127.0.0.1:18791/status", handler.LastRequest!.RequestUri!.ToString());
+    }
+
+    [Fact]
+    public async Task BrowserProxy_TunnelActive_NoOverride_TargetsTunnelLocalPortPlusTwo()
+    {
+        var handler = new CapturingHandler("""{"ok":true}""");
+        // Managed SSH tunnel, gateway reached locally on 9000, browser-control on the
+        // companion forward (tunnel local + 2). No override -> resolved from the active tunnel.
+        var cap = new BrowserProxyCapability(
+            NullLogger.Instance,
+            "ws://127.0.0.1:9000",
+            "secret-token",
+            handler,
+            useSshTunnel: true,
+            sshTunnelLocalPort: 9100);
+
+        var res = await cap.ExecuteAsync(new NodeInvokeRequest
+        {
+            Id = "browser-tunnel",
+            Command = "browser.proxy",
+            Args = Parse("""{"method":"GET","path":"/status"}""")
+        });
+
+        Assert.True(res.Ok);
+        Assert.Equal("http://127.0.0.1:9102/status", handler.LastRequest!.RequestUri!.ToString());
+    }
+
+    [Fact]
+    public async Task BrowserProxy_OverrideWins_OverActiveTunnel()
+    {
+        var handler = new CapturingHandler("""{"ok":true}""");
+        var cap = new BrowserProxyCapability(
+            NullLogger.Instance,
+            "ws://127.0.0.1:9000",
+            "secret-token",
+            handler,
+            controlPortOverride: 19000,
+            useSshTunnel: true,
+            sshTunnelLocalPort: 9100);
+
+        var res = await cap.ExecuteAsync(new NodeInvokeRequest
+        {
+            Id = "browser-override-tunnel",
+            Command = "browser.proxy",
+            Args = Parse("""{"method":"GET","path":"/status"}""")
+        });
+
+        Assert.True(res.Ok);
+        // Override pins the port regardless of the active tunnel.
+        Assert.Equal("http://127.0.0.1:19000/status", handler.LastRequest!.RequestUri!.ToString());
+    }
+
+    [Fact]
+    public async Task BrowserProxy_ControlPortOverride_RealHttpRoundTripHitsOverridePort()
+    {
+        // Unlike the mock-handler tests above, this drives the real HttpClient end-to-end:
+        // a genuine loopback HTTP server stands in for the browser-control host, and we assert
+        // the override actually directs a real TCP/HTTP request to the configured port. The
+        // gateway URL's port (18790) would derive control port 18792 — the wrong, unreachable
+        // port in a port-remapping tunnel — so a successful round-trip proves the override.
+        var server = new TcpListener(IPAddress.Loopback, 0);
+        server.Start();
+        var hostPort = ((IPEndPoint)server.LocalEndpoint).Port;
+
+        string? requestLine = null;
+        string? authHeader = null;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+
+        var serverTask = Task.Run(async () =>
+        {
+            using var client = await server.AcceptTcpClientAsync(cts.Token);
+            using var stream = client.GetStream();
+            var buffer = new byte[4096];
+            var sb = new StringBuilder();
+            while (!sb.ToString().Contains("\r\n\r\n"))
+            {
+                var n = await stream.ReadAsync(buffer, cts.Token);
+                if (n == 0) break;
+                sb.Append(Encoding.ASCII.GetString(buffer, 0, n));
+            }
+
+            var headerLines = sb.ToString().Split("\r\n");
+            requestLine = headerLines.Length > 0 ? headerLines[0] : null;
+            foreach (var line in headerLines)
+            {
+                if (line.StartsWith("Authorization:", StringComparison.OrdinalIgnoreCase))
+                    authHeader = line["Authorization:".Length..].Trim();
+            }
+
+            const string body = "{\"ok\":true}";
+            var response = $"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n{body}";
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(response), cts.Token);
+            await stream.FlushAsync(cts.Token);
+        }, cts.Token);
+
+        try
+        {
+            var cap = new BrowserProxyCapability(
+                NullLogger.Instance,
+                "ws://127.0.0.1:18790",
+                "shared-gateway-token",
+                handler: null, // real HttpClient -> real socket
+                controlPortOverride: hostPort);
+
+            var res = await cap.ExecuteAsync(new NodeInvokeRequest
+            {
+                Id = "browser-real-roundtrip",
+                Command = "browser.proxy",
+                Args = Parse("""{"method":"GET","path":"/status"}""")
+            });
+
+            await serverTask;
+
+            Assert.True(res.Ok, $"expected ok, got error: {res.Error}");
+            Assert.Equal("GET /status HTTP/1.1", requestLine);
+            Assert.NotNull(authHeader);
+            // the per-gateway shared token reached the real host over the wire at the override port
+            Assert.Contains("shared-gateway-token", authHeader!);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task BrowserProxy_ControlPortOverrideOutOfRange_ReturnsError()
+    {
+        var cap = new BrowserProxyCapability(
+            NullLogger.Instance,
+            "ws://127.0.0.1:18789",
+            "secret-token",
+            new CapturingHandler("""{"ok":true}"""),
+            controlPortOverride: 70000);
+
+        var res = await cap.ExecuteAsync(new NodeInvokeRequest
+        {
+            Id = "browser-port-override-invalid",
+            Command = "browser.proxy",
+            Args = Parse("""{"method":"GET","path":"/status"}""")
+        });
+
+        Assert.False(res.Ok);
+        Assert.Contains("browser-control port is outside the valid TCP port range", res.Error);
     }
 
     [Fact]
@@ -1429,6 +1979,28 @@ public class CanvasCapabilityTests
         Assert.Contains("\"navigated\":true", json);
         // Scheme and host lowercased; path preserved.
         Assert.Contains("\"url\":\"https://example.com/Path\"", json);
+    }
+
+    [Theory]
+    [InlineData("denied")]
+    [InlineData("unsupported_in_canvas")]
+    public async Task Navigate_NotOpenedByHandler_ReturnsNotNavigated(string opener)
+    {
+        var cap = new CanvasCapability(NullLogger.Instance);
+        cap.NavigateRequested += _ => Task.FromResult(opener);
+
+        var req = new NodeInvokeRequest
+        {
+            Id = "c12b-denied",
+            Command = "canvas.navigate",
+            Args = Parse("""{"url":"http://127.0.0.1:9/"}""")
+        };
+        var res = await cap.ExecuteAsync(req);
+        Assert.True(res.Ok);
+
+        var json = System.Text.Json.JsonSerializer.Serialize(res.Payload);
+        Assert.Contains($"\"opener\":\"{opener}\"", json);
+        Assert.Contains("\"navigated\":false", json);
     }
 
     [Theory]
@@ -2172,7 +2744,7 @@ public class ScreenCapabilityTests
     {
         var cap = new ScreenCapability(NullLogger.Instance);
         ScreenCaptureArgs? receivedArgs = null;
-        cap.CaptureRequested += (args) =>
+        cap.CaptureRequested += (args, _) =>
         {
             receivedArgs = args;
             return Task.FromResult(new ScreenCaptureResult { Format = "png", Width = 1920, Height = 1080, Base64 = "abc" });
@@ -2198,7 +2770,7 @@ public class ScreenCapabilityTests
     public async Task Capture_ReturnsError_WhenHandlerThrows()
     {
         var cap = new ScreenCapability(NullLogger.Instance);
-        cap.CaptureRequested += (args) => throw new InvalidOperationException("Display access denied");
+        cap.CaptureRequested += (args, _) => throw new InvalidOperationException("Display access denied");
 
         var req = new NodeInvokeRequest { Id = "s5", Command = "screen.snapshot", Args = Parse("""{}""") };
         var res = await cap.ExecuteAsync(req);
@@ -2210,7 +2782,7 @@ public class ScreenCapabilityTests
     public async Task Capture_ResponseIncludesDataUri()
     {
         var cap = new ScreenCapability(NullLogger.Instance);
-        cap.CaptureRequested += (args) => Task.FromResult(new ScreenCaptureResult
+        cap.CaptureRequested += (args, _) => Task.FromResult(new ScreenCaptureResult
         {
             Format = "png",
             Width = 1920,
@@ -2237,7 +2809,7 @@ public class ScreenCapabilityTests
         // downstream allocation (back-buffer sizes, image encoder buffers).
         var cap = new ScreenCapability(NullLogger.Instance);
         ScreenCaptureArgs? received = null;
-        cap.CaptureRequested += args =>
+        cap.CaptureRequested += (args, _) =>
         {
             received = args;
             return Task.FromResult(new ScreenCaptureResult { Format = "png", Width = 0, Height = 0, Base64 = "" });
@@ -2262,7 +2834,7 @@ public class ScreenCapabilityTests
     {
         var cap = new ScreenCapability(NullLogger.Instance);
         ScreenCaptureArgs? receivedArgs = null;
-        cap.CaptureRequested += (args) =>
+        cap.CaptureRequested += (args, _) =>
         {
             receivedArgs = args;
             return Task.FromResult(new ScreenCaptureResult { Format = "png", Width = 1920, Height = 1080, Base64 = "" });
@@ -2282,6 +2854,114 @@ public class ScreenCapabilityTests
     }
 
     [Fact]
+    public async Task Capture_RejectsUnsupportedFormat()
+    {
+        // Reject before the capture handler runs so a caller-supplied format
+        // cannot reach the data URI MIME type.
+        var cap = new ScreenCapability(NullLogger.Instance);
+        var handlerCalled = false;
+        cap.CaptureRequested += (_, _) =>
+        {
+            handlerCalled = true;
+            return Task.FromResult(new ScreenCaptureResult { Format = "png", Base64 = "x" });
+        };
+
+        var req = new NodeInvokeRequest
+        {
+            Id = "sfmt1",
+            Command = "screen.snapshot",
+            Args = Parse("""{"format":"svg+xml"}""")
+        };
+
+        var res = await cap.ExecuteAsync(req);
+        Assert.False(res.Ok);
+        Assert.False(handlerCalled);
+        Assert.Contains("Unsupported screen snapshot format", res.Error);
+    }
+
+    [Fact]
+    public async Task Capture_NormalizesJpgToJpeg()
+    {
+        // Normalize the alias before invoking the capture handler.
+        var cap = new ScreenCapability(NullLogger.Instance);
+        ScreenCaptureArgs? received = null;
+        cap.CaptureRequested += (args, _) =>
+        {
+            received = args;
+            return Task.FromResult(new ScreenCaptureResult { Format = args.Format, Width = 10, Height = 10, Base64 = "data" });
+        };
+
+        var req = new NodeInvokeRequest
+        {
+            Id = "sfmt2",
+            Command = "screen.snapshot",
+            Args = Parse("""{"format":"jpg"}""")
+        };
+
+        var res = await cap.ExecuteAsync(req);
+        Assert.True(res.Ok);
+        Assert.NotNull(received);
+        Assert.Equal("jpeg", received!.Format);
+
+        var json = JsonSerializer.Serialize(res.Payload);
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        Assert.Equal("jpeg", root.GetProperty("format").GetString());
+        Assert.StartsWith("data:image/jpeg;base64,", root.GetProperty("image").GetString());
+    }
+
+    [Fact]
+    public async Task Capture_DataUri_IgnoresHandlerEchoedFormat()
+    {
+        // The response MIME type comes from the validated request format.
+        var cap = new ScreenCapability(NullLogger.Instance);
+        cap.CaptureRequested += (_, _) => Task.FromResult(new ScreenCaptureResult
+        {
+            Format = "svg+xml\";base64,evil",
+            Width = 1,
+            Height = 1,
+            Base64 = "abc123"
+        });
+
+        var req = new NodeInvokeRequest
+        {
+            Id = "sfmt3",
+            Command = "screen.snapshot",
+            Args = Parse("""{"format":"png"}""")
+        };
+
+        var res = await cap.ExecuteAsync(req);
+        Assert.True(res.Ok);
+
+        var json = JsonSerializer.Serialize(res.Payload);
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        Assert.Equal("png", root.GetProperty("format").GetString());
+        Assert.Equal("data:image/png;base64,abc123", root.GetProperty("image").GetString());
+    }
+
+    [Fact]
+    public void TryNormalizeSnapshotFormat_AllowsKnownFormats_RejectsOthers()
+    {
+        Assert.True(ScreenCapability.TryNormalizeSnapshotFormat("png", out var png));
+        Assert.Equal("png", png);
+        Assert.True(ScreenCapability.TryNormalizeSnapshotFormat("PNG", out var pngUpper));
+        Assert.Equal("png", pngUpper);
+        Assert.True(ScreenCapability.TryNormalizeSnapshotFormat("jpeg", out var jpeg));
+        Assert.Equal("jpeg", jpeg);
+        Assert.True(ScreenCapability.TryNormalizeSnapshotFormat("  JPG  ", out var jpg));
+        Assert.Equal("jpeg", jpg);
+        Assert.True(ScreenCapability.TryNormalizeSnapshotFormat(null, out var def));
+        Assert.Equal("png", def);
+        Assert.True(ScreenCapability.TryNormalizeSnapshotFormat("", out var empty));
+        Assert.Equal("png", empty);
+
+        Assert.False(ScreenCapability.TryNormalizeSnapshotFormat("webp", out _));
+        Assert.False(ScreenCapability.TryNormalizeSnapshotFormat("gif", out _));
+        Assert.False(ScreenCapability.TryNormalizeSnapshotFormat("png;base64,x", out _));
+    }
+
+    [Fact]
     public async Task Record_ReturnsError_WhenNoHandler()
     {
         var cap = new ScreenCapability(NullLogger.Instance);
@@ -2296,7 +2976,7 @@ public class ScreenCapabilityTests
     {
         var cap = new ScreenCapability(NullLogger.Instance);
         ScreenRecordArgs? receivedArgs = null;
-        cap.RecordRequested += (args) =>
+        cap.RecordRequested += (args, _) =>
         {
             receivedArgs = args;
             return Task.FromResult(new ScreenRecordResult
@@ -2332,7 +3012,7 @@ public class ScreenCapabilityTests
     {
         var cap = new ScreenCapability(NullLogger.Instance);
         var handlerCalled = false;
-        cap.RecordRequested += (args) =>
+        cap.RecordRequested += (args, _) =>
         {
             handlerCalled = true;
             return Task.FromResult(new ScreenRecordResult());
@@ -2355,7 +3035,7 @@ public class ScreenCapabilityTests
     public async Task Record_ReturnsMacCompatiblePayload()
     {
         var cap = new ScreenCapability(NullLogger.Instance);
-        cap.RecordRequested += (args) => Task.FromResult(new ScreenRecordResult
+        cap.RecordRequested += (args, _) => Task.FromResult(new ScreenRecordResult
         {
             Format = "mp4",
             Base64 = "abc123",
@@ -2396,7 +3076,7 @@ public class ScreenCapabilityTests
     {
         var cap = new ScreenCapability(NullLogger.Instance);
         ScreenRecordArgs? received = null;
-        cap.RecordRequested += (args) =>
+        cap.RecordRequested += (args, _) =>
         {
             received = args;
             return Task.FromResult(new ScreenRecordResult { Format = "mp4", Fps = args.Fps });
@@ -2420,7 +3100,7 @@ public class ScreenCapabilityTests
     {
         var cap = new ScreenCapability(NullLogger.Instance);
         ScreenRecordArgs? received = null;
-        cap.RecordRequested += (args) =>
+        cap.RecordRequested += (args, _) =>
         {
             received = args;
             return Task.FromResult(new ScreenRecordResult { Format = "mp4", Fps = args.Fps });
@@ -2443,12 +3123,40 @@ public class ScreenCapabilityTests
     public async Task Record_ReturnsError_WhenHandlerThrows()
     {
         var cap = new ScreenCapability(NullLogger.Instance);
-        cap.RecordRequested += (_) => throw new InvalidOperationException("Capture permission denied");
+        cap.RecordRequested += (_, _) => throw new InvalidOperationException("Capture permission denied");
 
         var req = new NodeInvokeRequest { Id = "s15", Command = "screen.record", Args = Parse("""{}""") };
         var res = await cap.ExecuteAsync(req);
         Assert.False(res.Ok);
         Assert.Equal("Recording failed", res.Error);
+    }
+
+    [Fact]
+    public async Task Record_PropagatesCancellationToken_AndReturnsCancelled()
+    {
+        var cap = new ScreenCapability(NullLogger.Instance);
+        var tokenObserved = false;
+        cap.RecordRequested += async (_, cancellationToken) =>
+        {
+            tokenObserved = cancellationToken.CanBeCanceled;
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return new ScreenRecordResult();
+        };
+        using var cts = new CancellationTokenSource();
+        var request = new NodeInvokeRequest
+        {
+            Id = "screen-cancel",
+            Command = "screen.record",
+            Args = Parse("""{"durationMs":10000}""")
+        };
+
+        var responseTask = cap.ExecuteAsync(request, cts.Token);
+        cts.Cancel();
+        var response = await responseTask;
+
+        Assert.True(tokenObserved);
+        Assert.False(response.Ok);
+        Assert.Equal("cancelled", response.Error);
     }
 }
 
@@ -2486,7 +3194,7 @@ public class CameraCapabilityTests
     public async Task List_ReturnsCameras_WhenHandler()
     {
         var cap = new CameraCapability(NullLogger.Instance);
-        cap.ListRequested += () => Task.FromResult(new[]
+        cap.ListRequested += _ => Task.FromResult(new[]
         {
             new CameraInfo { DeviceId = "cam-1", Name = "Front", IsDefault = true },
             new CameraInfo { DeviceId = "cam-2", Name = "Back", IsDefault = false }
@@ -2527,7 +3235,7 @@ public class CameraCapabilityTests
     {
         var cap = new CameraCapability(NullLogger.Instance);
         CameraSnapArgs? receivedArgs = null;
-        cap.SnapRequested += (args) =>
+        cap.SnapRequested += (args, _) =>
         {
             receivedArgs = args;
             return Task.FromResult(new CameraSnapResult { Format = "jpeg", Width = 640, Height = 480, Base64 = "img" });
@@ -2554,7 +3262,7 @@ public class CameraCapabilityTests
     {
         var cap = new CameraCapability(NullLogger.Instance);
         CameraSnapArgs? receivedArgs = null;
-        cap.SnapRequested += (args) =>
+        cap.SnapRequested += (args, _) =>
         {
             receivedArgs = args;
             return Task.FromResult(new CameraSnapResult { Format = "jpeg", Width = 640, Height = 480, Base64 = "img" });
@@ -2573,7 +3281,7 @@ public class CameraCapabilityTests
     public async Task Snap_ReturnsError_WhenHandlerThrows()
     {
         var cap = new CameraCapability(NullLogger.Instance);
-        cap.SnapRequested += (args) => throw new InvalidOperationException("Camera access blocked");
+        cap.SnapRequested += (args, _) => throw new InvalidOperationException("Camera access blocked");
 
         var req = new NodeInvokeRequest { Id = "cam6", Command = "camera.snap", Args = Parse("""{}""") };
         var res = await cap.ExecuteAsync(req);
@@ -2596,7 +3304,7 @@ public class CameraCapabilityTests
     {
         var cap = new CameraCapability(NullLogger.Instance);
         CameraClipArgs? receivedArgs = null;
-        cap.ClipRequested += (args) =>
+        cap.ClipRequested += (args, _) =>
         {
             receivedArgs = args;
             return Task.FromResult(new CameraClipResult { Format = "mp4", Base64 = "vid", DurationMs = args.DurationMs, HasAudio = true });
@@ -2620,7 +3328,7 @@ public class CameraCapabilityTests
     {
         var cap = new CameraCapability(NullLogger.Instance);
         CameraClipArgs? receivedArgs = null;
-        cap.ClipRequested += (args) =>
+        cap.ClipRequested += (args, _) =>
         {
             receivedArgs = args;
             return Task.FromResult(new CameraClipResult { Format = "mp4", Base64 = "vid", DurationMs = args.DurationMs, HasAudio = args.IncludeAudio });
@@ -2661,7 +3369,7 @@ public class CameraCapabilityTests
         // zero / negative seconds, which produced a degenerate file.
         var cap = new CameraCapability(NullLogger.Instance);
         CameraClipArgs? received = null;
-        cap.ClipRequested += args =>
+        cap.ClipRequested += (args, _) =>
         {
             received = args;
             return Task.FromResult(new CameraClipResult { Format = "mp4", Base64 = "", DurationMs = args.DurationMs, HasAudio = false });
@@ -2678,6 +3386,34 @@ public class CameraCapabilityTests
         Assert.NotNull(received);
         Assert.True(received!.DurationMs >= 100, $"duration not floor-clamped: {received.DurationMs}");
         Assert.True(received.DurationMs <= 60000);
+    }
+
+    [Fact]
+    public async Task Clip_PropagatesCancellationToken_AndReturnsCancelled()
+    {
+        var cap = new CameraCapability(NullLogger.Instance);
+        var tokenObserved = false;
+        cap.ClipRequested += async (_, cancellationToken) =>
+        {
+            tokenObserved = cancellationToken.CanBeCanceled;
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return new CameraClipResult();
+        };
+        using var cts = new CancellationTokenSource();
+        var request = new NodeInvokeRequest
+        {
+            Id = "camera-cancel",
+            Command = "camera.clip",
+            Args = Parse("""{"durationMs":10000}""")
+        };
+
+        var responseTask = cap.ExecuteAsync(request, cts.Token);
+        cts.Cancel();
+        var response = await responseTask;
+
+        Assert.True(tokenObserved);
+        Assert.False(response.Ok);
+        Assert.Equal("cancelled", response.Error);
     }
 }
 
@@ -2875,6 +3611,152 @@ public class TtsCapabilityTests
 
         Assert.False(res.Ok);
         Assert.Contains("Unknown command", res.Error);
+    }
+
+    [Fact]
+    public void Commands_IncludeSpeakAndStatus()
+    {
+        var cap = new TtsCapability(NullLogger.Instance);
+
+        Assert.Contains(TtsCapability.SpeakCommand, cap.Commands);
+        Assert.Contains(TtsCapability.StatusCommand, cap.Commands);
+        Assert.True(cap.CanHandle("tts.status"));
+    }
+
+    [Theory]
+    // Preferred provider is ready → no fallback.
+    [InlineData("piper", "piper", "piper,windows", false, "piper", "piper", false)]
+    [InlineData("elevenlabs", "piper", "elevenlabs,windows", false, "elevenlabs", "elevenlabs", false)]
+    // Configured/default preferred provider not ready, Windows available → fall back to Windows.
+    [InlineData(null, "piper", "windows", true, "piper", "windows", true)]
+    [InlineData(null, "elevenlabs", "windows", true, "elevenlabs", "windows", true)]
+    // Explicit provider requests stay strict and do not silently reroute.
+    [InlineData("piper", "windows", "windows", false, "piper", "piper", false)]
+    [InlineData("elevenlabs", "windows", "windows", false, "elevenlabs", "elevenlabs", false)]
+    [InlineData("unknown-provider", "windows", "windows", false, "unknown-provider", "unknown-provider", false)]
+    // Preferred IS Windows but somehow not ready → no self-fallback.
+    [InlineData("windows", "windows", "piper", false, "windows", "windows", false)]
+    // Nothing ready → preferred returned unchanged so the dispatch error is meaningful.
+    [InlineData(null, "elevenlabs", "", true, "elevenlabs", "elevenlabs", false)]
+    public void ResolveEffectiveProvider_FallsBackToWindows(
+        string? requested,
+        string? configured,
+        string readyCsv,
+        bool allowFallback,
+        string expectedRequested,
+        string expectedEffective,
+        bool expectedFellBack)
+    {
+        var ready = readyCsv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var resolution = TtsCapability.ResolveEffectiveProvider(requested, configured, ready, allowFallback);
+
+        Assert.Equal(expectedRequested, resolution.RequestedProvider);
+        Assert.Equal(expectedEffective, resolution.EffectiveProvider);
+        Assert.Equal(expectedFellBack, resolution.FellBack);
+    }
+
+    [Fact]
+    public async Task Speak_Projection_IncludesRequestedProviderAndFellBack()
+    {
+        var cap = new TtsCapability(NullLogger.Instance);
+        cap.SpeakRequested += (_, _) => Task.FromResult(new TtsSpeakResult
+        {
+            Provider = TtsCapability.WindowsProvider,
+            RequestedProvider = TtsCapability.ElevenLabsProvider,
+            FellBack = true,
+            ContentType = "audio/wav",
+            DurationMs = 50
+        });
+
+        var res = await cap.ExecuteAsync(new NodeInvokeRequest
+        {
+            Id = "tts-fallback",
+            Command = "tts.speak",
+            Args = Parse("""{"text":"hello","provider":"elevenlabs"}""")
+        });
+
+        Assert.True(res.Ok);
+        var json = JsonSerializer.Serialize(res.Payload);
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        Assert.Equal("windows", root.GetProperty("provider").GetString());
+        Assert.Equal("elevenlabs", root.GetProperty("requestedProvider").GetString());
+        Assert.True(root.GetProperty("fellBack").GetBoolean());
+    }
+
+    [Fact]
+    public async Task Status_ReturnsError_WhenNoHandler()
+    {
+        var cap = new TtsCapability(NullLogger.Instance);
+
+        var res = await cap.ExecuteAsync(new NodeInvokeRequest
+        {
+            Id = "tts-status-unavailable",
+            Command = "tts.status",
+            Args = Parse("""{}""")
+        });
+
+        Assert.False(res.Ok);
+        Assert.Contains("not available", res.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Status_ProjectsProviderReadiness()
+    {
+        var cap = new TtsCapability(NullLogger.Instance);
+        cap.StatusRequested += _ => Task.FromResult(new TtsStatusResult
+        {
+            ConfiguredProvider = TtsCapability.PiperProvider,
+            EffectiveProvider = TtsCapability.WindowsProvider,
+            WillFallBack = true,
+            Providers =
+            [
+                new TtsProviderStatus { Provider = TtsCapability.PiperProvider, Readiness = TtsCapability.ReadinessVoiceNotDownloaded, IsReady = false },
+                new TtsProviderStatus { Provider = TtsCapability.WindowsProvider, Readiness = TtsCapability.ReadinessReady, IsReady = true },
+                new TtsProviderStatus { Provider = TtsCapability.ElevenLabsProvider, Readiness = TtsCapability.ReadinessNeedsApiKey, IsReady = false }
+            ]
+        });
+
+        var res = await cap.ExecuteAsync(new NodeInvokeRequest
+        {
+            Id = "tts-status",
+            Command = "tts.status",
+            Args = Parse("""{}""")
+        });
+
+        Assert.True(res.Ok);
+        var json = JsonSerializer.Serialize(res.Payload);
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        Assert.Equal("piper", root.GetProperty("configuredProvider").GetString());
+        Assert.Equal("windows", root.GetProperty("effectiveProvider").GetString());
+        Assert.True(root.GetProperty("willFallBack").GetBoolean());
+        var providers = root.GetProperty("providers");
+        Assert.Equal(3, providers.GetArrayLength());
+        Assert.Equal("voice-not-downloaded", providers[0].GetProperty("readiness").GetString());
+        Assert.False(providers[0].GetProperty("isReady").GetBoolean());
+        Assert.True(providers[1].GetProperty("isReady").GetBoolean());
+    }
+
+    [Fact]
+    public async Task Status_ReturnsSanitizedError_WhenHandlerThrows()
+    {
+        var cap = new TtsCapability(NullLogger.Instance);
+        cap.StatusRequested += _ => throw new InvalidOperationException("voice id secret-voice-xyz on device Mic-42");
+
+        var res = await cap.ExecuteAsync(new NodeInvokeRequest
+        {
+            Id = "tts-status-fail",
+            Command = "tts.status",
+            Args = Parse("""{}""")
+        });
+
+        Assert.False(res.Ok);
+        Assert.Equal("Status failed", res.Error);
+        Assert.DoesNotContain("secret-voice-xyz", res.Error);
+        Assert.DoesNotContain("Mic-42", res.Error);
     }
 }
 

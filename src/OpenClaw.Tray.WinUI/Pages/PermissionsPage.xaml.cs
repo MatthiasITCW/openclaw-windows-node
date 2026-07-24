@@ -1,8 +1,9 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using OpenClaw.Connection;
 using OpenClaw.Shared;
-using OpenClaw.Shared.Capabilities;
+using OpenClaw.Shared.Audio;
 using OpenClawTray.Helpers;
 using OpenClawTray.Services;
 using OpenClawTray.Windows;
@@ -12,6 +13,8 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading;
 
 namespace OpenClawTray.Pages;
 
@@ -19,13 +22,9 @@ public sealed partial class PermissionsPage : Page
 {
     private static App CurrentApp => (App)Microsoft.UI.Xaml.Application.Current!;
     private bool _suppressMcpToggle;
-    private bool _suppressTtsProviderChange;
     private readonly List<ToggleSwitch> _featureToggles = new();
     private List<ExecPolicyRule> _policyRules = new();
-
-    // Sentinel rendered into the API key PasswordBox so the user can see
-    // that a key is already saved without us ever surfacing the plaintext.
-    private const string SavedApiKeySentinel = "••••••••";
+    private const int BrowserProxyToggleIndex = 1;
 
     public PermissionsPage()
     {
@@ -38,19 +37,10 @@ public sealed partial class PermissionsPage : Page
     {
         HostnameText.Text = Environment.MachineName;
 
-        // Show "← Back to Connection" only when the user arrived from
-        // Connection's cross-page link; staying hidden when the rail nav
-        // is used keeps the page chrome quiet for direct navigation.
-        var hub = CurrentApp.ActiveHubWindow as HubWindow;
-        BackToConnectionLink.Visibility = hub?.LastNavigationOrigin == "connection"
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-
         BindNodeModeMaster();
         BuildCapabilityToggles();
         UpdateMcpStatus();
-        UpdateSttCard();
-        UpdateTtsCard();
+        UpdateVoiceSettingsCard();
         UpdateNodeStatus();
         ApplyFeaturesEnabledState();
 
@@ -58,19 +48,33 @@ public sealed partial class PermissionsPage : Page
         LoadAllowlist(CurrentApp.AppState?.Config);
     }
 
-    private void OnBackToConnectionClicked(object sender, RoutedEventArgs e)
-        => ((IAppCommands)CurrentApp).Navigate("connection");
-
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         if (CurrentApp.Settings != null)
             CurrentApp.Settings.Saved += OnSettingsSaved;
+
+        var mgr = CurrentApp.ConnectionManager;
+        if (mgr != null)
+            mgr.StateChanged += OnConnectionStateChanged;
     }
 
     private void OnUnloaded(object sender, RoutedEventArgs e)
     {
         if (CurrentApp.Settings != null)
             CurrentApp.Settings.Saved -= OnSettingsSaved;
+
+        var mgr = CurrentApp.ConnectionManager;
+        if (mgr != null)
+            mgr.StateChanged -= OnConnectionStateChanged;
+    }
+
+    private void OnConnectionStateChanged(object? sender, GatewayConnectionSnapshot snapshot)
+    {
+        DispatcherQueue?.TryEnqueue(() =>
+        {
+            if (!IsLoaded) return;
+            UpdateNodeStatus();
+        });
     }
 
     private bool _suppressNodeModeToggle;
@@ -91,8 +95,7 @@ public sealed partial class PermissionsPage : Page
         ((IAppCommands)CurrentApp).NotifySettingsSaved();
         ApplyFeaturesEnabledState();
         UpdateNodeStatus();
-        UpdateSttCard();
-        UpdateTtsCard();
+        UpdateVoiceSettingsCard();
     }
 
     private void OnSettingsSaved(object? sender, EventArgs e)
@@ -105,8 +108,7 @@ public sealed partial class PermissionsPage : Page
             UpdateNodeStatus();
             ReloadFeatureToggleStates();
             UpdateMcpStatus();
-            UpdateSttCard();
-            UpdateTtsCard();
+            UpdateVoiceSettingsCard();
         });
     }
 
@@ -128,18 +130,18 @@ public sealed partial class PermissionsPage : Page
         }
     }
 
-    /// <summary>
-    /// Disables and dims the sub-toggles when Node Mode is off so users see they have
-    /// no effect until Node Mode is back on. ItemsRepeater isn't a Control (no IsEnabled),
-    /// so we apply per-toggle plus an Opacity on the repeater.
-    /// </summary>
+    /// <summary>Enables capability toggles whenever either node transport can serve them.</summary>
     private void ApplyFeaturesEnabledState()
     {
-        var nodeEnabled = CurrentApp.Settings?.EnableNodeMode ?? false;
-        CapabilityRepeater.Opacity = nodeEnabled ? 1.0 : 0.4;
-        foreach (var toggle in _featureToggles)
-            toggle.IsEnabled = nodeEnabled;
-        FeaturesSectionDescription.Text = LocalizationHelper.GetString(nodeEnabled
+        var s = CurrentApp.Settings;
+        var canServe = (s?.EnableNodeMode ?? false) || (s?.EnableMcpServer ?? false);
+        CapabilityRepeater.Opacity = canServe ? 1.0 : 0.4;
+        for (int i = 0; i < _featureToggles.Count; i++)
+        {
+            var isBrowserProxyToggle = i == BrowserProxyToggleIndex;
+            _featureToggles[i].IsEnabled = canServe && (!isBrowserProxyToggle || s?.EnableNodeMode == true);
+        }
+        FeaturesSectionDescription.Text = LocalizationHelper.GetString(canServe
             ? "PermissionsPage_FeaturesDescription_Enabled"
             : "PermissionsPage_FeaturesDescription_Disabled");
     }
@@ -149,47 +151,45 @@ public sealed partial class PermissionsPage : Page
         if (CurrentApp.Settings == null) return;
         var settings = CurrentApp.Settings;
 
-        // OnToggleSideEffect runs after the new value is persisted.
-        var capabilities = new (string Icon, string Label, string Description, bool Value, Action<bool> Setter, Action<bool>? OnToggleSideEffect)[]
+        var capabilities = new (string Icon, string Label, string Description, bool Value, Action<bool> Setter)[]
         {
             ("⚡",
                 LocalizationHelper.GetString("PermissionsPage_Cap_SystemRun_Label"),
                 LocalizationHelper.GetString("PermissionsPage_Cap_SystemRun_Description"),
-                settings.NodeSystemRunEnabled, v => settings.NodeSystemRunEnabled = v, null),
+                settings.NodeSystemRunEnabled, v => settings.NodeSystemRunEnabled = v),
             ("🌐",
                 LocalizationHelper.GetString("PermissionsPage_Cap_Browser_Label"),
                 LocalizationHelper.GetString("PermissionsPage_Cap_Browser_Description"),
-                settings.NodeBrowserProxyEnabled, v => settings.NodeBrowserProxyEnabled = v, null),
+                settings.NodeBrowserProxyEnabled, v => settings.NodeBrowserProxyEnabled = v),
             ("📷",
                 LocalizationHelper.GetString("PermissionsPage_Cap_Camera_Label"),
                 LocalizationHelper.GetString("PermissionsPage_Cap_Camera_Description"),
-                settings.NodeCameraEnabled, v => settings.NodeCameraEnabled = v, null),
+                settings.NodeCameraEnabled, v => settings.NodeCameraEnabled = v),
             ("🎨",
                 LocalizationHelper.GetString("PermissionsPage_Cap_Canvas_Label"),
                 LocalizationHelper.GetString("PermissionsPage_Cap_Canvas_Description"),
-                settings.NodeCanvasEnabled, v => settings.NodeCanvasEnabled = v, null),
+                settings.NodeCanvasEnabled, v => settings.NodeCanvasEnabled = v),
             ("🖥️",
                 LocalizationHelper.GetString("PermissionsPage_Cap_Screen_Label"),
                 LocalizationHelper.GetString("PermissionsPage_Cap_Screen_Description"),
-                settings.NodeScreenEnabled, v => settings.NodeScreenEnabled = v, null),
+                settings.NodeScreenEnabled, v => settings.NodeScreenEnabled = v),
             ("📍",
                 LocalizationHelper.GetString("PermissionsPage_Cap_Location_Label"),
                 LocalizationHelper.GetString("PermissionsPage_Cap_Location_Description"),
-                settings.NodeLocationEnabled, v => settings.NodeLocationEnabled = v, null),
+                settings.NodeLocationEnabled, v => settings.NodeLocationEnabled = v),
             ("🔊",
                 LocalizationHelper.GetString("PermissionsPage_Cap_Tts_Label"),
                 LocalizationHelper.GetString("PermissionsPage_Cap_Tts_Description"),
-                settings.NodeTtsEnabled, v => settings.NodeTtsEnabled = v, null),
+                settings.NodeTtsEnabled, v => settings.NodeTtsEnabled = v),
             ("🎤",
                 LocalizationHelper.GetString("PermissionsPage_Cap_Stt_Label"),
                 LocalizationHelper.GetString("PermissionsPage_Cap_Stt_Description"),
-                settings.NodeSttEnabled, v => settings.NodeSttEnabled = v,
-                v => { if (v) EnsureWhisperModelDownloadedAsync(); }),
+                settings.NodeSttEnabled, v => settings.NodeSttEnabled = v),
         };
 
         var items = new List<UIElement>();
         _featureToggles.Clear();
-        foreach (var (icon, label, description, value, setter, sideEffect) in capabilities)
+        foreach (var (icon, label, description, value, setter) in capabilities)
         {
             var toggle = new ToggleSwitch
             {
@@ -199,15 +199,12 @@ public sealed partial class PermissionsPage : Page
                 OffContent = "",
             };
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(toggle, label);
-            var capturedSideEffect = sideEffect;
             toggle.Toggled += (s, e) =>
             {
                 setter(toggle.IsOn);
                 settings.Save();
                 ((IAppCommands)CurrentApp).NotifySettingsSaved();
-                capturedSideEffect?.Invoke(toggle.IsOn);
-                UpdateSttCard();
-                UpdateTtsCard();
+                UpdateVoiceSettingsCard();
                 UpdateNodeStatus();
             };
             _featureToggles.Add(toggle);
@@ -215,64 +212,6 @@ public sealed partial class PermissionsPage : Page
         }
 
         CapabilityRepeater.ItemsSource = items;
-    }
-
-    private bool _isDownloadingWhisperModel;
-    private string? _whisperDownloadError;
-
-    /// <summary>
-    /// Kicks off a Whisper model download if one isn't already on disk. Tracks state
-    /// page-locally so <see cref="UpdateSttEngineHint"/> can surface "downloading" /
-    /// failure copy that's accurate regardless of which code path started the download.
-    /// </summary>
-    private void EnsureWhisperModelDownloadedAsync() =>
-        AsyncEventHandlerGuard.Run(
-            EnsureWhisperModelDownloadedCoreAsync,
-            new OpenClawTray.AppLogger(),
-            nameof(EnsureWhisperModelDownloadedAsync));
-
-    private async Task EnsureWhisperModelDownloadedCoreAsync()
-    {
-        var logger = new AppLogger();
-        try
-        {
-            var modelName = CurrentApp.Settings?.SttModelName ?? "base";
-            var modelManager = new OpenClaw.Shared.Audio.WhisperModelManager(
-                SettingsManager.SettingsDirectoryPath, logger);
-
-            if (modelManager.IsModelDownloaded(modelName) || _isDownloadingWhisperModel) return;
-            // Also defer to a VoiceService-initiated download that may be in flight —
-            // concurrent writes to the same model file would otherwise be possible.
-            if (CurrentApp.VoiceService?.IsWhisperDownloadingModel == true)
-            {
-                if (IsLoaded) UpdateSttCard();
-                return;
-            }
-
-            _isDownloadingWhisperModel = true;
-            _whisperDownloadError = null;
-            if (IsLoaded) UpdateSttCard();
-
-            try
-            {
-                await modelManager.DownloadModelAsync(modelName, progress: null, default).ConfigureAwait(true);
-            }
-            catch (Exception ex)
-            {
-                _whisperDownloadError = ex.Message;
-                logger.Error($"[PermissionsPage] Whisper model download failed: {ex.Message}");
-            }
-            finally
-            {
-                _isDownloadingWhisperModel = false;
-                if (IsLoaded) UpdateSttCard();
-            }
-        }
-        catch (Exception ex)
-        {
-            // Last-resort guard: log and swallow so background work can never crash the app.
-            logger.Error($"[PermissionsPage] EnsureWhisperModelDownloadedAsync unexpected failure: {ex}");
-        }
     }
 
     private static Border BuildCapabilityRow(string icon, string label, string description, ToggleSwitch toggle)
@@ -322,175 +261,126 @@ public sealed partial class PermissionsPage : Page
         };
     }
 
-    // ── Speech-to-Text card ──────────────────────────────────────────
+    // ── Voice settings link ──────────────────────────────────────────
 
-    private void UpdateSttCard()
+    private void UpdateVoiceSettingsCard()
     {
-        var enabled = CurrentApp.Settings?.NodeSttEnabled == true;
-        SttCard.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
-        if (!enabled || CurrentApp.Settings == null) return;
-        UpdateSttEngineHint();
+        var settings = CurrentApp.Settings;
+        var enabled = settings?.NodeSttEnabled == true || settings?.NodeTtsEnabled == true;
+        var setupRequirement = settings == null
+            ? VoiceSetupRequirement.None
+            : GetVoiceSetupRequirement(settings);
+
+        VoiceSettingsCard.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
+        VoiceSettingsHelpPanel.Visibility = setupRequirement != VoiceSetupRequirement.None
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        VoiceSettingsHelpText.Text = GetVoiceSetupRequirementText(setupRequirement);
     }
 
-    private void UpdateSttEngineHint()
+    private enum VoiceSetupRequirement
     {
-        var modelName = CurrentApp.Settings?.SttModelName ?? "base";
-        var modelManager = new OpenClaw.Shared.Audio.WhisperModelManager(
-            SettingsManager.SettingsDirectoryPath, new AppLogger());
-        var modelDownloaded = modelManager.IsModelDownloaded(modelName);
-        var modelDownloading = _isDownloadingWhisperModel
-            || (CurrentApp.VoiceService?.IsWhisperDownloadingModel ?? false);
-
-        if (modelDownloaded)
-        {
-            SttEngineHint.Text = LocalizationHelper.GetString("PermissionsPage_SttHint_Ready");
-        }
-        else if (modelDownloading)
-        {
-            SttEngineHint.Text = LocalizationHelper.GetString("PermissionsPage_SttHint_Downloading");
-        }
-        else if (!string.IsNullOrWhiteSpace(_whisperDownloadError))
-        {
-            SttEngineHint.Text = LocalizationHelper.Format(
-                "PermissionsPage_SttHint_FailedFormat", _whisperDownloadError);
-        }
-        else
-        {
-            SttEngineHint.Text = LocalizationHelper.GetString("PermissionsPage_SttHint_NotDownloaded");
-        }
+        None,
+        SpeechModel,
+        VoiceSetup,
+        SpeechModelAndVoiceSetup
     }
 
-    private void OnSttMoreSettingsClick(object sender, RoutedEventArgs e)
+    private static VoiceSetupRequirement GetVoiceSetupRequirement(SettingsManager settings)
+    {
+        var needsSpeechModel = settings.NodeSttEnabled && !IsConfiguredWhisperModelDownloaded(settings);
+        var needsVoiceSetup = settings.NodeTtsEnabled && SpeechSetupReadiness.IsConfiguredTtsProviderSetupRequired(settings);
+
+        return (needsSpeechModel, needsVoiceSetup) switch
+        {
+            (true, true) => VoiceSetupRequirement.SpeechModelAndVoiceSetup,
+            (true, false) => VoiceSetupRequirement.SpeechModel,
+            (false, true) => VoiceSetupRequirement.VoiceSetup,
+            _ => VoiceSetupRequirement.None
+        };
+    }
+
+    private static string GetVoiceSetupRequirementText(VoiceSetupRequirement requirement)
+    {
+        var key = requirement switch
+        {
+            VoiceSetupRequirement.SpeechModel => "PermissionsPage_VoiceSettingsHelp_SpeechModel",
+            VoiceSetupRequirement.VoiceSetup => "PermissionsPage_VoiceSettingsHelp_VoiceSetup",
+            VoiceSetupRequirement.SpeechModelAndVoiceSetup => "PermissionsPage_VoiceSettingsHelp_Both",
+            _ => ""
+        };
+
+        return string.IsNullOrEmpty(key) ? "" : LocalizationHelper.GetString(key);
+    }
+
+    private static bool IsConfiguredWhisperModelDownloaded(SettingsManager settings)
+    {
+        var modelName = settings.SttModelName;
+        if (!WhisperModelManager.AvailableModels.Any(m =>
+                string.Equals(m.Name, modelName, StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        var manager = new WhisperModelManager(SettingsManager.SettingsDirectoryPath, new AppLogger());
+        return manager.IsModelDownloaded(modelName);
+    }
+
+    private void OnVoiceSettingsClick(object sender, RoutedEventArgs e)
     {
         ((IAppCommands)CurrentApp).Navigate("voice");
-    }
-
-    // ── Text-to-Speech card ──────────────────────────────────────────
-
-    private void UpdateTtsCard()
-    {
-        var enabled = CurrentApp.Settings?.NodeTtsEnabled == true;
-        TtsCard.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
-        if (!enabled || CurrentApp.Settings == null) return;
-
-        var settings = CurrentApp.Settings;
-
-        _suppressTtsProviderChange = true;
-        TtsProviderComboBox.SelectedIndex = settings.TtsProvider switch
-        {
-            var p when string.Equals(p, TtsCapability.ElevenLabsProvider, StringComparison.OrdinalIgnoreCase) => 2,
-            var p when string.Equals(p, TtsCapability.WindowsProvider, StringComparison.OrdinalIgnoreCase)    => 1,
-            _ => 0
-        };
-        _suppressTtsProviderChange = false;
-
-        // Don't overwrite a field the user is currently editing — external Settings.Saved
-        // events can fire while the user has focus on these boxes (Permissions subscribes
-        // to the same event), and rewriting would lose their in-progress input.
-        if (TtsElevenLabsApiKeyBox.FocusState == FocusState.Unfocused)
-        {
-            TtsElevenLabsApiKeyBox.Password =
-                string.IsNullOrEmpty(settings.TtsElevenLabsApiKey) ? "" : SavedApiKeySentinel;
-        }
-        if (TtsElevenLabsVoiceIdBox.FocusState == FocusState.Unfocused)
-        {
-            TtsElevenLabsVoiceIdBox.Text = settings.TtsElevenLabsVoiceId;
-        }
-        if (TtsElevenLabsModelBox.FocusState == FocusState.Unfocused)
-        {
-            TtsElevenLabsModelBox.Text = settings.TtsElevenLabsModel;
-        }
-
-        UpdateTtsElevenLabsPanelVisibility();
-        // No unconditional TtsStatusText reset: this method is dispatched from
-        // OnSettingsSaved, which can fire one frame after a local handler set the
-        // status ("Default provider: x", "ElevenLabs settings saved.") — wiping it
-        // here would erase the auto-save toast. Status is left to the handlers that
-        // explicitly set or clear it.
-    }
-
-    private void UpdateTtsElevenLabsPanelVisibility()
-    {
-        var isEleven = (TtsProviderComboBox.SelectedItem is ComboBoxItem item)
-            && string.Equals(item.Tag as string, TtsCapability.ElevenLabsProvider, StringComparison.OrdinalIgnoreCase);
-        TtsElevenLabsPanel.Visibility = isEleven ? Visibility.Visible : Visibility.Collapsed;
-    }
-
-    private void OnTtsProviderSelectionChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (_suppressTtsProviderChange) return;
-        if (CurrentApp.Settings == null) return;
-
-        var newProvider = (TtsProviderComboBox.SelectedItem is ComboBoxItem item && item.Tag is string tag)
-            ? tag
-            : TtsCapability.WindowsProvider;
-
-        if (!string.Equals(CurrentApp.Settings.TtsProvider, newProvider, StringComparison.OrdinalIgnoreCase))
-        {
-            CurrentApp.Settings.TtsProvider = newProvider;
-            CurrentApp.Settings.Save();
-            TtsStatusText.Text = LocalizationHelper.Format(
-                "PermissionsPage_TtsStatus_DefaultProviderFormat", newProvider);
-        }
-
-        UpdateTtsElevenLabsPanelVisibility();
-    }
-
-    private void OnTtsElevenLabsCommitted(object sender, RoutedEventArgs e)
-    {
-        if (CurrentApp.Settings == null) return;
-        var settings = CurrentApp.Settings;
-
-        var changed = false;
-
-        var typedKey = TtsElevenLabsApiKeyBox.Password ?? "";
-        if (!string.Equals(typedKey, SavedApiKeySentinel, StringComparison.Ordinal))
-        {
-            var trimmedKey = typedKey.Trim();
-            if (!string.Equals(settings.TtsElevenLabsApiKey, trimmedKey, StringComparison.Ordinal))
-            {
-                settings.TtsElevenLabsApiKey = trimmedKey;
-                changed = true;
-            }
-        }
-
-        var voiceId = TtsElevenLabsVoiceIdBox.Text?.Trim() ?? "";
-        if (!string.Equals(settings.TtsElevenLabsVoiceId, voiceId, StringComparison.Ordinal))
-        {
-            settings.TtsElevenLabsVoiceId = voiceId;
-            changed = true;
-        }
-
-        var model = TtsElevenLabsModelBox.Text?.Trim() ?? "";
-        if (!string.Equals(settings.TtsElevenLabsModel, model, StringComparison.Ordinal))
-        {
-            settings.TtsElevenLabsModel = model;
-            changed = true;
-        }
-
-        if (changed)
-        {
-            settings.Save();
-            TtsElevenLabsApiKeyBox.Password =
-                string.IsNullOrEmpty(settings.TtsElevenLabsApiKey) ? "" : SavedApiKeySentinel;
-            TtsStatusText.Text = LocalizationHelper.GetString("PermissionsPage_TtsStatus_ElevenLabsSaved");
-        }
     }
 
     // ── Node status ──────────────────────────────────────────────────
 
     private void UpdateNodeStatus()
     {
-        var nodeEnabled = CurrentApp.Settings?.EnableNodeMode ?? false;
-        var isConnected = (CurrentApp.AppState?.Status ?? ConnectionStatus.Disconnected) == ConnectionStatus.Connected;
+        var settings = CurrentApp.Settings;
+        var nodeEnabled = settings?.EnableNodeMode ?? false;
+        var mcpEnabled = settings?.EnableMcpServer ?? false;
 
         if (!nodeEnabled)
         {
-            NodeStatusDot.Fill = new SolidColorBrush(Microsoft.UI.Colors.Gray);
-            NodeStatusText.Text = LocalizationHelper.GetString("PermissionsPage_NodeStatus_Disabled");
-            NodeDetailsText.Text = LocalizationHelper.GetString("PermissionsPage_NodeStatus_DisabledDetails");
+            if (mcpEnabled && settings != null)
+            {
+                var mcpError = CurrentApp.ActiveNodeService?.McpStartupError;
+                if (!string.IsNullOrEmpty(mcpError))
+                {
+                    NodeStatusDot.Fill = new SolidColorBrush(Microsoft.UI.Colors.OrangeRed);
+                    NodeStatusText.Text = LocalizationHelper.GetString("PermissionsPage_NodeStatus_McpError");
+                    NodeDetailsText.Text = mcpError;
+                }
+                else
+                {
+                    NodeStatusDot.Fill = new SolidColorBrush(Microsoft.UI.Colors.DodgerBlue);
+                    NodeStatusText.Text = LocalizationHelper.GetString("PermissionsPage_NodeStatus_McpOnly");
+                    NodeDetailsText.Text = LocalizationHelper.Format(
+                        "PermissionsPage_NodeStatus_McpOnlyDetailsFormat",
+                        NodeCapabilityGating.CountMcpServedCapabilities(settings),
+                        NodeService.McpServerUrl);
+                }
+            }
+            else
+            {
+                NodeStatusDot.Fill = new SolidColorBrush(Microsoft.UI.Colors.Gray);
+                NodeStatusText.Text = LocalizationHelper.GetString("PermissionsPage_NodeStatus_Disabled");
+                NodeDetailsText.Text = LocalizationHelper.GetString("PermissionsPage_NodeStatus_DisabledDetails");
+            }
+            return;
         }
-        else if (isConnected)
+
+        var snap = CurrentApp.ConnectionManager?.CurrentSnapshot;
+        var nodeState = snap?.NodeState ?? RoleConnectionState.Idle;
+        var operatorConnected = snap?.OperatorState == RoleConnectionState.Connected;
+        var mcpStartupError = CurrentApp.ActiveNodeService?.McpStartupError;
+
+        if (mcpEnabled && !string.IsNullOrEmpty(mcpStartupError))
+        {
+            NodeStatusDot.Fill = new SolidColorBrush(Microsoft.UI.Colors.OrangeRed);
+            NodeStatusText.Text = LocalizationHelper.GetString("PermissionsPage_NodeStatus_McpError");
+            NodeDetailsText.Text = mcpStartupError;
+        }
+        else if (nodeState == RoleConnectionState.Connected && operatorConnected)
         {
             NodeStatusDot.Fill = new SolidColorBrush(Microsoft.UI.Colors.LimeGreen);
             NodeStatusText.Text = LocalizationHelper.GetString("PermissionsPage_NodeStatus_Active");
@@ -505,11 +395,22 @@ public sealed partial class PermissionsPage : Page
                     caps.Count, string.Join(", ", caps))
                 : LocalizationHelper.GetString("PermissionsPage_NodeStatus_NoCapabilities");
         }
+        else if (nodeState == RoleConnectionState.Connecting)
+        {
+            NodeStatusDot.Fill = new SolidColorBrush(Microsoft.UI.Colors.Goldenrod);
+            NodeStatusText.Text = LocalizationHelper.GetString("PermissionsPage_NodeStatus_Starting");
+            NodeDetailsText.Text = LocalizationHelper.GetString("PermissionsPage_NodeStatus_NotConnectedDetails");
+        }
         else
         {
             NodeStatusDot.Fill = new SolidColorBrush(Microsoft.UI.Colors.Orange);
             NodeStatusText.Text = LocalizationHelper.GetString("PermissionsPage_NodeStatus_NotConnected");
-            NodeDetailsText.Text = LocalizationHelper.GetString("PermissionsPage_NodeStatus_NotConnectedDetails");
+            NodeDetailsText.Text = mcpEnabled && settings != null && string.IsNullOrEmpty(mcpStartupError)
+                ? LocalizationHelper.Format(
+                    "PermissionsPage_NodeStatus_McpOnlyDetailsFormat",
+                    NodeCapabilityGating.CountMcpServedCapabilities(settings),
+                    NodeService.McpServerUrl)
+                : LocalizationHelper.GetString("PermissionsPage_NodeStatus_NotConnectedDetails");
         }
     }
 
@@ -528,6 +429,14 @@ public sealed partial class PermissionsPage : Page
 
         if (settings.EnableMcpServer)
         {
+            var mcpError = CurrentApp.ActiveNodeService?.McpStartupError;
+            if (!string.IsNullOrEmpty(mcpError))
+            {
+                McpStatusText.Text =
+                    $"{LocalizationHelper.GetString("PermissionsPage_NodeStatus_McpError")}: {mcpError}";
+                return;
+            }
+
             var tokenPath = NodeService.McpTokenPath;
             var tokenExists = File.Exists(tokenPath);
             McpStatusText.Text = LocalizationHelper.GetString(tokenExists
@@ -544,6 +453,8 @@ public sealed partial class PermissionsPage : Page
         CurrentApp.Settings.Save();
         ((IAppCommands)CurrentApp).NotifySettingsSaved();
         UpdateMcpStatus();
+        UpdateNodeStatus();
+        ApplyFeaturesEnabledState();
     }
 
     private void OnCopyMcpToken(object sender, RoutedEventArgs e)
@@ -582,9 +493,7 @@ public sealed partial class PermissionsPage : Page
         _loadingExecPolicy = true;
         try
         {
-            var policyPath = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "OpenClawTray", "exec-policy.json");
+            var policyPath = ExecPolicyPath;
 
             if (File.Exists(policyPath))
             {
@@ -594,7 +503,7 @@ public sealed partial class PermissionsPage : Page
 
                 if (root.TryGetProperty("defaultAction", out var da))
                 {
-                    var action = da.GetString() ?? "deny";
+                    var action = NormalizeExecPolicyAction(da);
                     for (int i = 0; i < DefaultActionCombo.Items.Count; i++)
                     {
                         if (DefaultActionCombo.Items[i] is ComboBoxItem item && item.Tag?.ToString() == action)
@@ -613,7 +522,10 @@ public sealed partial class PermissionsPage : Page
                             // Accept either case — earlier saves wrote "Pattern" capitalized
                             // due to an anonymous-type property name leak.
                             Pattern = TryGetStringCaseInsensitive(rule, "pattern", "Pattern") ?? "",
-                            Action = TryGetStringCaseInsensitive(rule, "action", "Action") ?? "deny",
+                            Action = ExecPolicyRuleList.TryGetActionCaseInsensitive(rule, "action", "Action") ?? "deny",
+                            Shells = TryGetStringArrayCaseInsensitive(rule, "shells", "Shells"),
+                            Description = TryGetStringCaseInsensitive(rule, "description", "Description"),
+                            Enabled = TryGetBoolCaseInsensitive(rule, "enabled", "Enabled") ?? true,
                             Index = idx++
                         });
                     }
@@ -636,13 +548,18 @@ public sealed partial class PermissionsPage : Page
         for (int i = 0; i < _policyRules.Count; i++) _policyRules[i].Index = i;
         var allowBrush = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["SystemFillColorSuccessBrush"];
         var denyBrush = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["SystemFillColorCriticalBrush"];
+        var askBrush = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["SystemFillColorCautionBrush"];
         PolicyRulesList.ItemsSource = null;
         PolicyRulesList.ItemsSource = _policyRules.Select(r => new
         {
             r.Pattern,
-            r.Action,
+            Action = DisplayExecPolicyAction(r.Action),
             r.Index,
-            ActionBrush = r.Action == "allow" ? allowBrush : denyBrush
+            RemoveRuleAutomationName = $"Remove rule {r.Pattern}",
+            RemoveRuleAutomationId = $"RemoveExecPolicyRuleButton_{r.Index}",
+            ActionBrush = r.Action == "allow"
+                ? allowBrush
+                : r.Action == "prompt" ? askBrush : denyBrush
         }).ToList();
 
         // Header badge + empty state
@@ -663,8 +580,8 @@ public sealed partial class PermissionsPage : Page
         if (string.IsNullOrEmpty(pattern)) return;
         // Read .Tag (invariant identifier) instead of .Content so future localization
         // of the allow/deny strings can't break the JSON contract on disk.
-        var action = (NewRuleAction.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? "deny";
-        _policyRules.Add(new ExecPolicyRule { Pattern = pattern, Action = action });
+        var action = NormalizeExecPolicyAction((NewRuleAction.SelectedItem as ComboBoxItem)?.Tag?.ToString());
+        ExecPolicyRuleList.UpsertByPattern(_policyRules, pattern, action);
         NewRulePattern.Text = "";
         RefreshPolicyRulesList();
         SaveExecPolicyToDisk();
@@ -688,25 +605,47 @@ public sealed partial class PermissionsPage : Page
 
     private bool _loadingExecPolicy;
     private Microsoft.UI.Dispatching.DispatcherQueueTimer? _execSavedHintTimer;
+    private static string ExecPolicyPath => Path.Combine(CurrentApp.DataDirectoryPath, "exec-policy.json");
 
-    private void SaveExecPolicyToDisk()
+    private void SaveExecPolicyToDisk(bool showSavedHint = true)
     {
+        string? tmpPath = null;
         try
         {
-            var policyPath = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "OpenClawTray", "exec-policy.json");
+            var policyPath = ExecPolicyPath;
 
-            var defaultAction = (DefaultActionCombo.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? "deny";
+            var defaultAction = NormalizeExecPolicyAction((DefaultActionCombo.SelectedItem as ComboBoxItem)?.Tag?.ToString());
             var policy = new
             {
                 defaultAction,
-                rules = _policyRules.Select(r => new { pattern = r.Pattern, action = r.Action }).ToArray()
+                rules = _policyRules.Select(r => new
+                {
+                    pattern = r.Pattern,
+                    action = r.Action,
+                    shells = r.Shells,
+                    description = r.Description,
+                    enabled = ExecPolicyRuleList.PersistedEnabled(r.Enabled)
+                }).ToArray()
             };
 
-            var json = JsonSerializer.Serialize(policy, new JsonSerializerOptions { WriteIndented = true });
+            var json = JsonSerializer.Serialize(policy, new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+            });
             Directory.CreateDirectory(Path.GetDirectoryName(policyPath)!);
-            File.WriteAllText(policyPath, json);
+
+            // Atomic write: serialize to a sibling .tmp first, then replace.
+            // The engine hot-reloads exec-policy.json on mtime/length change;
+            // a non-atomic write could expose a partial file to a concurrent
+            // Evaluate() and the engine would skip the (broken) update.
+            tmpPath = $"{policyPath}.{Guid.NewGuid():N}.tmp";
+            File.WriteAllText(tmpPath, json);
+            MoveFileWithRetry(tmpPath, policyPath);
+            tmpPath = null;
+
+            if (!showSavedHint)
+                return;
 
             // Brief inline "Saved" pill in the rules-card header. Reuses a single
             // DispatcherQueueTimer instance so rapid saves don't orphan timers.
@@ -721,6 +660,42 @@ public sealed partial class PermissionsPage : Page
             _execSavedHintTimer.Start();
         }
         // slopwatch-ignore: SW003 Cleanup is best-effort; failure cannot improve caller state and the original outcome is preserved.
+        catch
+        {
+            TryDeleteTempFile(tmpPath);
+        }
+    }
+
+    private static void MoveFileWithRetry(string sourcePath, string destinationPath)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                File.Move(sourcePath, destinationPath, overwrite: true);
+                return;
+            }
+            catch (Exception ex) when (IsTransientReplaceException(ex) && attempt < 20)
+            {
+                Thread.Sleep(5);
+            }
+        }
+    }
+
+    private static bool IsTransientReplaceException(Exception ex) =>
+        ex is IOException or UnauthorizedAccessException;
+
+    private static void TryDeleteTempFile(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return;
+
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        // slopwatch-ignore: SW003 Cleanup is best-effort after save failure.
         catch { }
     }
 
@@ -733,6 +708,48 @@ public sealed partial class PermissionsPage : Page
         }
         return null;
     }
+
+    internal static string NormalizeExecPolicyAction(string? action) =>
+        ExecPolicyRuleList.NormalizeAction(action);
+
+    private static string NormalizeExecPolicyAction(JsonElement action) =>
+        ExecPolicyRuleList.NormalizeAction(action);
+
+    private static string[]? TryGetStringArrayCaseInsensitive(JsonElement element, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (!element.TryGetProperty(name, out var prop) || prop.ValueKind != JsonValueKind.Array)
+                continue;
+
+            var values = new List<string>();
+            foreach (var item in prop.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.String)
+                    values.Add(item.GetString() ?? "");
+            }
+
+            return values.ToArray();
+        }
+
+        return null;
+    }
+
+    private static bool? TryGetBoolCaseInsensitive(JsonElement element, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (!element.TryGetProperty(name, out var prop))
+                continue;
+            if (prop.ValueKind == JsonValueKind.True) return true;
+            if (prop.ValueKind == JsonValueKind.False) return false;
+        }
+
+        return null;
+    }
+
+    private static string DisplayExecPolicyAction(string action) =>
+        string.Equals(action, "prompt", StringComparison.OrdinalIgnoreCase) ? "ask" : action;
 
     // ── Node Allowlist ───────────────────────────────────────────────
 
@@ -814,10 +831,4 @@ public sealed partial class PermissionsPage : Page
 
     // ── Types ────────────────────────────────────────────────────────
 
-    private class ExecPolicyRule
-    {
-        public string Pattern { get; set; } = "";
-        public string Action { get; set; } = "deny";
-        public int Index { get; set; }
-    }
 }

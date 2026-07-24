@@ -12,7 +12,6 @@ using Microsoft.UI.Xaml.Documents;
 using Microsoft.UI.Xaml.Media;
 using OpenClawTray.FunctionalUI;
 using OpenClawTray.FunctionalUI.Core;
-using OpenClawTray.Chat.Explorations;
 using Windows.UI;
 using static OpenClawTray.FunctionalUI.Factories;
 using static OpenClawTray.FunctionalUI.Core.Theme;
@@ -37,32 +36,26 @@ namespace OpenClawTray.Chat;
 /// inside an assistant bubble. Used by callers to bridge the gap between
 /// turn-start and the first assistant delta arriving.
 /// </param>
-/// <param name="ShowUsageMetadata">
-/// When true, allows gateway-reported token/context metadata in assistant
-/// footers. Production chat keeps this false so debug exploration presets
-/// cannot expose usage details in the main surface.
-/// </param>
-/// <param name="EnableExplorationControls">
-/// When true, honors Chat Exploration debug visibility controls. Production
-/// chat keeps this false so saved exploration presets cannot hide assistant
-/// bubbles or tool-call progress.
-/// </param>
+/// <param name="ShowToolCalls">When true, renders tool-call progress and usage footer summaries.</param>
+/// <param name="ToolCallsCollapseVersion">Bumps when expanded tool details should be reset.</param>
 public record OpenClawChatTimelineProps(
     string? SessionId,
     IReadOnlyList<ChatTimelineItem> Entries,
     bool HasMoreHistory,
     Action? OnLoadMoreHistory,
     IReadOnlyDictionary<string, ChatEntryMetadata>? EntryMetadata = null,
+    long TimelineGeneration = 0,
     string UserSenderLabel = "OpenClaw Windows Tray",
     string AssistantSenderLabel = "Field",
     string? DefaultModel = null,
+    string? DefaultUsageSummary = null,
     bool ShowThinkingIndicator = false,
-    bool ShowUsageMetadata = false,
-    bool EnableExplorationControls = false,
+    bool ShowToolCalls = true,
+    int ToolCallsCollapseVersion = 0,
     Func<string, Task>? OnReadAloud = null,
     Action? OnStopSpeaking = null,
     int ScrollToBottomToken = 0,
-    Action<string, bool>? OnPermissionResponse = null);
+    Action<string, string>? OnPermissionResponse = null);
 
 /// <summary>
 /// OpenClaw-skinned variant of <see cref="ChatTimeline"/> from the vendored
@@ -82,6 +75,33 @@ public record OpenClawChatTimelineProps(
 public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
 {
     const double FollowThreshold = 60;
+    // Bounded settle used by QueueScrollToBottom to catch LATE virtualization extent
+    // corrections: after a discrete scroll-to-bottom, a row can realize below the fold a few
+    // frames later, growing the extent with NO ViewChanged/SizeChanged to drive a re-pin. A
+    // short self-terminating timer keeps chasing the true bottom until the extent is stable
+    // for a couple of ticks (or the hard cap elapses), then restores bottom anchoring. Re-pins
+    // are ChangeView-only (they never grow the extent) so this converges and cannot storm.
+    const int FollowToBottomSettleTickMs = 16;
+    const int FollowToBottomMaxSettleTicks = 24;
+    const int FollowToBottomSettleStableTicks = 2;
+    // While the settle timer is chasing the true bottom, an offset that lands below the bottom is
+    // either post-jump virtualization re-estimation (a BOUNDED band — keep chasing) or a genuine
+    // user scroll-up to read earlier history (MANY viewports away — abandon and don't fight). The
+    // abandon gap is the larger of an absolute floor and a viewport-relative band so it scales
+    // with window size while never dipping below the floor on short viewports.
+    const double FollowToBottomMinAbandonGap = 900;
+    const double FollowToBottomAbandonViewportFactor = 1.5;
+    // Follow-to-bottom during in-place streaming growth is handled by WinUI ScrollViewer scroll
+    // anchoring (sv.VerticalAnchorRatio = 1.0), NOT by a reactive post-layout re-pin. With the
+    // bottom row pinned as an anchor, the ScrollViewer keeps it glued to the viewport bottom
+    // BEFORE each frame is painted as the ItemsRepeater's extent estimate climbs during
+    // realization — so there is no intermediate short frame (no jitter) and no programmatic
+    // ChangeView fighting the user's own scrolling. Discrete events (new entry, session switch,
+    // initial load, ScrollToBottom token) use QueueScrollToBottom, which briefly turns anchoring
+    // OFF while it drives ChangeView to the true bottom then restores 1.0 — otherwise anchoring
+    // would re-pin the stale bottom row mid-growth and the view would land one row short.
+    // Anchoring alone covers the in-place growth case that fires no reliable SizeChanged. See
+    // issue #996 for the upstream (Reactor) port context.
 
     /// <summary>
     /// Static scroll-offset store shared across all timeline instances so that
@@ -149,6 +169,9 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
     private const string MonoFontFamilySource = "Cascadia Code, Cascadia Mono, Consolas";
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<
         Microsoft.UI.Dispatching.DispatcherQueue, FontFamily> s_monoFontByDispatcher = new();
+    private const string ChatTextFontFamilySource = "Segoe UI Variable Text, Segoe UI";
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<
+        Microsoft.UI.Dispatching.DispatcherQueue, FontFamily> s_chatTextFontByDispatcher = new();
     private static FontFamily s_monoFontFamily
     {
         get
@@ -162,6 +185,23 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
             {
                 family = new FontFamily(MonoFontFamilySource);
                 s_monoFontByDispatcher.Add(dispatcher, family);
+            }
+            return family;
+        }
+    }
+    private static FontFamily s_chatTextFontFamily
+    {
+        get
+        {
+            var dispatcher = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
+            if (dispatcher is null)
+            {
+                return new FontFamily(ChatTextFontFamilySource);
+            }
+            if (!s_chatTextFontByDispatcher.TryGetValue(dispatcher, out var family))
+            {
+                family = new FontFamily(ChatTextFontFamilySource);
+                s_chatTextFontByDispatcher.Add(dispatcher, family);
             }
             return family;
         }
@@ -278,8 +318,7 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 if (v is SolidColorBrush brush) return brush.Color;
             }
         }
-        // slopwatch-ignore: SW003 Audited non-critical fallback is intentional and the caller preserves safe behavior without this work.
-        catch { /* resource lookup can throw in unpackaged/test hosts */ }
+        catch (Exception ex) { OpenClawTray.Services.Logger.Debug($"ChatTimeline: resource brush lookup failed (unpackaged/test host?): {ex.Message}"); }
         return fallback;
     }
 
@@ -296,6 +335,28 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
         textBlock.Inlines.Clear();
         if (normalized.Length > 0)
             textBlock.Inlines.Add(new Run { Text = normalized });
+    }
+
+    // RichTextBlock analog of the user-bubble plain-text cache. Selection lives
+    // on the RichTextBlock, so re-applying identical text must NOT clear Blocks
+    // (that wipes the active selection). Skip the rebuild when the run is
+    // unchanged and a paragraph is still present.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<RichTextBlock, string>
+        s_userParagraphCache = new();
+
+    private static void ApplyPlainSelectableParagraph(RichTextBlock richTextBlock, string? text)
+    {
+        var normalized = text ?? string.Empty;
+        if (richTextBlock.Blocks.Count > 0
+            && s_userParagraphCache.TryGetValue(richTextBlock, out var cached)
+            && cached == normalized)
+            return;
+        s_userParagraphCache.AddOrUpdate(richTextBlock, normalized);
+        richTextBlock.Blocks.Clear();
+        var paragraph = new Paragraph();
+        if (normalized.Length > 0)
+            paragraph.Inlines.Add(new Run { Text = normalized });
+        richTextBlock.Blocks.Add(paragraph);
     }
 
     // Cache parsed markdown text per TextBlock to avoid re-clearing and
@@ -442,45 +503,19 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
 
     public override Element Render()
     {
-        // Subscribe to ChatExplorationState so toggles live-rerender the
-        // timeline. Same inline pattern as OpenClawComposer (UseState +
-        // UseEffect — extension methods can't access protected hooks).
-        var explorationRev = UseState(0, threadSafe: true);
-        var explorationRevRef = UseRef(0);
-        UseEffect((Func<Action>)(() =>
-        {
-            if (!Props.EnableExplorationControls)
-                return () => { };
-
-            // Use a Ref for the counter to avoid stale-closure: the effect
-            // runs once, so explorationRev.Value would be stuck at 0. The
-            // Ref's .Current is always live, ensuring every Changed event
-            // produces a unique value → always triggers a re-render.
-            EventHandler h = (_, _) =>
-            {
-                explorationRevRef.Current++;
-                explorationRev.Set(explorationRevRef.Current);
-            };
-            ChatExplorationState.Changed += h;
-            return () => ChatExplorationState.Changed -= h;
-        }));
-
-        // Production chat uses stable visual defaults. Tool-call visibility is
-        // the one user-facing composer toggle that applies outside preview.
-        var bubbleRadius     = Props.EnableExplorationControls ? ChatVisualResolver.BubbleCornerRadius() : new CornerRadius(16);
-        var bubblePadding    = Props.EnableExplorationControls ? ChatVisualResolver.BubbleInnerPadding() : new Thickness(16, 12, 16, 12);
-        var bubbleSideMargin = Props.EnableExplorationControls ? ChatVisualResolver.BubbleSideMargin() : 8;
-        var showAsstBubbles  = !Props.EnableExplorationControls || ChatVisualResolver.ShowAssistantBubbles();
-        var showToolCalls    = ChatVisualResolver.ShowToolCalls();
-        var gutter           = Props.EnableExplorationControls ? ChatExplorationState.Gutter : 64;
-        var messageGap       = Props.EnableExplorationControls ? ChatExplorationState.MessageGap : 12;
-        var showUserAvatar   = Props.EnableExplorationControls && ChatVisualResolver.ShowUserAvatar();
-        var showAssistAvatar = !Props.EnableExplorationControls || ChatVisualResolver.ShowAssistantAvatar();
-        var showTimestamps   = !Props.EnableExplorationControls || ChatVisualResolver.ShowTimestamps();
+        var bubbleRadius     = new CornerRadius(16);
+        var bubblePadding    = new Thickness(16, 12, 16, 12);
+        const double bubbleSideMargin = 8;
+        const bool showAsstBubbles = true;
+        var showToolCalls = Props.ShowToolCalls;
+        const double gutter = 64;
+        const bool showUserAvatar = false;
+        const bool showAssistAvatar = true;
+        const bool showTimestamps = true;
 
         var scrollViewRef = UseRef<Microsoft.UI.Xaml.Controls.ScrollViewer?>(null);
         var isFollowingRef = UseRef(true);
-        var contentRef = UseRef<Microsoft.UI.Xaml.Controls.StackPanel?>(null);
+        var contentRef = UseRef<FrameworkElement?>(null);
         var prevEntryCountRef = UseRef(0);
         var prevSessionIdRef = UseRef<string?>(null);
         var prevFirstEntryIdRef = UseRef<string?>(null);
@@ -490,6 +525,14 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
         var suppressAutoFollowRef = UseRef(false);
         var sessionOffsetsRef = UseRef<Dictionary<string, double>>(new());
         var prevScrollToBottomTokenRef = UseRef(0);
+        var scrollSettleTimerRef = UseRef<Microsoft.UI.Xaml.DispatcherTimer?>(null);
+        // A reactive follow (SizeChanged) enqueues a pin on the dispatcher. Without a guard,
+        // the many SizeChanged notifications fired across an ItemsRepeater realization pass pile
+        // up dozens of enqueued pins; each re-pins to the bottom and CANCELS a user scroll issued
+        // in between (their ChangeView never gets a frame to apply), so the view can never leave
+        // the bottom — the "fighting the scrollbar" bug. This flag coalesces reactive follows to a
+        // single in-flight pin/settle at a time. Explicit scroll-to-bottom requests bypass it.
+        var scrollPinPendingRef = UseRef(false);
         var hasMoreHistoryRef = UseRef(Props.HasMoreHistory);
         var loadMoreHistoryRef = UseRef<Action?>(Props.OnLoadMoreHistory);
         var loadMoreRequestedForCountRef = UseRef(-1);
@@ -503,10 +546,10 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
         // collapsed" — matches the web's default-collapsed look.
         var expandedToolChips = UseState<HashSet<string>>(new HashSet<string>(), threadSafe: true);
 
-        // Track the last-seen CollapseToolChipsVersion so we clear expanded
+        // Track the last-seen collapse version so we clear expanded
         // state when the user toggles tool calls off (collapsed view should
         // start fresh when re-shown).
-        var collapseToolChipsVersion = ChatExplorationState.CollapseToolChipsVersion;
+        var collapseToolChipsVersion = Props.ToolCallsCollapseVersion;
         var lastCollapseVersion = UseRef(collapseToolChipsVersion);
         if (lastCollapseVersion.Current != collapseToolChipsVersion)
         {
@@ -523,7 +566,10 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
         if (prevShowToolCallsRef.Current != showToolCalls)
         {
             prevShowToolCallsRef.Current = showToolCalls;
-            contentRef.Current?.Children.Clear();
+            if (contentRef.Current is ItemsRepeater repeater)
+                repeater.ItemsSource = Array.Empty<object>();
+            else if (contentRef.Current is StackPanel stackPanel)
+                stackPanel.Children.Clear();
         }
 
         // Hover state — set of entry ids currently under the pointer. Used to
@@ -647,34 +693,245 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
             StoreSessionOffset(prevSessionIdRef.Current, sv.VerticalOffset);
         }
 
-        void QueueScrollToBottom(Microsoft.UI.Xaml.Controls.ScrollViewer sv, string? sessionId, bool disableAnimation)
+        void QueueScrollToBottom(
+            Microsoft.UI.Xaml.Controls.ScrollViewer sv,
+            string? sessionId,
+            bool disableAnimation,
+            bool respectUserScrollPosition = false)
         {
             isFollowingRef.Current = true;
-            sv.DispatcherQueue.TryEnqueue(() =>
+
+            // Bottom scroll anchoring (VerticalAnchorRatio = 1.0) keeps whatever row currently
+            // sits at the viewport bottom pinned there. During a DISCRETE scroll-to-bottom the
+            // extent is still growing — rows below the current anchor keep realizing — so if
+            // anchoring stays on the platform re-pins the STALE anchor row after each ChangeView
+            // and the view settles ~one row short of the true bottom and never converges (this is
+            // the LargeNative gap=240 and ThinkingAndStreaming 30%-stick regression; see PR #1014
+            // / issue #996). Turn anchoring OFF while we drive the view to the real bottom, then
+            // restore 1.0 once the extent settles so subsequent IN-PLACE streaming growth of the
+            // newest row keeps following. This also stops anchoring and the SizeChanged-driven
+            // QueueScrollToBottom from fighting each other mid-stream (the residual streaming
+            // jitter noted on #996).
+            sv.VerticalAnchorRatio = double.NaN;
+            var anchoringRestored = false;
+            void RestoreAnchoring()
             {
+                if (anchoringRestored)
+                    return;
+                anchoringRestored = true;
+                sv.VerticalAnchorRatio = 1.0;
+            }
+
+            void PinToBottom(bool passDisableAnimation)
+            {
+                sv.UpdateLayout();
                 var bottom = sv.ScrollableHeight;
-                sv.ChangeView(null, bottom, null, disableAnimation);
+                sv.ChangeView(null, bottom, null, passDisableAnimation);
                 lastVerticalOffsetRef.Current = bottom;
                 lastScrollableHeightRef.Current = sv.ScrollableHeight;
                 isFollowingRef.Current = true;
                 StoreSessionOffset(sessionId, bottom);
-            });
+            }
+
+            // Only one settle timer runs at a time: a later discrete scroll-to-bottom (e.g. a
+            // token bump mid-stream) restarts the settle window instead of spawning parallel
+            // timers that would fight over ChangeView. Null the ref too (not just Stop) so a
+            // subsequently rejected enqueue can't leave a stopped-but-non-null timer that makes the
+            // follow gates believe a settle is still in flight and suppress follow forever.
+            scrollSettleTimerRef.Current?.Stop();
+            scrollSettleTimerRef.Current = null;
+
+            // A scroll-to-bottom is a FOLLOW intent, but it can be triggered by a layout growth
+            // (thinking indicator / new row) that fires while the user has ALREADY scrolled far up
+            // to read earlier history. Re-pinning then would yank them back down (the reported
+            // "fighting the scrollbar" bug). Distinguish the two by how far the live offset sits
+            // from the bottom: content-growth follow stays within a bounded band of the bottom,
+            // while a reader has scrolled MANY viewports away. The gap is measured on a FRESH
+            // layout (below), after any in-flight user ChangeView has been applied, so the decision
+            // never races a scroll the user just issued.
+            bool UserScrolledAway()
+            {
+                var abandonGap = Math.Max(
+                    FollowToBottomMinAbandonGap,
+                    sv.ViewportHeight * FollowToBottomAbandonViewportFactor);
+                return sv.ScrollableHeight - sv.VerticalOffset > abandonGap;
+            }
+
+            // Coalesce reactive follows: mark a pin in flight so the SizeChanged storm does not
+            // pile up dozens of enqueued pins. Held across the enqueued callback's SYNCHRONOUS
+            // layout/pin work (during which our own UpdateLayout/ChangeView can re-enter
+            // SizeChanged) and released only in a terminal path: after the settle timer is started
+            // and owns the chase, on the abandon bail, or below if the enqueue is rejected.
+            scrollPinPendingRef.Current = true;
+
+            if (!sv.DispatcherQueue.TryEnqueue(() =>
+            {
+                // Stop any timer that a concurrently-enqueued QueueScrollToBottom may have created
+                // and left in the ref, so we never leak an orphaned timer that keeps pinning.
+                scrollSettleTimerRef.Current?.Stop();
+                scrollSettleTimerRef.Current = null;
+
+                // Flush any pending user ChangeView, then bail before pinning if this is a REACTIVE
+                // follow (layout growth) and the user has scrolled away — do NOT clobber their
+                // reading position with a bottom pin. Explicit scroll-to-bottom requests (session
+                // switch, token bump, user sent a message) pass respectUserScrollPosition = false
+                // and always pin, since they ARE the user asking to jump to the newest row.
+                sv.UpdateLayout();
+                if ((respectUserScrollPosition && UserScrolledAway()) || suppressAutoFollowRef.Current)
+                {
+                    // Abandoning the follow: we are NOT at the bottom, so DISABLE anchoring rather
+                    // than restore it to 1.0 — pinning the bottom row here would let post-remount
+                    // extent re-estimation drift the reader's held position. The coalescing guard is
+                    // released as this pin is now resolved (no timer will run).
+                    isFollowingRef.Current = false;
+                    sv.VerticalAnchorRatio = double.NaN;
+                    scrollPinPendingRef.Current = false;
+                    return;
+                }
+
+                // First pin immediately for responsiveness.
+                PinToBottom(disableAnimation);
+
+                var ticks = 0;
+                var stableTicks = 0;
+                var timer = new Microsoft.UI.Xaml.DispatcherTimer
+                {
+                    Interval = TimeSpan.FromMilliseconds(FollowToBottomSettleTickMs)
+                };
+                scrollSettleTimerRef.Current = timer;
+                timer.Tick += (_, _) =>
+                {
+                    // Bail out if the ScrollViewer was swapped/detached (unmount) so we never
+                    // keep pinning a dead visual or leave anchoring disabled.
+                    if (scrollViewRef.Current != sv || sv.XamlRoot is null)
+                    {
+                        timer.Stop();
+                        scrollSettleTimerRef.Current = null;
+                        RestoreAnchoring();
+                        return;
+                    }
+
+                    ticks++;
+
+                    // Honor user-scroll intent detected by ViewChanged between ticks.
+                    // When the user scrolls, their ChangeView fires ViewChanged which calls
+                    // UpdateScrollMetrics → sets isFollowingRef=false (gap > FollowThreshold).
+                    // Check BEFORE UpdateLayout so we never call PinToBottom after a user scroll.
+                    if (!isFollowingRef.Current)
+                    {
+                        timer.Stop();
+                        scrollSettleTimerRef.Current = null;
+                        sv.VerticalAnchorRatio = double.NaN;
+                        return;
+                    }
+
+                    sv.UpdateLayout();
+
+                    // Re-check after layout: UpdateLayout can flush pending ViewChanged events
+                    // (e.g. a user ChangeView that was queued but not yet dispatched).
+                    if (!isFollowingRef.Current)
+                    {
+                        timer.Stop();
+                        scrollSettleTimerRef.Current = null;
+                        sv.VerticalAnchorRatio = double.NaN;
+                        return;
+                    }
+
+                    // Yield to a real user scroll away from the bottom (bounded-band vs. many-
+                    // viewports discriminator described on UserScrolledAway above). The settle
+                    // timer ALWAYS yields — even for an explicit scroll-to-bottom, once the initial
+                    // jump has landed we must not keep fighting a user who then drags up to read.
+                    if (UserScrolledAway() || suppressAutoFollowRef.Current)
+                    {
+                        // Same abandon rule as the first pin: disable anchoring (do not restore
+                        // 1.0) so the held reading position is not dragged by extent re-estimation.
+                        isFollowingRef.Current = false;
+                        timer.Stop();
+                        scrollSettleTimerRef.Current = null;
+                        sv.VerticalAnchorRatio = double.NaN;
+                        return;
+                    }
+
+                    PinToBottom(passDisableAnimation: true);
+
+                    // Converge on being AT the bottom for a couple of ticks, then hand off to
+                    // scroll anchoring (VerticalAnchorRatio = 1.0, restored below). We deliberately
+                    // do NOT require the extent to be stable: WinUI's ItemsRepeater keeps re-
+                    // estimating row heights as rows realize, so the extent wobbles for many frames
+                    // even once we are visually pinned. Waiting for extent stability made this timer
+                    // run its full hard cap (~384ms) re-pinning every tick, which clobbered a user
+                    // scroll issued during that window (the offset never dropped because our own
+                    // ChangeView superseded theirs every 16ms). Once we are at the bottom, restored
+                    // anchoring keeps the bottom row glued as the extent estimate settles, so the
+                    // timer's job is done — terminate quickly and stop fighting user input.
+                    var atBottom = sv.ScrollableHeight - sv.VerticalOffset <= FollowThreshold;
+                    stableTicks = atBottom ? stableTicks + 1 : 0;
+
+                    if (stableTicks >= FollowToBottomSettleStableTicks || ticks >= FollowToBottomMaxSettleTicks)
+                    {
+                        timer.Stop();
+                        scrollSettleTimerRef.Current = null;
+                        RestoreAnchoring();
+                    }
+                };
+                timer.Start();
+                // The settle timer now owns the chase; release the coalescing guard. Further
+                // SizeChanged notifications are gated by scrollSettleTimerRef being non-null while
+                // it runs, and by scrollPinPendingRef only during the synchronous window above.
+                scrollPinPendingRef.Current = false;
+            }))
+            {
+                // Dispatcher rejected the enqueue (e.g. teardown): never leave anchoring disabled
+                // or the coalescing guard stuck on.
+                scrollPinPendingRef.Current = false;
+                RestoreAnchoring();
+            }
         }
 
         void QueuePreservePrependOffset(Microsoft.UI.Xaml.Controls.ScrollViewer sv, string? sessionId, double oldOffset, double oldScrollableHeight)
         {
+            // Content is inserted ABOVE the current viewport ("load earlier history"). In a stock
+            // WinUI ItemsRepeater, bottom scroll anchoring (VerticalAnchorRatio = 1.0) would
+            // natively preserve the on-screen position by shifting VerticalOffset down by the
+            // inserted height. Our FunctionalUI reconciler, however, FULL-REMOUNTS every Entry on
+            // this render (the #996 limitation): the element the platform had chosen as the
+            // anchor is destroyed, so leaving anchoring at 1.0 just re-pins to the NEW bottom and
+            // yanks a scrolled-up reader down to the newest row (observed: offset 2528 -> 8531,
+            // gap 0). So for the prepend pass we DISABLE anchoring and manually re-seat the offset
+            // by the inserted height instead. Exact pixel preservation isn't achievable under the
+            // full remount, but this keeps the reader in the middle band — not reset to the top,
+            // not dragged to the bottom (see the KNOWN LIMITATION note on the prepend proof test).
             suppressAutoFollowRef.Current = true;
-            sv.DispatcherQueue.TryEnqueue(() =>
+            sv.VerticalAnchorRatio = double.NaN;
+
+            // A prior scroll-to-bottom settle timer would keep pinning to the bottom and defeat
+            // the preserved reading position — cancel it for this prepend. Clear the coalescing
+            // guard too so the anchoring gate/SizeChanged follow path isn't left believing a pin
+            // is still in flight.
+            scrollSettleTimerRef.Current?.Stop();
+            scrollSettleTimerRef.Current = null;
+            scrollPinPendingRef.Current = false;
+
+            void RestoreOffset()
             {
+                // Re-seat by the ACTUAL inserted height measured after layout (ScrollableHeight
+                // delta), not a stale precomputed value, so estimated-extent wobble during row
+                // realization can't leave the reader clamped to the bottom.
+                sv.UpdateLayout();
                 var delta = sv.ScrollableHeight - oldScrollableHeight;
-                var target = ClampOffset(oldOffset + delta, sv.ScrollableHeight);
+                var target = ClampOffset(oldOffset + Math.Max(0, delta), sv.ScrollableHeight);
                 sv.ChangeView(null, target, null, disableAnimation: true);
                 lastVerticalOffsetRef.Current = target;
                 lastScrollableHeightRef.Current = sv.ScrollableHeight;
                 isFollowingRef.Current = sv.ScrollableHeight - target <= FollowThreshold;
                 StoreSessionOffset(sessionId, target);
-                sv.DispatcherQueue.TryEnqueue(() => suppressAutoFollowRef.Current = false);
-            });
+                suppressAutoFollowRef.Current = false;
+            }
+
+            if (!sv.DispatcherQueue.TryEnqueue(RestoreOffset))
+            {
+                RestoreOffset();
+            }
         }
 
         // Load more button — outside the repeated items
@@ -699,6 +956,15 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
         var assistantSender = Props.AssistantSenderLabel;
         var defaultModel = Props.DefaultModel;
         var meta = Props.EntryMetadata;
+        string? latestAssistantEntryId = null;
+        for (var i = Props.Entries.Count - 1; i >= 0; i--)
+        {
+            if (Props.Entries[i].Kind == ChatTimelineItemKind.Assistant)
+            {
+                latestAssistantEntryId = Props.Entries[i].Id;
+                break;
+            }
+        }
 
         // ── Web Control UI palette: "dash-light" theme (verified against the
         // bundled assets/index-*.css — dash-light is what the user runs).
@@ -716,12 +982,8 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
         // Acrylic), let it show through by using a transparent chat-page fill.
         // Otherwise fall back to the subtle layer color so Solid mode still
         // reads as a flat surface.
-        var chatPageBg = Props.EnableExplorationControls && ChatExplorationState.BackdropMode == ChatBackdropMode.Solid
-            ? themeBrush("SubtleFillColorSecondaryBrush")
-            : (Brush)new SolidColorBrush(Microsoft.UI.Colors.Transparent);
-        var assistantBubbleBg   = Props.EnableExplorationControls
-            ? ChatVisualResolver.AssistantBubbleBrush(themeBrush("SubtleFillColorSecondaryBrush"))
-            : themeBrush("SubtleFillColorSecondaryBrush");
+        var chatPageBg = (Brush)new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        var assistantBubbleBg   = themeBrush("SubtleFillColorSecondaryBrush");
         var assistantBubbleBdr  = themeBrush("ControlStrokeColorDefaultBrush");
         // User bubble brushes vary with the configured tone. Accent → bold
         // brand-color bubble with white text (classic iMessage feel).
@@ -730,26 +992,26 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
         // ``TextOnAccentFillColorPrimaryBrush``, which Fluent guarantees
         // meets WCAG AA contrast against any accent-tinted fill in both
         // light and dark themes (Microsoft's Fluent design token spec).
-        var userToneIsAccent    = Props.EnableExplorationControls && ChatExplorationState.UserBubbleTone == ChatUserBubbleTone.Accent;
-        var userBubbleBg        = Props.EnableExplorationControls
-            ? ChatVisualResolver.UserBubbleBrush(themeBrush(userToneIsAccent ? "AccentFillColorDefaultBrush" : "AccentFillColorSecondaryBrush"))
-            : themeBrush("AccentFillColorSecondaryBrush");
-        var userBubbleBdr       = themeBrush(userToneIsAccent ? "AccentFillColorDefaultBrush" : "AccentFillColorSecondaryBrush");
+        var userBubbleBg        = themeBrush("AccentFillColorSecondaryBrush");
+        var userBubbleBdr       = themeBrush("AccentFillColorSecondaryBrush");
         var userBubbleFg        = themeBrush("TextOnAccentFillColorPrimaryBrush");
         var avatarPanelBg       = themeBrush("SubtleFillColorTertiaryBrush");
         var avatarBorder        = themeBrush("ControlStrokeColorDefaultBrush");
         var assistantAvatarFg   = themeBrush("TextFillColorSecondaryBrush");
-        var userAvatarBg        = Props.EnableExplorationControls
-            ? ChatVisualResolver.AccentBrush(themeBrush("AccentFillColorDefaultBrush"))
-            : themeBrush("AccentFillColorDefaultBrush");
+        var userAvatarBg        = themeBrush("AccentFillColorDefaultBrush");
         var userAvatarFg        = themeBrush("TextOnAccentFillColorPrimaryBrush");
         // a11y: timestamps and "is thinking" caption sit directly on the
         // window backdrop. On Mica/Acrylic the system tint is translucent,
         // so Tertiary text can fall below WCAG AA. Bump to Secondary when
         // the chat surface is transparent over a host backdrop.
-        var chatStampFg         = Props.EnableExplorationControls && ChatExplorationState.BackdropMode == ChatBackdropMode.Solid
-            ? themeBrush("TextFillColorTertiaryBrush")
-            : themeBrush("TextFillColorSecondaryBrush");
+        // Timestamps / helper captions sit directly on the window backdrop (no
+        // bubble behind them), so a snapshot from Application.Resources renders
+        // the light-theme secondary color and vanishes in dark mode. Drive this
+        // brush from the built-in TextFillColorSecondary token for the timeline
+        // root's ActualTheme instead (wired below) so it stays legible after a
+        // runtime light/dark switch.
+        var chatStampFg         = new SolidColorBrush(
+            Theme.ResolveColor("TextFillColorSecondary", ElementTheme.Default));
         var chatTextFg          = themeBrush("TextFillColorPrimaryBrush");
         // Tool chips: very subtle background tint + light border so they
         // read as a secondary surface distinct from the filled assistant
@@ -805,6 +1067,12 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
         ChatEntryMetadata? MetaFor(string id) =>
             meta is not null && meta.TryGetValue(id, out var m) ? m : null;
 
+        string RowKey(ChatTimelineItem entry) =>
+            $"thread:{Props.SessionId ?? "none"}|generation:{Props.TimelineGeneration}|kind:{entry.Kind}|id:{entry.Id}";
+
+        string SyntheticRowKey(string id, ChatTimelineItemKind kind) =>
+            $"thread:{Props.SessionId ?? "none"}|generation:{Props.TimelineGeneration}|kind:{kind}|synthetic:{id}";
+
         // Hover-revealed action icon (copy / read aloud / trash). Opacity 0
         // and not hit-testable until the entry is hovered, then fades in
         // and becomes clickable. Soft pill radius + Light weight glyph so
@@ -822,7 +1090,7 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 TextBlock(shownGlyph)
                     .Set(t =>
                     {
-                        t.FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets");
+                        t.FontFamily = FluentIconCatalog.SymbolThemeFontFamily;
                         t.FontSize = 14;
                         t.FontWeight = Microsoft.UI.Text.FontWeights.Light;
                         t.Foreground = shownColor;
@@ -887,15 +1155,6 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 });
         }
 
-        // Build the WebView-style multi-pill footer:
-        //   "Field   7:54 PM   ↑1475   ↓12   R45.4k   23% ctx   gpt-5.5"
-        // Each pill is a small caption; missing pieces (e.g. token counts not
-        // reported) are silently skipped so the footer just shows what's
-        // known. Not clickable yet — that's deferred until the gateway surfaces
-        // the corresponding metadata.
-        static string FormatTokenCount(int n) =>
-            n >= 1000 ? $"{n / 1000.0:0.#}k" : n.ToString();
-
         // Copy assistant message text to the system clipboard. Strips a
         // light amount of markdown noise (fenced code backticks) so the
         // clipboard payload reads naturally when pasted into prose.
@@ -906,8 +1165,7 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
             {
                 ClipboardHelper.CopyText(text, flush: true);
             }
-            // slopwatch-ignore: SW003 UI helper action is best-effort and failure should not break the owning UI flow.
-            catch { /* clipboard contention — silently ignore */ }
+            catch (Exception ex) { OpenClawTray.Services.Logger.Debug($"ChatTimeline: clipboard copy contention: {ex.Message}"); }
         }
 
         void ReadAloud(string entryId, string text) =>
@@ -959,13 +1217,12 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
         Element BuildAssistantFooter(string sender, string time, string? model,
             int? inputTokens, int? outputTokens, int? responseTokens, int? contextPct,
             Brush stampFg,
-            string entryId, string entryText)
+            string entryId, string entryText,
+            string? fallbackUsageSummary)
         {
-            // Honor per-field toggles from ChatExplorationState.
-            var showSender   = Props.EnableExplorationControls && ChatExplorationState.ShowSenderName;
-            var showModel    = Props.EnableExplorationControls && ChatExplorationState.ShowModelName;
-            var showTokens   = Props.ShowUsageMetadata && Props.EnableExplorationControls && ChatExplorationState.ShowTokens;
-            var showCtxPct   = Props.ShowUsageMetadata && Props.EnableExplorationControls && ChatExplorationState.ShowContextPercent;
+            var entryUsageSummary = fallbackUsageSummary;
+            var showInlineUsage = Props.ShowToolCalls
+                && !string.IsNullOrWhiteSpace(entryUsageSummary);
 
             var parts = new List<Element>();
             void AddPill(string text)
@@ -980,17 +1237,12 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
             // footer so the timestamp/sender stay anchored on the left and
             // the empty space (when not hovered) trails off harmlessly to
             // the right instead of leaving an awkward gap before the time.
-            if (showSender && !string.IsNullOrEmpty(sender))
-                parts.Add(Caption(sender).Foreground(stampFg)
-                    .Set(t => { t.FontSize = 11; t.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold; })
-                    .VAlign(VerticalAlignment.Center));
-
             AddPill(time);
-            if (showTokens && inputTokens   is int inN)   AddPill($"↑{FormatTokenCount(inN)}");
-            if (showTokens && outputTokens  is int outN)  AddPill($"↓{FormatTokenCount(outN)}");
-            if (showTokens && responseTokens is int respN) AddPill($"R{FormatTokenCount(respN)}");
-            if (showCtxPct && contextPct    is int pct)   AddPill($"{pct}% ctx");
-            if (showModel) AddPill(model ?? "");
+            if (showInlineUsage)
+            {
+                AddPill("·");
+                AddPill(entryUsageSummary!);
+            }
 
             parts.Add(HoverIcon(entryId, "copy", "\uE8C8", "\uE73E",
                 LocalizationHelper.GetString("Chat_Assistant_Action_Copy"),
@@ -1015,7 +1267,6 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
         Element BuildUserFooter(string sender, string time, Brush stampFg,
             string entryId, string entryText)
         {
-            var showSender = Props.EnableExplorationControls && ChatExplorationState.ShowSenderName;
             var parts = new List<Element>
             {
                 HoverIcon(entryId, "copy", "\uE8C8", "\uE73E",
@@ -1029,11 +1280,6 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 //     LocalizationHelper.GetString("Chat_User_Action_Delete"),
                 //     () => { /* TODO: wire to provider */ AckAction(entryId, "delete"); }).VAlign(VerticalAlignment.Center),
             };
-
-            if (showSender && !string.IsNullOrEmpty(sender))
-                parts.Add(Caption(sender).Foreground(stampFg)
-                    .Set(t => { t.FontSize = 11; t.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold; })
-                    .VAlign(VerticalAlignment.Center));
 
             if (!string.IsNullOrEmpty(time))
                 parts.Add(Caption(time).Foreground(stampFg)
@@ -1121,7 +1367,7 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                                 TextBlock(fileGlyph)
                                     .Set(t =>
                                     {
-                                        t.FontFamily = new FontFamily("Segoe Fluent Icons");
+                                        t.FontFamily = FluentIconCatalog.SymbolThemeFontFamily;
                                         t.FontSize = 16;
                                         t.Foreground = userBubbleFg;
                                         t.VerticalAlignment = VerticalAlignment.Center;
@@ -1160,6 +1406,7 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
             // bubbleRadius wraps both so they read as one message.
             var bubbleChildren = new List<Element>();
             foreach (var ae in attachmentElements) bubbleChildren.Add(ae);
+            var entryMeta = MetaFor(entry.Id);
             if (hasMessage)
             {
                 // Resolve HC + selection brush once per render method call
@@ -1169,13 +1416,21 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 bool isHighContrast = TryDetectHighContrast();
                 var selectionHighlightBrush = GetUserBubbleSelectionBrush(isHighContrast);
                 bubbleChildren.Add(
-                    TextBlock(string.Empty)
+                    RichTextBlock()
                         .Set(t =>
                         {
                             t.TextWrapping = TextWrapping.Wrap;
                             t.FontSize = 14;
                             t.Foreground = userBubbleFg;
                             t.IsTextSelectionEnabled = true;
+                            t.FontFamily = s_chatTextFontFamily;
+                            t.TextTrimming = TextTrimming.None;
+                            t.MaxLines = 0;
+                            t.LineHeight = 0;
+                            t.CharacterSpacing = 0;
+                            t.Width = double.NaN;
+                            t.MinWidth = 0;
+                            t.MaxWidth = double.PositiveInfinity;
                             // The default SelectionHighlightColor is the
                             // system accent — which equals the user bubble's
                             // background — so the highlight band is invisible
@@ -1193,17 +1448,14 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                             // color the OS guarantees contrasts with both
                             // surfaces.
                             t.SelectionHighlightColor = selectionHighlightBrush;
-                            // Render through Inlines (a single Run) rather
-                            // than the .Text property. This matches the
-                            // assistant bubble's selection-safe path and
-                            // sidesteps a WinUI bug where setting Text on a
-                            // selection-enabled TextBlock during a re-render
-                            // triggered by the mouse-up that ends a drag-
-                            // select leaves the glyph layer visually empty.
-                            ApplyPlainSelectableInlines(t, messageText);
+                            // Render the message as a single Paragraph (one Run)
+                            // so the whole user message is one continuous
+                            // selection scope — matching the assistant bubble's
+                            // RichTextBlock append-block pattern. The plain-text
+                            // run keeps the bubble inert (no markdown / links).
+                            ApplyPlainSelectableParagraph(t, messageText);
                         }));
             }
-
             Element content;
             if (bubbleChildren.Count > 0)
             {
@@ -1227,10 +1479,9 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 content = Empty();
             }
 
-            // Avatar shown only on the LAST entry of a same-sender burst,
-            // and only when ChatExplorationState.AvatarMode allows. When
-            // avatars are hidden entirely we drop the slot; mid-burst entries
-            // still get a spacer so they stay aligned with the first bubble.
+            // User avatars are hidden in the production tray chat, but keep
+            // the branch local so the row layout stays symmetric with the
+            // assistant path.
             Element rightSlot = !showUserAvatar
                ? Empty()
                : (endsBurst
@@ -1247,7 +1498,6 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
             Element footer = Empty();
             if (endsBurst && showTimestamps)
             {
-                var entryMeta = MetaFor(entry.Id);
                 var timeStr = FormatTime(entryMeta?.Timestamp);
                 var rightInset = showUserAvatar ? (36 + bubbleSideMargin) : 0;
                 rightInset += (int)bubblePadding.Right;
@@ -1300,15 +1550,15 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                     ? AssistantAvatar().VAlign(VerticalAlignment.Top)
                     : Border(Empty()).Size(36, 36));
 
-            // Assistant bubble — subtle gray with primary text. Radius/Padding
-            // come from ChatExplorationState (BubbleCornerRadius + PaddingDensity).
-            // HAlign=Left keeps the bubble anchored next to the avatar/timestamp
-            // column. MaxWidth=720 caps the growth so long messages stop where
-            // the tool burst card's max right edge lands.
+            // Assistant bubble — subtle gray with primary text. HAlign=Left
+            // keeps the bubble anchored next to the avatar/timestamp column.
+            // MaxWidth=720 caps the growth so long messages stop where the
+            // tool burst card's max right edge lands.
             // When `nestedTool` is supplied, the tool burst (single chip OR
             // collapsed multi-step summary) is rendered INSIDE the bubble's
             // content area — directly below the assistant text with a small
             // top gap — so it visually reads as a child of the bubble.
+            var assistantEntryMeta = MetaFor(entry.Id);
             Element bubbleContent = overrideBubbleContent ?? SafeMarkdownText(entry.Text);
             if (nestedTool != null)
             {
@@ -1341,13 +1591,13 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
             Element footer = Empty();
             if (endsBurst && showTimestamps && !suppressFooter)
             {
-                var entryMeta = MetaFor(entry.Id);
-                var timeStr = FormatTime(entryMeta?.Timestamp);
-                var modelStr = entryMeta?.Model ?? defaultModel;
+                var timeStr = FormatTime(assistantEntryMeta?.Timestamp);
+                var modelStr = assistantEntryMeta?.Model ?? defaultModel;
                 footer = BuildAssistantFooter(assistantSender, timeStr, modelStr,
-                    entryMeta?.InputTokens, entryMeta?.OutputTokens,
-                    entryMeta?.ResponseTokens, entryMeta?.ContextPercent,
-                    chatStampFg, entry.Id, entry.Text ?? "");
+                    assistantEntryMeta?.InputTokens, assistantEntryMeta?.OutputTokens,
+                    assistantEntryMeta?.ResponseTokens, assistantEntryMeta?.ContextPercent,
+                    chatStampFg, entry.Id, entry.Text ?? "",
+                    entry.Id == latestAssistantEntryId ? Props.DefaultUsageSummary : null);
                 var leftInset = showAssistAvatar ? (36 + bubbleSideMargin) : 0;
                 leftInset += (int)bubblePadding.Left;
                 footer = footer.Margin(leftInset, 2, 0, 0);
@@ -1689,28 +1939,6 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 return rowWithSeparator;
             }
 
-            // ── Style-aware composition ──────────────────────────────
-            // Read the live exploration state for the burst variant only in
-            // the debug preview. Production chat uses stable Auto behavior.
-            // Defaults to Auto, which picks the best variant per burst:
-            //   - single-step  → Plain (one inline row, nothing to fold)
-            //   - multi-step   → CompactSummary (1-line collapsed summary,
-            //                    click chevron to expand the steps)
-            // CompactSummary applies even while a step is in-flight: the
-            // header's aggregate status pill flips to "Running" (and back
-            // to "Done") so the user sees live progress without the group
-            // momentarily expanding to show the running row. Expanding
-            // mid-burst would yank the per-step list back into view every
-            // time the agent invoked another tool, which is exactly what
-            // collapsed mode is supposed to avoid.
-            var style = Props.EnableExplorationControls ? ChatExplorationState.ToolBurstStyle : ToolBurstStyle.Auto;
-            if (style == ToolBurstStyle.Auto)
-            {
-                style = entries.Count >= 2
-                    ? ToolBurstStyle.CompactSummary
-                    : ToolBurstStyle.Plain;
-            }
-            var showStepNumbers = Props.EnableExplorationControls && ChatExplorationState.ShowStepNumbers && entries.Count > 1;
             var stepCount = entries.Count;
 
             // Tool burst alignment: align outer left to the assistant bubble's
@@ -1745,25 +1973,14 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 Id: "agg", Kind: ChatTimelineItemKind.ToolCall, Text: string.Empty,
                 ToolName: null, ToolResult: aggregateStatus, ToolOutput: null));
 
-            string? StepPrefix(int i) => showStepNumbers ? $"{i + 1}." : null;
-
-            // Footer (when shown) reflects the *last* entry's timestamp —
-            // that's when the burst finished from the user's POV.
-            var lastEntry = entries[entries.Count - 1];
-            var entryMeta = MetaFor(lastEntry.Id);
-            var timeStr = FormatTime(entryMeta?.Timestamp);
-            // "Task · 3 steps · 8:16 PM" — used by FooterReframe + as the
-            // companion line under the TaskHeader card. Keeps the time so
-            // users still get the chronology.
             Element CardOf(Element[] rowEls) => Border(VStack(0, rowEls))
                 .Background(toolCardBgBrush)
                 .WithBorder(toolCardBorderBrush, toolCardBorderThickness)
                 .Set(b =>
                 {
-                    // CornerRadius is uniform across the card (BubbleCornerRadius
-                    // is a single value broadcast to all four corners by
-                    // ChatVisualResolver). Setting CornerRadius directly works
-                    // because rounding nests under the Border's BorderThickness.
+                    // CornerRadius is uniform across the card; setting it
+                    // directly works because rounding nests under the
+                    // Border's BorderThickness.
                     b.CornerRadius = bubbleRadius;
 
                     if (nested)
@@ -1860,21 +2077,21 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 card.Grid(row: 0, column: 0)
             ).HAlign(HorizontalAlignment.Stretch);
 
-            // Build the per-step rows once — used by Plain, TaskHeader, and
-            // CompactSummary (when expanded).
+            // Build the per-step rows once — used by Plain and CompactSummary
+            // (when expanded).
             var rows = new Element[entries.Count];
             for (int i = 0; i < entries.Count; i++)
             {
                 rows[i] = BuildRow(entries[i],
                     isFirst: i == 0,
                     isLast: i == entries.Count - 1,
-                    stepPrefix: StepPrefix(i));
+                    stepPrefix: null);
             }
 
             // CompactSummary: a single collapsed-by-default row showing the
             // task summary; clicking expands the per-step list. Only worth it
             // for multi-step bursts — single-step falls back to plain.
-            if (style == ToolBurstStyle.CompactSummary && entries.Count > 1)
+            if (entries.Count > 1)
             {
                 var summaryToken = $"{entries[0].Id}:burst-summary";
                 var summaryExpanded = expandedToolChips.Value.Contains(summaryToken);
@@ -1966,266 +2183,6 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 return Wrap(CardOf(pieces.ToArray()));
             }
 
-            // TaskHeader: prepend a non-clickable header row to the card.
-            if (style == ToolBurstStyle.TaskHeader && entries.Count > 1)
-            {
-                var taskHeader = Border(
-                    Border(
-                        (FlexRow(
-                            Caption("⚡").Foreground(taskStatusBg)
-                                .VAlign(VerticalAlignment.Center),
-                            Caption($"Task · {stepCount} steps").Foreground(SecondaryText)
-                                .Set(t => { t.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold; })
-                                .VAlign(VerticalAlignment.Center),
-                            Caption(string.Empty).Flex(grow: 1),
-                            Border(
-                                Caption(taskStatusText).Foreground(themeBrush("TextOnAccentFillColorPrimaryBrush"))
-                                    .Set(t => { t.FontSize = 11; t.LineHeight = 16; })
-                                    .VAlign(VerticalAlignment.Center)
-                            ).Background(taskStatusBg).CornerRadius(10).Padding(8, 0, 8, 0)
-                             .Set(b => b.MinHeight = 18).VAlign(VerticalAlignment.Center)
-                        ) with { ColumnGap = 6 }).Padding(12, 8, 12, 8)
-                    ).Set(b => b.MinHeight = 22)
-                ).Background(themeBrush("SubtleFillColorSecondaryBrush"));
-
-                var combined = new Element[entries.Count + 1];
-                combined[0] = taskHeader;
-                Array.Copy(rows, 0, combined, 1, rows.Length);
-
-                return Wrap(CardOf(combined));
-            }
-
-            // TaskList: per-step rows with a status icon (✓ / spinner / ✕)
-            // mirroring the AgentRunCard "Running steps / Completed steps"
-            // pattern from native-chat-v2. Now agent-grouped:
-            //  • left assistant avatar slot (matches RenderAssistantEntry)
-            //  • collapsible header showing aggregate status + a result-focused
-            //    one-line summary
-            //  • auto-expanded while any step is InProgress, auto-collapsed
-            //    when the whole burst is Success/Error. Click chevron to flip.
-            if (style == ToolBurstStyle.TaskList)
-            {
-                Element StatusGlyph(ChatToolCallStatus status, double size = 14)
-                {
-                    switch (status)
-                    {
-                        case ChatToolCallStatus.Success:
-                            return Caption("\uE73E")
-                                .Foreground(themeBrush("SystemFillColorSuccessBrush"))
-                                .Set(t => { t.FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"); t.FontSize = size; })
-                                .HAlign(HorizontalAlignment.Center).VAlign(VerticalAlignment.Center);
-                        case ChatToolCallStatus.Error:
-                            return Caption("\uE711")
-                                .Foreground(themeBrush("SystemFillColorCriticalBrush"))
-                                .Set(t => { t.FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"); t.FontSize = size; })
-                                .HAlign(HorizontalAlignment.Center).VAlign(VerticalAlignment.Center);
-                        case ChatToolCallStatus.Interrupted:
-                            return Caption("\uE738")
-                                .Foreground(themeBrush("TextFillColorTertiaryBrush"))
-                                .Set(t => { t.FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"); t.FontSize = size; })
-                                .HAlign(HorizontalAlignment.Center).VAlign(VerticalAlignment.Center);
-                        default:
-                            return ProgressRing()
-                                .Width(size).Height(size)
-                                .Set(p => { p.IsActive = true; p.Foreground = themeBrush("AccentFillColorDefaultBrush"); })
-                                .HAlign(HorizontalAlignment.Center).VAlign(VerticalAlignment.Center);
-                    }
-                }
-
-                // Result-focused one-liner: prefer the LAST entry's output
-                // (truncated). Fall back to status-specific text when output
-                // isn't available yet (e.g. mid-flight or error).
-                string SummaryLine()
-                {
-                    string Truncate(string s, int max)
-                    {
-                        s = s.Replace('\r', ' ').Replace('\n', ' ').Trim();
-                        return s.Length > max ? s.Substring(0, max - 1) + "…" : s;
-                    }
-                    var last = entries[entries.Count - 1];
-                    if (aggregateStatus == ChatToolCallStatus.InProgress)
-                    {
-                        var name = last.ToolName ?? "tool";
-                        return $"Working on {name}…";
-                    }
-                    if (aggregateStatus == ChatToolCallStatus.Error)
-                    {
-                        var errEntry = entries.FirstOrDefault(e => e.ToolResult == ChatToolCallStatus.Error) ?? last;
-                        var name = errEntry.ToolName ?? "tool";
-                        var msg = !string.IsNullOrWhiteSpace(errEntry.ToolOutput) ? errEntry.ToolOutput! : "failed";
-                        return Truncate($"{name} failed: {msg}", 80);
-                    }
-                    if (!string.IsNullOrWhiteSpace(last.ToolOutput)) return Truncate(last.ToolOutput!, 80);
-                    return $"Ran {entries.Count} step{(entries.Count == 1 ? "" : "s")}";
-                }
-                var summaryLine = SummaryLine();
-
-                // Auto state: expand while running, collapse when finished.
-                // expandedToolChips token marks "user override" — when present,
-                // flip the default. Simple flip-from-default (no value map).
-                var taskListToken = $"{entries[0].Id}:tasklist";
-                var defaultExpanded = aggregateStatus == ChatToolCallStatus.InProgress;
-                var hasOverride = expandedToolChips.Value.Contains(taskListToken);
-                var effectiveExpanded = hasOverride ? !defaultExpanded : defaultExpanded;
-                // ▲ when expanded (action: click to collapse up),
-                // ▼ when collapsed (action: click to expand down).
-                var chevron = effectiveExpanded ? "▲" : "▼";
-                var stepCountLabel = $"{stepCount} step{(stepCount == 1 ? "" : "s")}";
-                var taskListHeaderAutomationName = $"{summaryLine}, {stepCountLabel}, {taskStatusText}, {(effectiveExpanded ? "expanded" : "collapsed")}";
-
-                Action toggleTaskList = () =>
-                {
-                    var next = new HashSet<string>(expandedToolChips.Value);
-                    if (!next.Add(taskListToken)) next.Remove(taskListToken);
-                    suppressAutoFollowRef.Current = true;
-                    expandedToolChips.Set(next);
-                };
-
-                // Per-step rows (used only when expanded).
-                var stepRows = new System.Collections.Generic.List<Element>();
-                var stepAutomationSummaries = new System.Collections.Generic.List<string>();
-                for (int i = 0; i < entries.Count; i++)
-                {
-                    var e = entries[i];
-                    var status = e.ToolResult ?? ChatToolCallStatus.InProgress;
-                    var label = e.ToolName ?? "tool";
-                    var prefix = StepPrefix(i);
-                    var labelText = string.IsNullOrEmpty(prefix) ? label : $"{prefix} {label}";
-                    var summary = ShortSummary(e);
-                    stepAutomationSummaries.Add(string.IsNullOrEmpty(summary) ? labelText : $"{labelText}: {summary}");
-
-                    stepRows.Add(
-                        (FlexRow(
-                            Border(StatusGlyph(status))
-                                .Width(20).HAlign(HorizontalAlignment.Center).VAlign(VerticalAlignment.Center),
-                            VStack(2,
-                                Caption(labelText).Foreground(themeBrush("TextFillColorPrimaryBrush"))
-                                    .Set(t => { t.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold; })
-                                    .VAlign(VerticalAlignment.Center),
-                                string.IsNullOrEmpty(summary)
-                                    ? Empty()
-                                    : Caption(summary).Foreground(TertiaryText)
-                                        .Set(t => { t.FontSize = 11; t.TextTrimming = TextTrimming.CharacterEllipsis; t.MaxLines = 1; })
-                            ).Flex(grow: 1)
-                        ) with { ColumnGap = 10 })
-                    );
-                }
-
-                // Header content: aggregate status (only for in-progress / error)
-                // · summary · step count · chevron. When the burst finished
-                // successfully, drop the leading ✓ — the summary line is
-                // already past-tense and the avatar carries identity.
-                var headerStatusSlot = aggregateStatus == ChatToolCallStatus.Success
-                    ? Empty()
-                    : (Element)Border(StatusGlyph(aggregateStatus, 14))
-                        .Width(20).HAlign(HorizontalAlignment.Center).VAlign(VerticalAlignment.Center);
-                var headerContent = (FlexRow(
-                    headerStatusSlot,
-                    Caption(summaryLine).Foreground(themeBrush("TextFillColorPrimaryBrush"))
-                        .Set(t =>
-                        {
-                            t.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold;
-                            t.TextTrimming = TextTrimming.CharacterEllipsis;
-                            t.MaxLines = 1;
-                        })
-                        .VAlign(VerticalAlignment.Center).Flex(grow: 1),
-                    Caption(stepCountLabel).Foreground(TertiaryText)
-                        .Set(t => { t.FontSize = 11; }).VAlign(VerticalAlignment.Center),
-                    Caption(chevron).Foreground(TertiaryText)
-                        .Set(t => { t.FontSize = 11; }).VAlign(VerticalAlignment.Center)
-                ) with { ColumnGap = 8 }).Margin(0, 0, 0, 0);
-
-                var headerButton = Button(headerContent, toggleTaskList)
-                    .AutomationName(taskListHeaderAutomationName)
-                    .Set(b =>
-                    {
-                        b.HorizontalAlignment = HorizontalAlignment.Stretch;
-                        b.HorizontalContentAlignment = HorizontalAlignment.Stretch;
-                        b.Padding = bubblePadding;
-                        b.CornerRadius = new CornerRadius(bubbleRadius.TopLeft, bubbleRadius.TopRight, effectiveExpanded ? 0 : bubbleRadius.BottomRight, effectiveExpanded ? 0 : bubbleRadius.BottomLeft);
-                    }).Resources(r => r
-                        .Set("ButtonBackground", new SolidColorBrush(Colors.Transparent))
-                        .Set("ButtonBackgroundPointerOver", themeBrush("SubtleFillColorTertiaryBrush"))
-                        .Set("ButtonBackgroundPressed", themeBrush("SubtleFillColorSecondaryBrush"))
-                        .Set("ButtonBorderBrush", new SolidColorBrush(Colors.Transparent))
-                        .Set("ButtonBorderBrushPointerOver", new SolidColorBrush(Colors.Transparent))
-                        .Set("ButtonBorderBrushPressed", new SolidColorBrush(Colors.Transparent)));
-
-                var cardChildren = new System.Collections.Generic.List<Element> { headerButton };
-                if (effectiveExpanded)
-                {
-                    // Body sits inside the same card; thin top border so the
-                    // header + body read as one unit but the divide is clear.
-                    cardChildren.Add(
-                        Border(VStack(8, stepRows.ToArray()))
-                            .AutomationName($"Tool steps for: {summaryLine}. {string.Join("; ", stepAutomationSummaries)}")
-                            .Set(b =>
-                            {
-                                b.Padding = bubblePadding;
-                                b.BorderBrush = toolCardBorderBrush;
-                                b.BorderThickness = new Thickness(0, 1, 0, 0);
-                            })
-                    );
-                }
-
-                var listCard = Border(
-                    VStack(0, cardChildren.ToArray())
-                ).Background(toolCardBgBrush)
-                 .WithBorder(toolCardBorderBrush, toolCardBorderThickness)
-                 // CornerRadius is uniform (single value from ChatVisualResolver
-                 // broadcast to all four corners); safe to assign directly.
-                 .Set(b =>
-                 {
-                     b.CornerRadius = bubbleRadius;
-                     if (nested)
-                     {
-                         b.HorizontalAlignment = HorizontalAlignment.Stretch;
-                     }
-                     else
-                     {
-                         b.MaxWidth = 720;
-                         b.HorizontalAlignment = HorizontalAlignment.Left;
-                     }
-                 });
-
-                if (nested)
-                    return listCard.HAlign(HorizontalAlignment.Stretch);
-
-                // Wrap with the assistant avatar slot so the burst visually
-                // anchors to the agent that produced it (and lines up with the
-                // assistant bubble that follows below). When this task card
-                // continues an agent-side run that already showed the avatar
-                // above, render an empty 36×36 spacer to keep alignment.
-                Element leftSlot = !showAssistAvatar
-                    ? Empty()
-                    : (showAvatar
-                        ? AssistantAvatar().VAlign(VerticalAlignment.Top)
-                        : Border(Empty()).Size(36, 36));
-
-                var burstRow = Grid(
-                    [GridSize.Auto, GridSize.Star()],
-                    [GridSize.Auto],
-                    leftSlot.Grid(row: 0, column: 0).Margin(0, 0, showAssistAvatar ? bubbleSideMargin : 0, 0),
-                    listCard.HAlign(HorizontalAlignment.Left).Grid(row: 0, column: 1)
-                ).HAlign(HorizontalAlignment.Stretch);
-
-                // Match assistant bubble's outer inset so user/assistant/tool
-                // share the same left edge. Avatar slot lives inside burstRow.
-                return burstRow.HAlign(HorizontalAlignment.Stretch).Margin(16, 6, gutter, 6);
-            }
-
-            // FooterReframe keeps the "Task · N steps · time" caption.
-            // Plain drops the footer entirely — the assistant follow-up
-            // bubble below carries the timestamp for the whole turn, and
-            // labelling each tool card with "Tool · time" added visual noise.
-            // Both styles align the card to the bubble's text edge + indent
-            // (see toolLeftMargin) so the burst visually belongs to the
-            // assistant bubble it follows.
-            if (style == ToolBurstStyle.FooterReframe)
-            {
-                return Wrap(CardOf(rows));
-            }
-
             return Wrap(CardOf(rows));
         }
 
@@ -2255,11 +2212,45 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
             var detail = entry.Text;
             var onResponse = Props.OnPermissionResponse;
 
+            static bool ActionEquals(string? action, string expected) =>
+                string.Equals(action, expected, StringComparison.OrdinalIgnoreCase);
+
+            string LabelForAction(string action) =>
+                ActionEquals(action, ChatPermissionActionKeys.AllowOnce) ? LocalizationHelper.GetString("Chat_Permission_Allow") :
+                ActionEquals(action, ChatPermissionActionKeys.AllowAlways) ? LocalizationHelper.GetString("Chat_Permission_AllowAlways") :
+                ActionEquals(action, ChatPermissionActionKeys.Deny) ? LocalizationHelper.GetString("Chat_Permission_Deny") :
+                action;
+
+            var actionKeys = ChatPermissionActionKeys.NormalizeActions(entry.PermissionActions);
+
             Element body;
             if (entry.PermissionDecision == ChatPermissionDecision.Pending)
             {
-                var allowLabel = LocalizationHelper.GetString("Chat_Permission_Allow");
-                var denyLabel = LocalizationHelper.GetString("Chat_Permission_Deny");
+                Element PermissionActionButton(string actionKey, int index)
+                {
+                    var label = LabelForAction(actionKey);
+                    var isAccent = ActionEquals(actionKey, ChatPermissionActionKeys.AllowOnce)
+                        || (!actionKeys.Any(a => ActionEquals(a, ChatPermissionActionKeys.AllowOnce))
+                            && index == 0
+                            && !ActionEquals(actionKey, ChatPermissionActionKeys.Deny));
+
+                    return Button(label,
+                        () => onResponse?.Invoke(requestId, actionKey))
+                        .Set(b =>
+                        {
+                            b.CornerRadius = new CornerRadius(4);
+                            b.Padding = new Thickness(14, 6, 14, 6);
+                            b.MinWidth = 0; b.MinHeight = 0;
+                            b.IsEnabled = onResponse is not null && !string.IsNullOrEmpty(requestId);
+                            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(b, $"{label}{automationSuffix}");
+                            if (isAccent)
+                            {
+                                try { b.Style = (Microsoft.UI.Xaml.Style)Microsoft.UI.Xaml.Application.Current.Resources["AccentButtonStyle"]; }
+                                catch (Exception ex) { OpenClawTray.Services.Logger.Debug($"ChatTimeline: accent button style lookup failed: {ex.Message}"); }
+                            }
+                        });
+                }
+
                 body = VStack(8,
                     TextBlock($"⚠ {kind}")
                         .Set(t => { t.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold; t.TextWrapping = TextWrapping.Wrap; }),
@@ -2284,32 +2275,8 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                      }),
                     TextBlock(LocalizationHelper.GetString("Chat_Permission_Caption"))
                         .Set(t => { t.TextWrapping = TextWrapping.Wrap; t.FontSize = 11; t.Opacity = 0.7; }),
-                    HStack(8,
-                        Button(allowLabel,
-                            () => onResponse?.Invoke(requestId, true))
-                            .Set(b =>
-                            {
-                                b.CornerRadius = new CornerRadius(4);
-                                b.Padding = new Thickness(14, 6, 14, 6);
-                                b.MinWidth = 0; b.MinHeight = 0;
-                                b.IsEnabled = onResponse is not null && !string.IsNullOrEmpty(requestId);
-                                // Include the operation kind in the screen-reader name so
-                                // users hear "Allow shell.exec" instead of bare "Allow".
-                                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(b, $"{allowLabel}{automationSuffix}");
-                                // slopwatch-ignore: SW003 Audited non-critical fallback is intentional and the caller preserves safe behavior without this work.
-                                try { b.Style = (Microsoft.UI.Xaml.Style)Microsoft.UI.Xaml.Application.Current.Resources["AccentButtonStyle"]; } catch { }
-                            }),
-                        Button(denyLabel,
-                            () => onResponse?.Invoke(requestId, false))
-                            .Set(b =>
-                            {
-                                b.CornerRadius = new CornerRadius(4);
-                                b.Padding = new Thickness(14, 6, 14, 6);
-                                b.MinWidth = 0; b.MinHeight = 0;
-                                b.IsEnabled = onResponse is not null && !string.IsNullOrEmpty(requestId);
-                                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(b, $"{denyLabel}{automationSuffix}");
-                            })
-                    ).HAlign(HorizontalAlignment.Right)
+                    HStack(8, actionKeys.Select(PermissionActionButton).ToArray())
+                        .HAlign(HorizontalAlignment.Right)
                 );
             }
             else
@@ -2319,9 +2286,10 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 // was approved/denied without expanding anything.
                 var (glyph, labelKey) = entry.PermissionDecision switch
                 {
-                    ChatPermissionDecision.Allowed => ("✓", "Chat_Permission_DecisionAllowed"),
-                    ChatPermissionDecision.Denied  => ("✕", "Chat_Permission_DecisionDenied"),
-                    _                              => ("⌛", "Chat_Permission_DecisionExpired"),
+                    ChatPermissionDecision.Allowed       => ("✓", "Chat_Permission_DecisionAllowed"),
+                    ChatPermissionDecision.AllowedAlways => ("✓", "Chat_Permission_DecisionAlwaysAllowed"),
+                    ChatPermissionDecision.Denied        => ("✕", "Chat_Permission_DecisionDenied"),
+                    _                                    => ("⌛", "Chat_Permission_DecisionExpired"),
                 };
                 var label = LocalizationHelper.GetString(labelKey);
                 // Surrogate-safe truncation: if char 119 is a high surrogate,
@@ -2338,7 +2306,7 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                     snippet = detail.Substring(0, cut) + "…";
                 }
                 body = VStack(4,
-                    TextBlock($"{glyph} {kind} — {label}")
+                    TextBlock($"{glyph} {kind}: {label}")
                         .Set(t =>
                         {
                             t.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold;
@@ -2370,6 +2338,44 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                    b.BorderBrush = themeBrush("CardStrokeColorDefaultBrush");
                    b.Background = themeBrush("LayerFillColorDefaultBrush");
                });
+        }
+
+        Element RenderCompactionEntry(ChatTimelineItem entry)
+        {
+            var entryMeta = MetaFor(entry.Id);
+            var presentation = ChatCompactionPresenter.Create(
+                entryMeta?.CompactionTokensBefore,
+                entryMeta?.CompactionTokensAfter,
+                LocalizationHelper.GetString("Chat_Compaction_Title"),
+                LocalizationHelper.GetString("Chat_Compaction_MetricsFormat"),
+                LocalizationHelper.GetString("Chat_Compaction_FallbackDetail"));
+            var borderThickness = TryDetectHighContrast() ? 2 : 1;
+
+            return TimelineInset(
+                Border(
+                    VStack(3,
+                        TextBlock(presentation.Title).Set(t =>
+                        {
+                            t.FontSize = 13;
+                            t.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold;
+                            t.HorizontalAlignment = HorizontalAlignment.Center;
+                        }).Foreground(themeBrush("TextFillColorPrimaryBrush")),
+                        Caption(presentation.Detail).Set(t =>
+                        {
+                            t.FontSize = 12;
+                            t.TextWrapping = TextWrapping.Wrap;
+                            t.HorizontalAlignment = HorizontalAlignment.Center;
+                            t.TextAlignment = TextAlignment.Center;
+                        }).Foreground(themeBrush("TextFillColorSecondaryBrush"))
+                    )
+                ).Background(themeBrush("CardBackgroundFillColorDefaultBrush"))
+                 .WithBorder(themeBrush("ControlStrokeColorDefaultBrush"), borderThickness)
+                 .CornerRadius(8)
+                 .Padding(16, 10, 16, 10)
+                 .HAlign(HorizontalAlignment.Stretch)
+                 .AutomationName(presentation.AutomationName),
+                top: 8,
+                bottom: 8);
         }
 
         Element RenderEntry(ChatTimelineItem entry, bool startsBurst, bool endsBurst, bool showAvatar) => entry.Kind switch
@@ -2420,6 +2426,12 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
             // of a conversation are preserved in chronological order.
             ChatTimelineItemKind.PermissionRequest =>
                 RenderPermissionEntry(entry),
+
+            ChatTimelineItemKind.Status when string.Equals(
+                MetaFor(entry.Id)?.OpenClawKind,
+                "compaction",
+                StringComparison.OrdinalIgnoreCase) =>
+                RenderCompactionEntry(entry),
 
             // Filtered status — drop transient connection chatter.
             ChatTimelineItemKind.Status when entry.Text.Contains("Restored") || entry.Text.Contains("Connecting to") || entry.Text.Contains("Connected") || entry.Text.Contains("Resuming") => Empty(),
@@ -2485,17 +2497,22 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
         // ToolCall bursts render AFTER the assistant reply (or the thinking
         // indicator if no reply has streamed yet). Gateway emits tool_start
         // before assistant_delta, but the desired visual flow is
-        //   [User] → [Assistant reply / thinking] → [Tool burst]
-        // so the assistant message reads first and the tool work hangs below it.
-        // Exception: when any tool call in the turn failed, preserve insertion
-        // order so the error renders before the assistant's acknowledgement —
-        // [User] → [Tool burst (error)] → [Assistant reply]. This places the
-        // final assistant response at the scroll anchor (bottom), matching the
-        // web UI. See issue #672.
+        //   [User] → [Assistant reply / thinking] → [Tool burst] → [Denied permission]
+        // so the assistant message reads first, tool work hangs below it, and a
+        // denied permission appears last as the outcome. Approved permission
+        // badges keep their natural pre-tool position so they read as "user
+        // accepted → tool ran". Exception: when any tool call in the turn failed, preserve
+        // insertion order so the error renders before the assistant's acknowledgement —
+        // [User] → [Tool burst (error)] → [Assistant reply]. This places the final
+        // assistant response at the scroll anchor (bottom), matching the web UI.
+        // See issue #672.
         var orderedIdx = new int[Props.Entries.Count];
         {
             int outPos = 0;
             int turnStart = 0;
+            static bool IsDeniedPermission(ChatTimelineItem e) =>
+                e.Kind == ChatTimelineItemKind.PermissionRequest
+                && e.PermissionDecision == ChatPermissionDecision.Denied;
             void Flush(int endExclusive)
             {
                 // If the turn contains any failed tool call, preserve insertion
@@ -2522,10 +2539,14 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                     return;
                 }
                 for (int j = turnStart; j < endExclusive; j++)
-                    if (Props.Entries[j].Kind != ChatTimelineItemKind.ToolCall)
+                    if (Props.Entries[j].Kind != ChatTimelineItemKind.ToolCall
+                        && !IsDeniedPermission(Props.Entries[j]))
                         orderedIdx[outPos++] = j;
                 for (int j = turnStart; j < endExclusive; j++)
                     if (Props.Entries[j].Kind == ChatTimelineItemKind.ToolCall)
+                        orderedIdx[outPos++] = j;
+                for (int j = turnStart; j < endExclusive; j++)
+                    if (IsDeniedPermission(Props.Entries[j]))
                         orderedIdx[outPos++] = j;
             }
             for (int i = 0; i < Props.Entries.Count; i++)
@@ -2584,12 +2605,10 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 if (e.ToolResult == ChatToolCallStatus.Error) return false;
             }
             if (b.Count == 1) return true;
-            // Multi-step bursts collapse into a single CompactSummary row
-            // under Auto / CompactSummary, so they fit comfortably inside
-            // an assistant bubble even while a step is in-flight — the
-            // aggregate status pill on the header shows Running/Done.
-            var s = Props.EnableExplorationControls ? ChatExplorationState.ToolBurstStyle : ToolBurstStyle.Auto;
-            return s == ToolBurstStyle.Auto || s == ToolBurstStyle.CompactSummary;
+            // Multi-step bursts collapse into a single summary row, so they
+            // fit comfortably inside an assistant bubble even while a step is
+            // in-flight — the aggregate status pill shows Running/Done.
+            return true;
         }
 
         for (int k = 0; k < orderedIdx.Length; k++)
@@ -2614,19 +2633,19 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
             {
                 if (!showToolCalls)
                 {
-                    renderedEntries[k] = Empty().WithKey(entry.Id);
+                    renderedEntries[k] = Empty().WithKey(RowKey(entry));
                     continue;
                 }
                 if (!startsBurst)
                 {
-                    renderedEntries[k] = Empty().WithKey(entry.Id);
+                    renderedEntries[k] = Empty().WithKey(RowKey(entry));
                     continue;
                 }
                 if (nestedConsumed.Contains(k))
                 {
                     // The assistant bubble above already rendered this burst
                     // inline as a child element — emit nothing here.
-                    renderedEntries[k] = Empty().WithKey(entry.Id);
+                    renderedEntries[k] = Empty().WithKey(RowKey(entry));
                     continue;
                 }
                 var burst = new System.Collections.Generic.List<ChatTimelineItem> { entry };
@@ -2636,7 +2655,7 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                     burst.Add(Props.Entries[orderedIdx[kj]]);
                     kj++;
                 }
-                renderedEntries[k] = RenderToolBurst(burst, showAvatar, currentBubbleSlot).WithKey(entry.Id);
+                renderedEntries[k] = RenderToolBurst(burst, showAvatar, currentBubbleSlot).WithKey(RowKey(entry));
                 continue;
             }
 
@@ -2672,11 +2691,11 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                     }
                 }
 
-                renderedEntries[k] = RenderAssistantEntry(entry, startsBurst, endsBurst, showAvatar, currentBubbleSlot, nestedTool).WithKey(entry.Id);
+                renderedEntries[k] = RenderAssistantEntry(entry, startsBurst, endsBurst, showAvatar, currentBubbleSlot, nestedTool).WithKey(RowKey(entry));
                 continue;
             }
 
-            renderedEntries[k] = RenderEntry(entry, startsBurst, endsBurst, showAvatar).WithKey(entry.Id);
+            renderedEntries[k] = RenderEntry(entry, startsBurst, endsBurst, showAvatar).WithKey(RowKey(entry));
         }
 
         var thinkingNestedConsumed = new System.Collections.Generic.HashSet<int>();
@@ -2743,7 +2762,8 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 nestedTool: thinkingNestedTool,
                 suppressFooter: true,
                 forceVisible: true)
-                .LiveRegion(Microsoft.UI.Xaml.Automation.Peers.AutomationLiveSetting.Polite);
+                .LiveRegion(Microsoft.UI.Xaml.Automation.Peers.AutomationLiveSetting.Polite)
+                .WithKey(SyntheticRowKey("__thinking__", ChatTimelineItemKind.Assistant));
         }
 
         // Build the final element list, splicing the thinking indicator
@@ -2789,12 +2809,12 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                     Grid([GridSize.Star()], [GridSize.Auto, GridSize.Auto, GridSize.Auto, GridSize.Auto],
                         loadMoreButton.Grid(row: 0, column: 0),
                         Border(Empty()).Height(20).Grid(row: 1, column: 0),
-                        VStack(2, timelineRows).Set(sp =>
+                        VirtualVStack(2, timelineRows).Set(host =>
                         {
-                            if (contentRef.Current != sp)
+                            if (contentRef.Current != host)
                             {
-                                contentRef.Current = (Microsoft.UI.Xaml.Controls.StackPanel)sp;
-                                sp.SizeChanged += (_, _) =>
+                                contentRef.Current = host;
+                                host.SizeChanged += (_, _) =>
                                 {
                                     if (scrollViewRef.Current is not { } sv) return;
 
@@ -2812,9 +2832,23 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                                         return;
                                     }
 
-                                    if (!suppressAutoFollowRef.Current && isFollowingRef.Current)
+                                    // Follow-to-bottom during layout-driven growth (streaming into
+                                    // the newest row, thinking indicator, tool expand) needs a re-
+                                    // pin: WinUI scroll anchoring (VerticalAnchorRatio = 1.0) keeps
+                                    // an EXISTING bottom row glued as it grows, but NEW content that
+                                    // appears below the anchor (the thinking indicator, an appended
+                                    // row) is not followed by anchoring alone. Re-pin on the sticky
+                                    // follow intent only; QueueScrollToBottom itself re-checks the
+                                    // live offset on a fresh layout and BAILS if the user has since
+                                    // scrolled away (see UserScrolledAway there), so this cannot yank
+                                    // a scrolled-up reader back down even though SizeChanged fires on
+                                    // the same realization pass as their scroll.
+                                    if (!suppressAutoFollowRef.Current
+                                        && isFollowingRef.Current
+                                        && scrollSettleTimerRef.Current is null
+                                        && !scrollPinPendingRef.Current)
                                     {
-                                        QueueScrollToBottom(sv, prevSessionIdRef.Current, disableAnimation: true);
+                                        QueueScrollToBottom(sv, prevSessionIdRef.Current, disableAnimation: true, respectUserScrollPosition: true);
                                     }
                                     else if (suppressAutoFollowRef.Current)
                                     {
@@ -2834,9 +2868,69 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 if (scrollViewRef.Current != sv)
                 {
                     scrollViewRef.Current = sv;
+                    // Option B: WinUI scroll anchoring pins the bottom row to the viewport bottom
+                    // pre-paint as the ItemsRepeater extent grows during streaming (see the
+                    // constants note above). This replaces the old reactive ViewChanged re-pin.
+                    sv.VerticalAnchorRatio = 1.0;
                     sv.ViewChanged += (_, _) =>
                     {
+                        // Follow-to-bottom during in-place streaming growth is handled by scroll
+                        // anchoring (VerticalAnchorRatio = 1.0), so there is NO reactive re-pin
+                        // here. The old re-pin produced an intermediate short frame (jitter) and
+                        // fought the user's own scrolling. We just refresh follow/offset metrics
+                        // and drive the load-earlier trigger.
                         UpdateScrollMetrics(sv);
+
+                        // A genuine user scroll far away from the bottom is authoritative: cancel
+                        // any in-flight follow so it can't drag the reader back down. Without this,
+                        // an initial-load / append settle timer (which keeps re-pinning while the
+                        // ItemsRepeater extent estimate is still climbing) or a coalesced reactive
+                        // pin can supersede the user's own ChangeView a frame later, and the view
+                        // snaps back to the bottom (the reported "fighting the scrollbar" bug).
+                        // Disable bottom anchoring too, so extent re-estimation below the viewport
+                        // doesn't nudge the held reading position.
+                        var abandonGap = Math.Max(
+                            FollowToBottomMinAbandonGap,
+                            sv.ViewportHeight * FollowToBottomAbandonViewportFactor);
+                        if (sv.ScrollableHeight - sv.VerticalOffset > abandonGap)
+                        {
+                            isFollowingRef.Current = false;
+                            scrollPinPendingRef.Current = false;
+                            if (scrollSettleTimerRef.Current is not null)
+                            {
+                                scrollSettleTimerRef.Current.Stop();
+                                scrollSettleTimerRef.Current = null;
+                            }
+                            sv.VerticalAnchorRatio = double.NaN;
+                        }
+                        else if (!isFollowingRef.Current
+                            && scrollSettleTimerRef.Current is not null)
+                        {
+                            // Moderate user scroll above FollowThreshold (but below the large
+                            // abandonGap) during an active settle timer: the user's reading intent
+                            // is authoritative. After our own PinToBottom the gap is ~0 (offset
+                            // equals ScrollableHeight), so isFollowingRef stays true across the
+                            // pin's ViewChanged. If isFollowingRef is false here, the VIEW moved
+                            // because the USER scrolled between ticks — cancel the timer so
+                            // subsequent ticks cannot re-pin their position back to the bottom.
+                            // This closes the 61–900px band where the old design tolerated noise
+                            // at the cost of fighting a deliberate scroll.
+                            scrollPinPendingRef.Current = false;
+                            scrollSettleTimerRef.Current.Stop();
+                            scrollSettleTimerRef.Current = null;
+                            sv.VerticalAnchorRatio = double.NaN;
+                        }
+                        else if (isFollowingRef.Current
+                            && scrollSettleTimerRef.Current is null
+                            && !scrollPinPendingRef.Current)
+                        {
+                            // The user (or a settled pin) returned to the bottom band: re-arm bottom
+                            // anchoring immediately so in-place streaming growth follows again,
+                            // without waiting for the next render. Skipped while an explicit pin is
+                            // in flight — that path deliberately drives to the true bottom with
+                            // anchoring off and restores 1.0 itself once the extent settles.
+                            sv.VerticalAnchorRatio = 1.0;
+                        }
 
                         if (sv.ScrollableHeight > 0
                             && sv.VerticalOffset <= FollowThreshold
@@ -2851,6 +2945,17 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
 
                 if (entryCount != previousEntryCount)
                     loadMoreRequestedForCountRef.Current = -1;
+
+                // Keep bottom scroll anchoring active only while actually following. When the user
+                // has scrolled up to read history, anchoring the viewport-bottom row lets extent
+                // re-estimation — and the full remount FunctionalUI performs on every streamed
+                // revision — nudge their offset (observed ~40px drift per revision). Disabling it
+                // holds the reading position steady; it is re-enabled the moment they return to the
+                // bottom band (isFollowing flips true on the next render). Explicit pins
+                // (QueueScrollToBottom) and prepend (QueuePreservePrependOffset) own the ratio for
+                // their own async windows, so defer to them while one is in flight.
+                if (scrollSettleTimerRef.Current is null && !scrollPinPendingRef.Current)
+                    sv.VerticalAnchorRatio = isFollowingRef.Current ? 1.0 : double.NaN;
 
                 if (sessionChanged && !isFirstMount)
                 {
@@ -2908,7 +3013,11 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 prevLastEntryIdRef.Current = lastEntryId;
                 prevEntryCountRef.Current = entryCount;
             })
-            ).Background(chatPageBg).Grid(row: 0, column: 0)
+            ).Set(rootBorder =>
+             {
+                 Theme.EnsureThemeCallback(rootBorder, () =>
+                     chatStampFg.Color = Theme.ResolveColor("TextFillColorSecondary", rootBorder.ActualTheme));
+             }).Background(chatPageBg).Grid(row: 0, column: 0)
         );
     }
 }

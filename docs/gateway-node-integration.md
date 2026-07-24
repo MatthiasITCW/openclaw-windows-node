@@ -78,18 +78,25 @@ After changing config:
 openclaw gateway restart
 ```
 
-After changing the node's command list (code change), you must **re-pair**:
+After changing the node's command list, approve the pending reapproval request:
 ```bash
-openclaw devices list          # find old device
-openclaw devices reject <id>   # reject the old pairing
-# Node will auto-reconnect and create a new pairing request
-openclaw devices list          # find new request
-openclaw devices approve <id>  # approve with updated commands
+openclaw nodes pending
+openclaw nodes approve <pendingRequestId>
 ```
 
-### 1.4 Why Re-Pairing is Needed
+`openclaw nodes pending` only discovers request IDs; it does not approve declarations.
 
-The gateway snapshots the node's declared `commands` array at **pairing approval time**. If you change the node's code to add new commands and restart it, the gateway still uses the old snapshot. You must reject the old pairing and approve a new one.
+Older gateways without pending reapproval support may still require rejecting and re-pairing the node.
+
+### 1.4 Why Reapproval is Needed
+
+The gateway snapshots the node's declared `commands` array at **pairing approval time**. When a newer gateway detects changed declarations, `node.list` and `node.describe` keep the existing `caps`, `commands`, and `permissions` as the approved/effective snapshot and report the proposed replacement under `pendingDeclaredCaps`, `pendingDeclaredCommands`, and `pendingDeclaredPermissions`. Approve the reported request explicitly:
+
+```powershell
+openclaw nodes approve <pendingRequestId>
+```
+
+Then reconnect the node and verify the effective command and capability counts update. Pending declarations are never effective before approval. Older gateways that do not report pending reapproval fields may still require rejecting and re-pairing the node.
 
 ### 1.5 `denyCommands`
 
@@ -200,7 +207,8 @@ explicit gateway policy matching the node's advertised commands.
 
 1. Calls `issueDeviceBootstrapToken()` on the gateway
 2. Generates a **short-lived, single-use** `bootstrapToken`
-3. Encodes `{ url, bootstrapToken, expiresAtMs }` as base64url
+3. Encodes `{ url, urls?, bootstrapToken }` as base64url. The gateway enforces
+   the 10-minute token lifetime; the payload does not include expiry metadata.
 4. Renders as QR code or pasteable setup code
 
 ### 4.2 bootstrapToken vs gateway.auth.token
@@ -231,7 +239,7 @@ The setup code and QR code are the same bootstrap concept in different packaging
 QR image
   -> decodes to setup code text
     -> decodes to JSON payload
-      -> contains gateway URL + bootstrapToken + expiry
+      -> contains gateway URL(s) + bootstrapToken
 ```
 
 Advanced users can drop into setup at any level:
@@ -248,7 +256,8 @@ The QR/setup-code path is preferred for first-time node onboarding because it av
 
 The Windows Setup Wizard:
 1. Accepts a QR image, clipboard QR image, pasteable setup code, or manual gateway URL/token.
-2. For QR/setup-code input, decodes `{ url, bootstrapToken, expiresAtMs }`.
+2. For QR/setup-code input, decodes `{ url, bootstrapToken }`; the optional
+   upstream `urls` fallback list is not used by the current decoder.
 3. Stores `bootstrapToken` in the active `GatewayRecord.BootstrapToken`; manual long-lived tokens are stored as `GatewayRecord.SharedGatewayToken`.
 4. Sends it as `auth.bootstrapToken` in the node connect handshake.
 
@@ -272,7 +281,7 @@ Windows stores `hello-ok.auth.deviceToken` in the per-gateway device identity fi
 ```
 1. User runs `openclaw qr` on gateway host
 2. User imports/scans QR image or pastes setup code into Windows Setup Wizard
-3. Wizard decodes → { url, bootstrapToken, expiresAtMs }
+3. Wizard decodes → { url, bootstrapToken }
 4. Node connects with: auth: { bootstrapToken: "<token>" }
 5. Gateway auto-approves pairing (bootstrap-token auth method)
 6. Gateway returns hello-ok with: auth: { deviceToken: "<token>" }
@@ -313,7 +322,7 @@ For the first-party Windows companion node, the practical local solution is:
 1. Keep declaring the correct command names from the Windows node.
 2. Send canonical connect metadata: `platform: "windows"` and
    `deviceFamily: "Windows"`.
-3. Re-pair after command-list changes because the gateway snapshots commands at approval time.
+3. Reapprove command-list changes because the gateway snapshots commands at approval time; older gateways may require re-pairing.
 
 ### 5.1 Gateway Node Allowlist Configuration
 
@@ -333,7 +342,7 @@ camera.clip
 screen.record
 ```
 
-After changing either `gateway.nodes.allowCommands` or `gateway.nodes.denyCommands`, re-approve or re-pair the Windows node. Approved device records may keep a snapshot of the commands that were visible at approval time, so a gateway restart alone may not refresh existing approvals.
+After changing either `gateway.nodes.allowCommands` or `gateway.nodes.denyCommands`, check Command Center for `pending-reapproval`. Copy and run its exact `openclaw nodes approve <pendingRequestId>` command, reconnect the Windows node, and verify the effective command and capability counts update. A gateway restart alone does not approve pending declarations. Older gateways without pending reapproval diagnostics may still require re-pairing.
 
 ### 5.2 Immediate Code Fixes (This Branch)
 
@@ -348,7 +357,6 @@ After changing either `gateway.nodes.allowCommands` or `gateway.nodes.denyComman
 - [x] Handle `hello-ok.auth.deviceToken` — save it for future connections
 - [x] Accept QR images and clipboard setup content as alternate ways to enter the same bootstrap payload
 - [x] Show "auto-paired!" vs "waiting for approval" based on auth method
-- [x] Handle bootstrap token expiry gracefully when setup code payloads include expiry metadata (`expiresAt`, `expires_at`, `expires`, `expiry`, or `exp`)
 - [x] Add Settings toggles for optional Windows node capability groups (`canvas`, `screen`, `camera`, `location`, `browser.proxy`)
 
 ### 5.4 Upstream Alignment

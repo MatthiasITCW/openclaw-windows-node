@@ -4,6 +4,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using OpenClaw.Shared.ExecApprovals;
+using OpenClaw.Shared.Telemetry;
 
 namespace OpenClaw.Shared.Capabilities;
 
@@ -49,10 +50,33 @@ public class SystemCapability : NodeCapabilityBase
         "shutdown",
         "invoke-webrequest",
         "invoke-restmethod",
+        "invoke-expression",
+        "iex ",
+        "invoke-command",
+        "icm ",
         "start-process",
         "set-executionpolicy",
         "reg ",
-        "net "
+        "net ",
+        // Living-off-the-land binaries: native tools whose purpose here is code execution or remote
+        // download-and-run — the same intent already blocked for the PowerShell downloaders
+        // (invoke-webrequest/-restmethod) and process spawning (start-process), but in native-binary
+        // form the fragments above miss. A remote .set must not be able to whitelist one and invoke
+        // it (mshta/regsvr32/rundll32 run remote script; certutil/bitsadmin/curl/wget download). A
+        // denylist cannot be exhaustive against the LOLBAS set — the local Permissions UI, not a
+        // remote caller, is the place to allow anything broader than the read-only defaults.
+        "mshta",
+        "rundll32",
+        "regsvr32",
+        "regsvcs",
+        "regasm",
+        "installutil",
+        "msbuild",
+        "wmic",
+        "certutil",
+        "bitsadmin",
+        "curl",
+        "wget"
     ];
     
     private readonly bool _includeRunCommands;
@@ -62,6 +86,16 @@ public class SystemCapability : NodeCapabilityBase
 
     // Event to let UI handle the actual notification display
     public event EventHandler<SystemNotifyArgs>? NotifyRequested;
+
+    /// <summary>
+    /// Fired when policy denies an exec request non-interactively (no native
+    /// prompt is shown — e.g. default action is Deny, or matched rule action
+    /// is Deny). Lets UI surfaces (chat) render a denial card that would
+    /// otherwise be invisible to the user. Not raised when the user clicks
+    /// Deny in the native prompt — that path already raises
+    /// <see cref="ExecApprovalPromptService.Decided"/>.
+    /// </summary>
+    public event EventHandler<ExecApprovalPromptDecidedEventArgs>? PolicyAutoDecided;
     
     // Command runner for system.run (swappable: local, docker, wsl)
     private ICommandRunner? _commandRunner;
@@ -126,7 +160,9 @@ public class SystemCapability : NodeCapabilityBase
             (request.Command == "system.run" || request.Command == "system.run.prepare"))
         {
             Logger.Info($"[system.run] rejected: 'Run system tools' is disabled (command={request.Command})");
-            return Error("system.run is disabled by user setting (Permissions → Run system tools).");
+            return ErrorWithDiagnostic(
+                "system.run is disabled by user setting (Permissions → Run system tools).",
+                NodeToolErrorCategory.PermissionDenied);
         }
 
         return request.Command switch
@@ -265,11 +301,15 @@ public class SystemCapability : NodeCapabilityBase
         
         var command = argv[0];
         var rawCommand = GetStringArg(request.Args, "rawCommand");
+        var requestedShell = GetStringArg(request.Args, "shell");
+        var effectiveShell = _commandRunner?.ResolveEffectiveShell(requestedShell)
+            ?? ResolveDefaultEffectiveShell(requestedShell);
         var cwd = GetStringArg(request.Args, "cwd");
         var agentId = GetStringArg(request.Args, "agentId");
-        var sessionKey = GetStringArg(request.Args, "sessionKey");
+        var sessionKey = request.SessionKey ?? GetStringArg(request.Args, "sessionKey");
         
-        Logger.Info($"system.run.prepare: {rawCommand} (cwd={cwd ?? "default"})");
+        Logger.Info(
+            $"system.run.prepare: {rawCommand} (shell={effectiveShell}, requestedShell={requestedShell ?? "auto"}, cwd={cwd ?? "default"})");
         
         return Success(new
         {
@@ -279,37 +319,94 @@ public class SystemCapability : NodeCapabilityBase
                 argv,
                 cwd,
                 rawCommand,
+                requestedShell = string.IsNullOrWhiteSpace(requestedShell) ? null : requestedShell.Trim(),
+                effectiveShell,
                 agentId,
                 sessionKey
             }
         });
     }
+
+    private static string ResolveDefaultEffectiveShell(string? requestedShell)
+    {
+        if (string.IsNullOrWhiteSpace(requestedShell))
+            return "powershell";
+
+        return requestedShell.Trim().ToLowerInvariant() switch
+        {
+            "cmd" => "cmd",
+            "pwsh" => "pwsh",
+            "powershell" => "powershell",
+            _ => "powershell",
+        };
+    }
     
     private async Task<NodeInvokeResponse> HandleRunAsync(NodeInvokeRequest request)
     {
         var correlationId = Guid.NewGuid().ToString("N")[..8];
+        var v2Handler = _v2Handler;
+        request.Telemetry?.SetApprovalPipeline(
+            v2Handler != null
+                ? NodeToolApprovalPipeline.V2
+                : NodeToolApprovalPipeline.Legacy);
 
         // Routing seam (rail 2): select path, delegate — no approval logic here.
-        if (_v2Handler != null)
+        if (v2Handler != null)
         {
             Logger.Info($"[system.run] corr={correlationId} path=v2");
+            var approvalSpan = request.Telemetry?.StartChild(
+                NodeToolInvocation.SystemRunAuthorizeSpanName,
+                GetTelemetryParentContext(request));
             ExecApprovalV2Result v2Result;
-            try
+            var approvalCategory = NodeToolErrorCategory.None;
+            Type? approvalErrorType = null;
+            if (_commandRunner is IDirectArgvSupportAwareCommandRunner argvAware
+                && !argvAware.CanExecuteDirectArgv())
             {
-                v2Result = await _v2Handler.HandleAsync(request, correlationId);
+                // Approved commands execute as a direct argv, which the active
+                // sandbox transport cannot carry yet. Fail closed before any
+                // evaluation or prompt so nothing gets approved that cannot
+                // execute. The sandbox is never bypassed or disabled from here.
+                v2Result = ExecApprovalV2Result.Unavailable(
+                    "sandboxed system.run cannot execute the approved command form yet; " +
+                    "keep the sandbox on and disable the new approvals path, or turn the sandbox off, to run commands");
             }
-            catch (Exception ex)
+            else
             {
-                // Rail 1: no silent fallback — handler exceptions become typed denies.
-                Logger.Error($"[system.run] corr={correlationId} path=v2 handler threw", ex);
-                v2Result = ExecApprovalV2Result.ValidationFailed("Handler exception");
+                try
+                {
+                    v2Result = await v2Handler.HandleAsync(request, correlationId);
+                }
+                catch (Exception ex)
+                {
+                    // Rail 1: no silent fallback — handler exceptions become typed denies.
+                    Logger.Error($"[system.run] corr={correlationId} path=v2 handler threw", ex);
+                    v2Result = ExecApprovalV2Result.ValidationFailed("Handler exception");
+                    approvalErrorType = ex.GetType();
+                }
             }
 
+            approvalCategory = approvalErrorType == null
+                ? MapV2ErrorCategory(v2Result.Code)
+                : NodeToolErrorCategory.InternalFailure;
             Logger.Info($"[system.run] corr={correlationId} decision={v2Result.Code} reason={v2Result.Reason}");
-            // Rail 1: no silent fallback to legacy regardless of result code.
-            // In PR1 only ExecApprovalV2NullHandler exists (always unavailable); the real
-            // coordinator that can produce an allow decision is wired in PR7/PR8.
-            return Error($"exec-approvals-v2: {v2Result.Code} ({v2Result.Reason})");
+            NodeToolInvocation.CompleteChild(
+                approvalSpan,
+                approvalCategory == NodeToolErrorCategory.None
+                    ? NodeToolOutcome.Success
+                    : NodeToolOutcome.Failure,
+                approvalCategory,
+                errorType: approvalErrorType);
+
+            if (v2Result.IsAllow && v2Result.Execution is { } approvedExecution)
+                return await RunApprovedAsync(approvedExecution, correlationId, request);
+
+            // No fallback to legacy regardless of result code: any non-allow
+            // outcome from the approval handler is a terminal, typed error.
+            var response = Error($"exec-approvals-v2: {v2Result.Code} ({v2Result.Reason})");
+            if (approvalCategory != NodeToolErrorCategory.None)
+                response.Diagnostic = new NodeToolDiagnostic(approvalCategory);
+            return response;
         }
 
         // Legacy path — untouched (rail 3).
@@ -317,7 +414,9 @@ public class SystemCapability : NodeCapabilityBase
 
         if (_commandRunner == null)
         {
-            return Error("Command execution not available");
+            return ErrorWithDiagnostic(
+                "Command execution not available",
+                NodeToolErrorCategory.CapabilityUnavailable);
         }
         
         // Per OpenClaw spec, "command" is an argv array (e.g. ["echo","Hello"]).
@@ -342,11 +441,12 @@ public class SystemCapability : NodeCapabilityBase
         
         if (string.IsNullOrWhiteSpace(command))
         {
-            return Error("Missing command parameter");
+            return ErrorWithDiagnostic("Missing command parameter", NodeToolErrorCategory.InvalidRequest);
         }
         
         var shell = GetStringArg(request.Args, "shell");
         var cwd = GetStringArg(request.Args, "cwd");
+        var sessionKey = request.SessionKey ?? GetStringArg(request.Args, "sessionKey");
         var timeoutMs = GetIntArg(request.Args, "timeoutMs",
             GetIntArg(request.Args, "timeout", DefaultRunTimeoutMs));
         // Clamp caller-supplied timeouts. timeoutMs <= 0 historically meant
@@ -378,7 +478,9 @@ public class SystemCapability : NodeCapabilityBase
             Array.Sort(blockedNames, StringComparer.OrdinalIgnoreCase);
             var blockedList = string.Join(", ", blockedNames);
             Logger.Warn($"system.run DENIED: blocked environment overrides [{blockedList}]");
-            return Error($"Unsafe environment variable override blocked: {blockedList}");
+            return ErrorWithDiagnostic(
+                $"Unsafe environment variable override blocked: {blockedList}",
+                NodeToolErrorCategory.InvalidRequest);
         }
         env = envResult.Allowed;
         
@@ -389,78 +491,249 @@ public class SystemCapability : NodeCapabilityBase
         var fullCommand = args != null
             ? FormatExecCommand([command!, ..args])
             : command;
+        var requestedShell = string.IsNullOrWhiteSpace(shell) ? null : shell.Trim();
+        var effectiveShell = _commandRunner.ResolveEffectiveShell(requestedShell);
+        var approvedHostFallbackShell = _commandRunner is IHostFallbackAwareCommandRunner fallbackAwareRunner
+            ? fallbackAwareRunner.ResolveHostFallbackShellForApproval(requestedShell, effectiveShell)
+            : null;
         
-        Logger.Info($"system.run: {fullCommand} (shell={shell ?? "auto"}, timeout={timeoutMs}ms)");
+        Logger.Info($"system.run: {fullCommand} (shell={effectiveShell}, requestedShell={shell ?? "auto"}, timeout={timeoutMs}ms)");
         
         // Check exec approval policy
         if (_approvalPolicy != null)
         {
-            var approval = _approvalPolicy.Evaluate(fullCommand, shell);
-            var approvalCheck = await EnsureApprovedAsync(fullCommand, shell, approval);
-            if (!approvalCheck.Allowed)
+            var approvalSpan = request.Telemetry?.StartChild(
+                NodeToolInvocation.SystemRunAuthorizeSpanName,
+                GetTelemetryParentContext(request));
+            try
             {
-                Logger.Warn($"system.run DENIED: {fullCommand} ({approval.Reason})");
-                return Error($"Command denied by exec policy: {approval.Reason}");
-            }
-
-            var outerApprovalCoversNestedTargets =
-                approvalCheck.PromptDecisionKind != null ||
-                IsExactAllowRuleForCommand(approval, fullCommand);
-
-            var parseResult = ExecShellWrapperParser.Expand(fullCommand, shell);
-            if (!string.IsNullOrWhiteSpace(parseResult.Error))
-            {
-                Logger.Warn($"system.run DENIED: {fullCommand} ({parseResult.Error})");
-                return Error($"Command denied by exec policy: {parseResult.Error}");
-            }
-
-            foreach (var target in parseResult.Targets)
-            {
-                var innerApproval = _approvalPolicy.Evaluate(target.Command, target.Shell);
-                if (outerApprovalCoversNestedTargets && !IsExplicitDeny(innerApproval))
+                var approvalError = await EnsureCommandAndNestedTargetsApprovedAsync(
+                    fullCommand,
+                    effectiveShell,
+                    sessionKey,
+                    correlationId);
+                if (approvalError != null)
                 {
-                    if (!innerApproval.Allowed)
+                    approvalError.Diagnostic = new NodeToolDiagnostic(NodeToolErrorCategory.ExecPolicyDenied);
+                    NodeToolInvocation.CompleteChild(
+                        approvalSpan,
+                        NodeToolOutcome.Failure,
+                        NodeToolErrorCategory.ExecPolicyDenied);
+                    return approvalError;
+                }
+
+                if (!string.IsNullOrWhiteSpace(approvedHostFallbackShell)
+                    && !string.Equals(approvedHostFallbackShell, effectiveShell, StringComparison.OrdinalIgnoreCase))
+                {
+                    approvalError = await EnsureCommandAndNestedTargetsApprovedAsync(
+                        fullCommand,
+                        approvedHostFallbackShell,
+                        sessionKey,
+                        correlationId);
+                    if (approvalError != null)
                     {
-                        Logger.Info(
-                            $"system.run nested approval covered by approved wrapper: {target.Command} ({innerApproval.Reason})");
+                        approvalError.Diagnostic = new NodeToolDiagnostic(NodeToolErrorCategory.ExecPolicyDenied);
+                        NodeToolInvocation.CompleteChild(
+                            approvalSpan,
+                            NodeToolOutcome.Failure,
+                            NodeToolErrorCategory.ExecPolicyDenied);
+                        return approvalError;
                     }
-                    continue;
                 }
 
-                var innerApprovalCheck = await EnsureApprovedAsync(target.Command, target.Shell, innerApproval);
-                if (!innerApprovalCheck.Allowed)
-                {
-                    Logger.Warn($"system.run DENIED: {target.Command} ({innerApproval.Reason})");
-                    return Error($"Command denied by exec policy: {innerApproval.Reason}");
-                }
+                NodeToolInvocation.CompleteChild(approvalSpan, NodeToolOutcome.Success);
+            }
+            catch (Exception ex)
+            {
+                NodeToolInvocation.CompleteChild(
+                    approvalSpan,
+                    NodeToolOutcome.Failure,
+                    NodeToolErrorCategory.InternalFailure,
+                    errorType: ex.GetType());
+                throw;
             }
         }
         
+        var runSpan = request.Telemetry?.StartChild(
+            NodeToolInvocation.SystemRunRunSpanName,
+            GetTelemetryParentContext(request));
         try
         {
             var result = await _commandRunner.RunAsync(new CommandRequest
             {
                 Command = command,
                 Args = args,
-                Shell = shell,
+                Shell = requestedShell,
                 Cwd = cwd,
                 TimeoutMs = timeoutMs,
-                Env = env
+                Env = env,
+                ApprovedEffectiveShell = effectiveShell,
+                ApprovedHostFallbackShell = approvedHostFallbackShell,
+                Telemetry = request.Telemetry,
+                TelemetryParentContext = runSpan?.Context ?? request.Telemetry?.Context ?? default
             });
-            
-            return Success(new
+
+            var executionMode = result.ExecutionMode ?? NodeToolExecutionMode.Host;
+            var errorCategory = ClassifyCommandResult(result);
+            if (result.SandboxDenialReason.HasValue)
+                request.Telemetry?.SetSandboxDenialReason(result.SandboxDenialReason.Value);
+            NodeToolInvocation.CompleteChild(
+                runSpan,
+                errorCategory == NodeToolErrorCategory.None
+                    ? NodeToolOutcome.Success
+                    : NodeToolOutcome.Failure,
+                errorCategory,
+                    executionMode,
+                    sandboxDenialReason: result.SandboxDenialReason);
+
+            var response = Success(new
             {
                 stdout = result.Stdout,
                 stderr = result.Stderr,
                 exitCode = result.ExitCode,
                 timedOut = result.TimedOut,
+                success = result.ExitCode == 0 && !result.TimedOut,
                 durationMs = result.DurationMs
             });
+            if (errorCategory != NodeToolErrorCategory.None)
+            {
+                response.Diagnostic = new NodeToolDiagnostic(
+                    errorCategory,
+                    executionMode,
+                    result.SandboxDenialReason);
+            }
+            return response;
         }
         catch (Exception ex)
         {
             Logger.Error("system.run failed", ex);
-            return Error("Execution failed");
+            NodeToolInvocation.CompleteChild(
+                runSpan,
+                NodeToolOutcome.Failure,
+                NodeToolErrorCategory.InternalFailure,
+                errorType: ex.GetType());
+            var response = ErrorWithDiagnostic("Execution failed", NodeToolErrorCategory.InternalFailure);
+            return response;
+        }
+    }
+
+    private NodeInvokeResponse ErrorWithDiagnostic(
+        string message,
+        NodeToolErrorCategory errorCategory,
+        NodeToolExecutionMode? executionMode = null)
+    {
+        var response = Error(message);
+        response.Diagnostic = new NodeToolDiagnostic(errorCategory, executionMode);
+        return response;
+    }
+
+    private static System.Diagnostics.ActivityContext? GetTelemetryParentContext(
+        NodeInvokeRequest request) =>
+        request.TelemetryParentContext != default
+            ? request.TelemetryParentContext
+            : request.Telemetry?.Context;
+
+    private static NodeToolErrorCategory ClassifyCommandResult(CommandResult result)
+    {
+        if (result.ErrorCategory != NodeToolErrorCategory.None)
+            return result.ErrorCategory;
+        if (result.TimedOut)
+            return NodeToolErrorCategory.Timeout;
+        return result.ExitCode == 0
+            ? NodeToolErrorCategory.None
+            : NodeToolErrorCategory.CommandFailed;
+    }
+
+    private static NodeToolErrorCategory MapV2ErrorCategory(ExecApprovalV2Code code) =>
+        code switch
+        {
+            ExecApprovalV2Code.SecurityDeny
+                or ExecApprovalV2Code.AskDeny
+                or ExecApprovalV2Code.AllowlistMiss
+                or ExecApprovalV2Code.UserDenied => NodeToolErrorCategory.ExecPolicyDenied,
+            ExecApprovalV2Code.ValidationFailed => NodeToolErrorCategory.InvalidRequest,
+            ExecApprovalV2Code.ResolutionFailed => NodeToolErrorCategory.CommandUnavailable,
+            ExecApprovalV2Code.Unavailable => NodeToolErrorCategory.CapabilityUnavailable,
+            ExecApprovalV2Code.InternalError => NodeToolErrorCategory.InternalFailure,
+            ExecApprovalV2Code.Allow => NodeToolErrorCategory.None,
+            _ => NodeToolErrorCategory.InternalFailure
+        };
+
+    /// <summary>
+    /// Execute a command the V2 approval handler allowed. The request is built
+    /// from the approved payload only — validated argv plus sanitized env — so
+    /// the process receives exactly what was approved, with no shell re-parsing
+    /// and nothing re-derived from the raw request. The payload's constructor
+    /// already clamps the timeout to the system.run maximum.
+    /// </summary>
+    private async Task<NodeInvokeResponse> RunApprovedAsync(
+        ExecApprovedExecution execution,
+        string correlationId,
+        NodeInvokeRequest request)
+    {
+        var runSpan = request.Telemetry?.StartChild(
+            NodeToolInvocation.SystemRunRunSpanName,
+            GetTelemetryParentContext(request));
+        if (_commandRunner == null)
+        {
+            NodeToolInvocation.CompleteChild(
+                runSpan,
+                NodeToolOutcome.Failure,
+                NodeToolErrorCategory.CapabilityUnavailable);
+            return ErrorWithDiagnostic(
+                "Command execution not available",
+                NodeToolErrorCategory.CapabilityUnavailable);
+        }
+
+        try
+        {
+            var commandRequest = execution.ToCommandRequest();
+            commandRequest.Telemetry = request.Telemetry;
+            commandRequest.TelemetryParentContext =
+                runSpan?.Context ?? request.Telemetry?.Context ?? default;
+            var result = await _commandRunner.RunAsync(commandRequest);
+            Logger.Info($"[system.run] corr={correlationId} path=v2 executed exit={result.ExitCode} timedOut={result.TimedOut}");
+
+            var executionMode = result.ExecutionMode ?? NodeToolExecutionMode.Host;
+            var errorCategory = ClassifyCommandResult(result);
+            if (result.SandboxDenialReason.HasValue)
+                request.Telemetry?.SetSandboxDenialReason(result.SandboxDenialReason.Value);
+            NodeToolInvocation.CompleteChild(
+                runSpan,
+                errorCategory == NodeToolErrorCategory.None
+                    ? NodeToolOutcome.Success
+                    : NodeToolOutcome.Failure,
+                errorCategory,
+                executionMode,
+                sandboxDenialReason: result.SandboxDenialReason);
+
+            var response = Success(new
+            {
+                stdout = result.Stdout,
+                stderr = result.Stderr,
+                exitCode = result.ExitCode,
+                timedOut = result.TimedOut,
+                success = result.ExitCode == 0 && !result.TimedOut,
+                durationMs = result.DurationMs
+            });
+            if (errorCategory != NodeToolErrorCategory.None)
+            {
+                response.Diagnostic = new NodeToolDiagnostic(
+                    errorCategory,
+                    executionMode,
+                    result.SandboxDenialReason);
+            }
+            return response;
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[system.run] corr={correlationId} path=v2 execution failed", ex);
+            NodeToolInvocation.CompleteChild(
+                runSpan,
+                NodeToolOutcome.Failure,
+                NodeToolErrorCategory.InternalFailure,
+                errorType: ex.GetType());
+            return ErrorWithDiagnostic("Execution failed", NodeToolErrorCategory.InternalFailure);
         }
     }
 
@@ -468,20 +741,27 @@ public class SystemCapability : NodeCapabilityBase
         string command,
         string? shell,
         ExecApprovalResult approval,
+        string? sessionKey,
+        string correlationId,
         CancellationToken cancellationToken = default)
     {
         if (approval.Allowed)
             return new ExecApprovalCheckResult(true, null);
 
         if (approval.Action != ExecApprovalAction.Prompt || _promptHandler == null || _approvalPolicy == null)
+        {
+            RaisePolicyAutoDenied(command, shell, approval);
             return new ExecApprovalCheckResult(false, null);
+        }
 
         var decision = await _promptHandler.RequestAsync(new ExecApprovalPromptRequest
         {
             Command = command,
             Shell = shell,
             MatchedPattern = approval.MatchedPattern,
-            Reason = approval.Reason ?? "Command requires approval"
+            Reason = approval.Reason ?? "Command requires approval",
+            SessionKey = sessionKey,
+            CorrelationId = correlationId
         }, cancellationToken);
 
         if (decision.Kind == ExecApprovalPromptDecisionKind.Deny)
@@ -513,6 +793,86 @@ public class SystemCapability : NodeCapabilityBase
         return new ExecApprovalCheckResult(true, decision.Kind);
     }
 
+    private async Task<NodeInvokeResponse?> EnsureCommandAndNestedTargetsApprovedAsync(
+        string fullCommand,
+        string? shell,
+        string? sessionKey,
+        string correlationId)
+    {
+        if (_approvalPolicy == null)
+            return null;
+
+        var parseResult = ExecShellWrapperParser.Expand(fullCommand, shell);
+        if (!string.IsNullOrWhiteSpace(parseResult.Error))
+        {
+            Logger.Warn($"system.run DENIED: {fullCommand} ({parseResult.Error})");
+            return Error($"Command denied by exec policy: {parseResult.Error}");
+        }
+
+        var approval = _approvalPolicy.Evaluate(fullCommand, shell);
+        var hasNestedTargets = parseResult.Targets.Count > 0;
+        var hasExplicitOuterRule = !string.IsNullOrWhiteSpace(approval.MatchedPattern);
+        var evaluateOuter =
+            !hasNestedTargets ||
+            hasExplicitOuterRule ||
+            approval.Allowed ||
+            approval.Action == ExecApprovalAction.Prompt;
+        var approvalCheck = new ExecApprovalCheckResult(false, null);
+        if (evaluateOuter)
+        {
+            approvalCheck = await EnsureApprovedAsync(fullCommand, shell, approval, sessionKey, correlationId);
+            if (!approvalCheck.Allowed)
+            {
+                Logger.Warn($"system.run DENIED: {fullCommand} ({approval.Reason})");
+                return Error($"Command denied by exec policy: {approval.Reason}");
+            }
+        }
+
+        var outerApprovalCoversNestedTargets =
+            approvalCheck.PromptDecisionKind != null ||
+            IsExactAllowRuleForCommand(approval, fullCommand);
+
+        // Gateway execution wraps Windows commands in cmd.exe. Only an
+        // unmatched default deny may defer to exact parsed-payload rules;
+        // explicit/default prompts still show and persist the full wrapper.
+        foreach (var target in parseResult.Targets)
+        {
+            var innerApproval = _approvalPolicy.Evaluate(target.Command, target.Shell);
+            if (outerApprovalCoversNestedTargets && !IsExplicitDeny(innerApproval))
+            {
+                if (!innerApproval.Allowed)
+                {
+                    Logger.Info(
+                        $"system.run nested approval covered by approved wrapper: {target.Command} ({innerApproval.Reason})");
+                }
+                continue;
+            }
+
+            var innerApprovalCheck = await EnsureApprovedAsync(
+                target.Command,
+                target.Shell,
+                innerApproval,
+                sessionKey,
+                correlationId);
+            if (!innerApprovalCheck.Allowed)
+            {
+                Logger.Warn($"system.run DENIED: {target.Command} ({innerApproval.Reason})");
+                return Error($"Command denied by exec policy: {innerApproval.Reason}");
+            }
+
+            if (!evaluateOuter &&
+                innerApprovalCheck.PromptDecisionKind == null &&
+                !IsExactAllowRuleForCommand(innerApproval, target.Command))
+            {
+                const string reason = "Wrapped commands require an exact allow rule";
+                Logger.Warn($"system.run DENIED: {target.Command} ({reason})");
+                return Error($"Command denied by exec policy: {reason}");
+            }
+        }
+
+        return null;
+    }
+
     private static bool CanPersistExactAllowRule(string command) =>
         !string.IsNullOrWhiteSpace(command) &&
         command.IndexOfAny(['*', '?']) < 0;
@@ -532,6 +892,31 @@ public class SystemCapability : NodeCapabilityBase
     private readonly record struct ExecApprovalCheckResult(
         bool Allowed,
         ExecApprovalPromptDecisionKind? PromptDecisionKind);
+
+    private void RaisePolicyAutoDenied(string command, string? shell, ExecApprovalResult approval)
+    {
+        var handler = PolicyAutoDecided;
+        if (handler == null) return;
+        try
+        {
+            var request = new ExecApprovalPromptRequest
+            {
+                Command = command,
+                Shell = shell,
+                MatchedPattern = approval.MatchedPattern,
+                Reason = approval.Reason ?? "Command denied by policy"
+            };
+            var decision = ExecApprovalPromptDecision.Deny(approval.Reason ?? "Command denied by policy");
+            handler(this, new ExecApprovalPromptDecidedEventArgs(
+                request,
+                decision,
+                ExecApprovalPromptDecisionSource.PolicyAutoDeny));
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"PolicyAutoDecided handler threw: {ex.Message}");
+        }
+    }
     
     private NodeInvokeResponse HandleExecApprovalsGet()
     {
@@ -616,7 +1001,7 @@ public class SystemCapability : NodeCapabilityBase
                         rule.Action = actStr.ToLowerInvariant() switch
                         {
                             "allow" => ExecApprovalAction.Allow,
-                            "prompt" => ExecApprovalAction.Prompt,
+                            "prompt" or "ask" => ExecApprovalAction.Prompt,
                             _ => ExecApprovalAction.Deny
                         };
                     }
@@ -650,7 +1035,7 @@ public class SystemCapability : NodeCapabilityBase
                 defaultAction = defStr.ToLowerInvariant() switch
                 {
                     "allow" => ExecApprovalAction.Allow,
-                    "prompt" => ExecApprovalAction.Prompt,
+                    "prompt" or "ask" => ExecApprovalAction.Prompt,
                     _ => ExecApprovalAction.Deny
                 };
             }
@@ -692,7 +1077,11 @@ public class SystemCapability : NodeCapabilityBase
             if (string.IsNullOrWhiteSpace(pattern))
                 return "Empty allow rule patterns are not permitted.";
 
-            var normalized = pattern.ToLowerInvariant();
+            // Normalize to lowercase and collapse all whitespace runs (including tabs,
+            // non-breaking spaces) to a single ASCII space so fragment checks cannot be
+            // bypassed with alternate whitespace characters.
+            var normalized = System.Text.RegularExpressions.Regex.Replace(
+                pattern.ToLowerInvariant(), @"\s+", " ");
 
             // Catch all-wildcard patterns (e.g. *, **, ?*, * ?) that match any command.
             // Strip every wildcard character and whitespace; if nothing remains the pattern
@@ -710,21 +1099,23 @@ public class SystemCapability : NodeCapabilityBase
             // A remote .set call should never be able to whitelist a specific binary
             // by path — that would be a two-step EoP (compromise MCP token → whitelist
             // attacker binary → invoke it). Legitimate rules name commands, not paths.
-            // Strip one layer of matching surrounding quotes first so quoted forms
-            // ("C:\evil.exe", 'C:\evil.exe') are caught alongside bare paths.
+            // Parse the executable token first so quoted paths remain one token even
+            // when the rule includes arguments.
             // Covers: drive-rooted paths (C:\, C:/), UNC/long-path (\\, //), and
             // forward-slash UNC namespace forms (//server/share, //?/C:/evil.exe).
-            var unquoted = normalized;
-            if (normalized.Length >= 2 &&
-                ((normalized[0] == '"' && normalized[^1] == '"') ||
-                 (normalized[0] == '\'' && normalized[^1] == '\'')))
-                unquoted = normalized[1..^1];
+            var executableToken = ExecCommandToken.ParseFirstToken(normalized);
+            if (executableToken is null)
+                return $"Allow rule must begin with a valid executable token: {pattern}";
 
-            if (unquoted.Length >= 3 &&
-                ((char.IsLetter(unquoted[0]) && unquoted[1] == ':' && (unquoted[2] == '\\' || unquoted[2] == '/')) ||
-                 unquoted.StartsWith(@"\\", StringComparison.Ordinal) ||
-                 unquoted.StartsWith("//", StringComparison.Ordinal)))
+            var pathToken = executableToken;
+            if (pathToken.Length >= 3 &&
+                ((char.IsLetter(pathToken[0]) && pathToken[1] == ':' && (pathToken[2] == '\\' || pathToken[2] == '/')) ||
+                 pathToken.StartsWith(@"\\", StringComparison.Ordinal) ||
+                 pathToken.StartsWith("//", StringComparison.Ordinal)))
                 return $"Absolute path allow rule is not permitted: {pattern}";
+
+            if (ExecCommandToken.IsIndirectCommandHost(executableToken))
+                return $"Allow rules cannot target shell interpreters or command hosts: {pattern}";
 
             foreach (var dangerous in DangerousAllowPatternFragments)
             {
@@ -741,6 +1132,14 @@ public class SystemCapability : NodeCapabilityBase
                     return $"Dangerous allow rule is not permitted: {pattern}";
                 }
             }
+
+            // Finally: the executable (first whitespace-delimited token) must be a concrete literal. A
+            // wildcard there lets a NON-dangerous pattern match ANY command (MatchesPattern globs
+            // * -> .* over the whole command line), e.g. "*.*", "*e*", "*.exe", "c*" — the broad-allow
+            // class the earlier shape checks miss. Runs after the dangerous-fragment check so a
+            // dangerous stem keeps its specific message. Legit rules pin the command ("git *").
+            if (executableToken.Contains('*') || executableToken.Contains('?'))
+                return $"Allow rule must name a concrete command (no wildcard in the executable): {pattern}";
         }
 
         return null;

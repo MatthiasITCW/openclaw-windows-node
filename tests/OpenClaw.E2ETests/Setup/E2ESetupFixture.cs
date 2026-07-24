@@ -22,6 +22,8 @@ namespace OpenClaw.E2ETests.Setup;
 /// </summary>
 public sealed class E2ESetupFixture : IAsyncLifetime
 {
+    private readonly Action<Dictionary<string, object>>? _settingsPatch;
+
     /// <summary>
     /// Persistent artifact directory that survives test cleanup.
     /// CI uploads this as a test artifact for post-mortem debugging.
@@ -51,7 +53,14 @@ public sealed class E2ESetupFixture : IAsyncLifetime
     private Process? _trayProcess;
 
     public E2ESetupFixture()
+        : this(settingsPatch: null)
     {
+    }
+
+    internal E2ESetupFixture(Action<Dictionary<string, object>>? settingsPatch)
+    {
+        _settingsPatch = settingsPatch;
+
         if (!E2ETestGate.IsEnabled)
         {
             _distroName = "OpenClawE2E-disabled";
@@ -257,7 +266,7 @@ public sealed class E2ESetupFixture : IAsyncLifetime
         File.WriteAllText(_configPath, json);
     }
 
-    private static void PatchSettingsForMcp(string settingsPath)
+    private void PatchSettingsForMcp(string settingsPath)
     {
         var json = File.ReadAllText(settingsPath);
         var settings = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json) ?? [];
@@ -269,6 +278,7 @@ public sealed class E2ESetupFixture : IAsyncLifetime
         merged["HasSeenActivityStreamTip"] = true;
         merged["ShowNotifications"] = false;
         merged["GlobalHotkeyEnabled"] = false;
+        _settingsPatch?.Invoke(merged);
         File.WriteAllText(settingsPath, JsonSerializer.Serialize(merged, new JsonSerializerOptions { WriteIndented = true }));
     }
 
@@ -342,9 +352,9 @@ public sealed class E2ESetupFixture : IAsyncLifetime
     /// both roles' FSMs to reach Connected, but the node service reports its
     /// own connected state directly — use that as the reliable signal.
     /// </summary>
-    private async Task WaitForConnectionReady()
+    public async Task WaitForConnectionReady(TimeSpan? timeout = null)
     {
-        var deadline = DateTime.UtcNow.AddSeconds(90);
+        var deadline = DateTime.UtcNow.Add(timeout ?? TimeSpan.FromSeconds(90));
         string lastStatus = "unknown";
         bool lastNodeConnected = false;
         bool lastNodePaired = false;
@@ -384,13 +394,13 @@ public sealed class E2ESetupFixture : IAsyncLifetime
 
         CopyDataDirLogs();
         throw new TimeoutException(
-            $"Tray never reached connected state within 90s. Last: status={lastStatus}, " +
+            $"Tray never reached connected state within {timeout?.TotalSeconds ?? 90}s. Last: status={lastStatus}, " +
             $"nodeConnected={lastNodeConnected}, nodePaired={lastNodePaired}. Logs: {ArtifactDir}");
     }
 
-    private async Task WaitForNodeListReady()
+    public async Task WaitForNodeListReady(TimeSpan? timeout = null)
     {
-        var deadline = DateTime.UtcNow.AddSeconds(60);
+        var deadline = DateTime.UtcNow.Add(timeout ?? TimeSpan.FromSeconds(60));
         string lastResponse = "unknown";
 
         while (DateTime.UtcNow < deadline)
@@ -432,7 +442,7 @@ public sealed class E2ESetupFixture : IAsyncLifetime
 
         CopyDataDirLogs();
         throw new TimeoutException(
-            $"app.nodes never returned an online node with capabilities within 60s. " +
+            $"app.nodes never returned an online node with capabilities within {timeout?.TotalSeconds ?? 60}s. " +
             $"Last response: {lastResponse}. Logs: {ArtifactDir}");
     }
 
@@ -468,7 +478,8 @@ public sealed class E2ESetupFixture : IAsyncLifetime
     public async Task<OpenClaw.SetupEngine.CommandResult> RunInWslAsync(
         string command,
         TimeSpan? timeout = null,
-        IReadOnlyDictionary<string, string>? environment = null)
+        IReadOnlyDictionary<string, string>? environment = null,
+        bool inputViaStdin = false)
     {
         command = command.Replace("\r", "");
         Log($"WSL command: {SanitizeForLog(command)}");
@@ -479,6 +490,7 @@ public sealed class E2ESetupFixture : IAsyncLifetime
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            RedirectStandardInput = inputViaStdin,
             CreateNoWindow = true,
         };
 
@@ -486,8 +498,9 @@ public sealed class E2ESetupFixture : IAsyncLifetime
         psi.ArgumentList.Add(_distroName);
         psi.ArgumentList.Add("--");
         psi.ArgumentList.Add("bash");
-        psi.ArgumentList.Add("-c");
-        psi.ArgumentList.Add(command);
+        psi.ArgumentList.Add(inputViaStdin ? "-s" : "-c");
+        if (!inputViaStdin)
+            psi.ArgumentList.Add(command);
 
         if (environment is { Count: > 0 })
         {
@@ -504,6 +517,13 @@ public sealed class E2ESetupFixture : IAsyncLifetime
         var sw = Stopwatch.StartNew();
         using var process = Process.Start(psi)
             ?? throw new InvalidOperationException("Failed to start wsl.exe");
+
+        if (inputViaStdin)
+        {
+            await process.StandardInput.WriteAsync(command);
+            await process.StandardInput.WriteAsync("\n");
+            process.StandardInput.Close();
+        }
 
         var stdoutTask = process.StandardOutput.ReadToEndAsync();
         var stderrTask = process.StandardError.ReadToEndAsync();
@@ -570,6 +590,91 @@ public sealed class E2ESetupFixture : IAsyncLifetime
             throw new InvalidDataException("Active gateway record is missing Url or Id");
 
         return (url, sharedToken, id);
+    }
+
+    public (bool HasOperatorToken, bool HasNodeToken, bool HasBootstrapToken, string IdentityDir) ReadActiveGatewayCredentialState()
+    {
+        var gateway = ReadActiveGatewayRecord();
+        var identityDir = Path.Combine(DataDir, "gateways", gateway.ActiveId);
+        var identityPath = Path.Combine(identityDir, "device-key-ed25519.json");
+        if (!File.Exists(identityPath))
+            throw new FileNotFoundException("Active gateway identity file not found", identityPath);
+
+        using var identityDoc = JsonDocument.Parse(File.ReadAllText(identityPath));
+        var root = identityDoc.RootElement;
+        var hasOperatorToken =
+            TryGetPropertyIgnoreCase(root, "DeviceToken", out var operatorToken) &&
+            operatorToken.ValueKind == JsonValueKind.String &&
+            !string.IsNullOrWhiteSpace(operatorToken.GetString());
+        var hasNodeToken =
+            TryGetPropertyIgnoreCase(root, "NodeDeviceToken", out var nodeToken) &&
+            nodeToken.ValueKind == JsonValueKind.String &&
+            !string.IsNullOrWhiteSpace(nodeToken.GetString());
+
+        var gatewaysPath = Path.Combine(DataDir, "gateways.json");
+        using var gatewaysDoc = JsonDocument.Parse(File.ReadAllText(gatewaysPath));
+        var hasBootstrapToken = false;
+        if (TryGetPropertyIgnoreCase(gatewaysDoc.RootElement, "Gateways", out var gatewaysElement) &&
+            gatewaysElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var record in gatewaysElement.EnumerateArray())
+            {
+                if (TryGetPropertyIgnoreCase(record, "Id", out var idElement) &&
+                    string.Equals(idElement.GetString(), gateway.ActiveId, StringComparison.Ordinal))
+                {
+                    hasBootstrapToken =
+                        TryGetPropertyIgnoreCase(record, "BootstrapToken", out var bootstrapToken) &&
+                        bootstrapToken.ValueKind == JsonValueKind.String &&
+                        !string.IsNullOrWhiteSpace(bootstrapToken.GetString());
+                    break;
+                }
+            }
+        }
+
+        Log($"Credential state: operatorToken={hasOperatorToken}, nodeToken={hasNodeToken}, bootstrapToken={hasBootstrapToken}, identityDir={identityDir}");
+        return (hasOperatorToken, hasNodeToken, hasBootstrapToken, identityDir);
+    }
+
+    public string ReadActiveGatewayDeviceId()
+    {
+        var credentials = ReadActiveGatewayCredentialState();
+        var identityPath = Path.Combine(credentials.IdentityDir, "device-key-ed25519.json");
+        using var identityDoc = JsonDocument.Parse(File.ReadAllText(identityPath));
+        if (TryGetPropertyIgnoreCase(identityDoc.RootElement, "DeviceId", out var deviceId) &&
+            deviceId.ValueKind == JsonValueKind.String &&
+            !string.IsNullOrWhiteSpace(deviceId.GetString()))
+        {
+            return deviceId.GetString()!;
+        }
+
+        throw new InvalidDataException($"Active gateway identity file is missing DeviceId: {identityPath}");
+    }
+
+    public async Task<(bool HasOperatorToken, bool HasNodeToken, bool HasBootstrapToken, string IdentityDir)> WaitForDurablePairedCredentialsAsync(TimeSpan? timeout = null)
+    {
+        var deadline = DateTime.UtcNow.Add(timeout ?? TimeSpan.FromSeconds(45));
+        (bool HasOperatorToken, bool HasNodeToken, bool HasBootstrapToken, string IdentityDir)? last = null;
+        Exception? lastError = null;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                last = ReadActiveGatewayCredentialState();
+                if (last.Value.HasOperatorToken && last.Value.HasNodeToken && !last.Value.HasBootstrapToken)
+                    return last.Value;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+            }
+
+            // slopwatch-ignore: SW004 Integration fixture polling delay is intentional and bounded while waiting for external process state.
+            await Task.Delay(500);
+        }
+
+        throw new TimeoutException(
+            $"Timed out waiting for durable paired credentials. Last={last?.ToString() ?? "<none>"}; error={lastError?.Message}");
     }
 
     public async Task<string> WaitForTrayKeepAliveStartedAsync(TimeSpan? timeout = null)

@@ -8,10 +8,10 @@ using OpenClaw.Shared;
 namespace OpenClaw.Shared.ExecApprovals;
 
 // Full coordinator pipeline: validate → normalize → buildContext → evaluate(pass1) →
-// prompt/fallback → [persistAllowlistEntry stub] → evaluate(pass2) → final decision.
-// Rail 10: no WinUI types. Rail 17: SemaphoreSlim serializes the prompt+pass2 block.
-// Rail 19: not wired in production src in PR7 — verified by test 15.
-// Must be registered as singleton when wired (PR8+): the SemaphoreSlim is per-instance.
+// prompt/fallback → evaluate(pass2) → side effects → final decision.
+// UI-free: no WinUI types. A SemaphoreSlim serializes the prompt+pass2 block.
+// Wired in production by NodeService behind an explicit opt-in setting, default off.
+// Must be registered as singleton when wired: the SemaphoreSlim is per-instance.
 public sealed class ExecApprovalsCoordinator : IExecApprovalV2Handler
 {
     private readonly ExecApprovalsStore _store;
@@ -19,7 +19,7 @@ public sealed class ExecApprovalsCoordinator : IExecApprovalV2Handler
     private readonly IExecApprovalV2PromptHandler _prompt;
     private readonly IOpenClawLogger _logger;
 
-    // Serializes the prompt call + second-pass block (rail 17).
+    // Serializes the prompt call + second-pass block.
     // Does NOT protect validate/normalize/buildContext — those are stateless.
     private readonly SemaphoreSlim _promptLock = new(1, 1);
 
@@ -75,7 +75,9 @@ public sealed class ExecApprovalsCoordinator : IExecApprovalV2Handler
         }
 
         var sanitizedEnv = envResult.Allowed as IReadOnlyDictionary<string, string>;
-        IReadOnlyList<ExecAllowlistEntry> matches = resolved.Defaults.Security == ExecSecurity.Allowlist
+        var needsAllowlistMatches = resolved.Defaults.Security == ExecSecurity.Allowlist
+            || resolved.Defaults.AskFallback == ExecSecurity.Allowlist;
+        IReadOnlyList<ExecAllowlistEntry> matches = needsAllowlistMatches
             ? ExecAllowlistMatcher.MatchAll(resolved.Allowlist, identity.AllowlistResolutions)
             : [];
 
@@ -90,24 +92,47 @@ public sealed class ExecApprovalsCoordinator : IExecApprovalV2Handler
             identity.AllowAlwaysPatterns,
             matches);
 
-        // Step 4: first pass (approvalDecision always null in PR7 — CVE #8682, ADR-0002 Phase 2)
+        // Step 4: first pass (approvalDecision always null — pass2 decides based on user response)
         var pass1 = ExecApprovalEvaluator.Evaluate(context, null);
         if (pass1 is ExecHostPolicyDecision.DenyOutcome denyPass1)
             return LogAndReturn(denyPass1.Error, correlationId,
                 promptAttempted: false, fallbackUsed: false, canonical: context.DisplayCommand);
         if (pass1 is ExecHostPolicyDecision.AllowOutcome)
         {
-            // Pre-approved path (security=Full, ask=Off or allowlist satisfied): skip prompt
+            // A stored executable-level rule must not authorize a command host whose
+            // argument tail selects a different command or script. Preserve the store
+            // verbatim, but refuse to consume that rule for this invocation.
+            if (context.Security == ExecSecurity.Allowlist
+                && context.AllowlistSatisfied
+                && IsIndirectCommandHost(identity))
+                return LogAndReturn(
+                    ExecApprovalV2Result.ValidationFailed(
+                        "persistent-approval-not-permitted-for-command-host"),
+                    correlationId, promptAttempted: false, fallbackUsed: false,
+                    canonical: context.DisplayCommand);
+
+            // Pre-approved path (security=Full, ask=Off or allowlist satisfied): skip prompt.
+            // Fail closed if the approved executable cannot be pinned to a resolved path.
+            var preApprovedExecution = BuildApprovedExecution(identity, sanitizedEnv);
+            if (preApprovedExecution is null)
+                return LogAndReturn(ExecApprovalV2Result.InternalError("unresolved-executable-on-allow"),
+                    correlationId, promptAttempted: false, fallbackUsed: false, canonical: context.DisplayCommand);
+
+            // Side effects are best-effort: a metadata write failure must not flip an allow to a deny.
+            try { await RecordAllowlistUsageAsync(context).ConfigureAwait(false); }
+            catch (Exception ex) { _logger.Warn($"[EXEC-APPROVALS] [{correlationId}] side-effect: record-usage failed (non-fatal): {ex.Message}"); }
             _logger.Info($"[EXEC-APPROVALS] [{correlationId}] path=new " +
                 $"canonical=\"{SanitizeForLog(context.DisplayCommand)}\" decision=allow " +
                 $"reason=approved fallbackUsed=false promptAttempted=false");
-            return ExecApprovalV2Result.Allow();
+            return ExecApprovalV2Result.Allow(preApprovedExecution);
         }
         // RequiresPromptOutcome → continue to prompt/fallback block
 
-        // Steps 5-7: prompt/fallback + second pass (critical section)
+        // Steps 5-8: prompt/fallback + second pass (critical section) + side effect flag
         bool promptAttempted = false;
         bool fallbackUsed = false;
+        bool fallbackAllowWasMatchDependent = false;
+        bool persistAllowlistEntry = false;
 
         await _promptLock.WaitAsync().ConfigureAwait(false);
         try
@@ -157,10 +182,11 @@ public sealed class ExecApprovalsCoordinator : IExecApprovalV2Handler
             else
             {
                 fallbackUsed = true;
-                followupDecision = FallbackDecision(context, resolved.Defaults.AskFallback);
+                followupDecision = FallbackDecision(
+                    context,
+                    resolved.Defaults.AskFallback,
+                    out fallbackAllowWasMatchDependent);
             }
-
-            // Step 6: AddAllowlistEntry stub (PR9 implements for AllowAlways + security==Allowlist)
 
             // Step 7: second pass — must never return RequiresPrompt
             var pass2 = ExecApprovalEvaluator.Evaluate(context, followupDecision);
@@ -174,28 +200,53 @@ public sealed class ExecApprovalsCoordinator : IExecApprovalV2Handler
                 return LogAndReturn(ExecApprovalV2Result.InternalError("second-pass-requires-prompt"),
                     correlationId, promptAttempted, fallbackUsed, canonical: context.DisplayCommand);
             }
-            // AllowOutcome → fall through to steps 8-10
+            // pass2 is AllowOutcome — record whether AllowAlways was the prompt decision.
+            persistAllowlistEntry = followupDecision == ExecApprovalDecision.AllowAlways;
         }
         finally
         {
             _promptLock.Release();
         }
 
-        // Step 8: RecordAllowlistUse stub (PR9)
+        // Step 8: build payload before any store writes — a fail-closed payload result
+        // must not leave persistent allowlist state behind.
+        var execution = BuildApprovedExecution(identity, sanitizedEnv);
+        if (execution is null)
+            return LogAndReturn(ExecApprovalV2Result.InternalError("unresolved-executable-on-allow"),
+                correlationId, promptAttempted, fallbackUsed, canonical: context.DisplayCommand);
 
-        // Step 9: final allow log
+        var durableCommandHostAuthorization =
+            persistAllowlistEntry || fallbackAllowWasMatchDependent;
+        if (durableCommandHostAuthorization && IsIndirectCommandHost(identity))
+            return LogAndReturn(
+                ExecApprovalV2Result.ValidationFailed(
+                    "persistent-approval-not-permitted-for-command-host"),
+                correlationId, promptAttempted, fallbackUsed,
+                canonical: context.DisplayCommand);
+
+        // Step 9: side effects — only reached when the payload is valid.
+        // Each side effect is independently best-effort so a failure in one does not skip the other.
+        if (persistAllowlistEntry && context.Security == ExecSecurity.Allowlist)
+        {
+            try { await PersistAllowlistEntriesAsync(context).ConfigureAwait(false); }
+            catch (Exception ex) { _logger.Warn($"[EXEC-APPROVALS] [{correlationId}] side-effect: persist-entry failed (non-fatal): {ex.Message}"); }
+        }
+        try { await RecordAllowlistUsageAsync(context).ConfigureAwait(false); }
+        catch (Exception ex) { _logger.Warn($"[EXEC-APPROVALS] [{correlationId}] side-effect: record-usage failed (non-fatal): {ex.Message}"); }
+
+        // Step 10: final allow log
         _logger.Info($"[EXEC-APPROVALS] [{correlationId}] path=new " +
             $"canonical=\"{SanitizeForLog(context.DisplayCommand)}\" decision=allow " +
             $"reason=approved fallbackUsed={fallbackUsed} promptAttempted={promptAttempted}");
 
         // Step 10: return Allow
-        return ExecApprovalV2Result.Allow();
+        return ExecApprovalV2Result.Allow(execution);
         }
         catch (Exception ex)
         {
             // Outer safety net: any unhandled exception in buildContext, CanPresent, FallbackDecision,
             // or an out-of-range prompt outcome produces a typed deny instead of escaping HandleAsync.
-            // Rail 1: failures in the new path must never be silent or untyped.
+            // Failures must never be silent or untyped.
             var msg = $"[EXEC-APPROVALS] [{correlationId}] path=new " +
                 $"canonical=\"\" decision=deny reason=unexpected-exception " +
                 $"fallbackUsed=false promptAttempted=false";
@@ -204,20 +255,109 @@ public sealed class ExecApprovalsCoordinator : IExecApprovalV2Handler
         }
     }
 
+    // Builds the approved execution payload from the RESOLVED executable path, never
+    // the raw argv[0]. The command must execute with the same canonical identity it
+    // was evaluated under: a relative argv[0] in the payload would let Windows
+    // re-resolve it against PATH/cwd at execution time (a hijack), and the
+    // direct-argv runner rejects non-absolute executables anyway. Returns null when
+    // the executable could not be resolved to a path — the caller fails closed
+    // rather than execute a command whose identity we cannot pin.
+    internal static ExecApprovedExecution? BuildApprovedExecution(
+        CanonicalCommandIdentity identity,
+        IReadOnlyDictionary<string, string>? sanitizedEnv)
+    {
+        var resolvedPath = identity.Resolution?.ResolvedPath;
+        if (string.IsNullOrEmpty(resolvedPath))
+            return null;
+
+        // A batch script (.bat/.cmd) cannot run without cmd.exe, which re-parses the
+        // arguments and breaks the verbatim-argv guarantee. The direct-argv runner
+        // rejects these too; reject here as well so the fail-closed result is reached
+        // before any approval state is written, not after.
+        if (resolvedPath.EndsWith(".bat", StringComparison.OrdinalIgnoreCase)
+            || resolvedPath.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        // If any env wrapper in the chain carries modifiers (VAR=val assignments or
+        // flags), the direct-argv payload cannot faithfully carry those semantics: the
+        // modifier would be silently dropped, and the process would run in a different
+        // environment than the one that was approved. This walks the full unwrap chain
+        // so a nested form such as `env env FOO=bar node` is caught, not just the outer
+        // wrapper. Fail closed rather than execute a command that differs from what was
+        // evaluated.
+        if (ExecEnvInvocationUnwrapper.AnyWrapperHasModifiers(identity.Command))
+            return null;
+
+        // Transparent env wrappers (no modifiers) are safe to unwrap: the inner
+        // command is the real executable and the args are preserved verbatim.
+        var effective = ExecEnvInvocationUnwrapper.UnwrapForResolution(identity.Command);
+        var argv = new string[effective.Count];
+        argv[0] = resolvedPath;
+        for (var i = 1; i < effective.Count; i++)
+            argv[i] = effective[i];
+
+        return new ExecApprovedExecution(argv, identity.Cwd, identity.TimeoutMs, sanitizedEnv);
+    }
+
+    private static bool IsIndirectCommandHost(CanonicalCommandIdentity identity)
+    {
+        var resolvedPath = identity.Resolution?.ResolvedPath;
+        return !string.IsNullOrWhiteSpace(resolvedPath)
+            && ExecCommandToken.IsIndirectCommandHost(resolvedPath);
+    }
+
+    // Persists allowAlways patterns after an AllowAlways prompt decision (non-empty only).
+    // Caller guarantees Security == Allowlist (guard is in HandleAsync step 8).
+    private async Task PersistAllowlistEntriesAsync(ExecApprovalEvaluation context)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pattern in context.AllowAlwaysPatterns)
+        {
+            if (string.IsNullOrWhiteSpace(pattern) || !seen.Add(pattern)) continue;
+            await _store.AddAllowlistEntryAsync(context.AgentId, pattern).ConfigureAwait(false);
+        }
+    }
+
+    // Updates lastUsed* metadata for every matched allowlist entry after a final allow.
+    // Guard mirrors macOS recordAllowlistMatches: no-op unless security=allowlist and satisfied.
+    private async Task RecordAllowlistUsageAsync(ExecApprovalEvaluation context)
+    {
+        if (context.Security != ExecSecurity.Allowlist || !context.AllowlistSatisfied) return;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < context.AllowlistMatches.Count; i++)
+        {
+            var pattern = context.AllowlistMatches[i].Pattern;
+            if (string.IsNullOrEmpty(pattern) || !seen.Add(pattern)) continue;
+            var resolvedPath = i < context.AllowlistResolutions.Count
+                ? context.AllowlistResolutions[i].ResolvedPath
+                : null;
+            await _store.RecordAllowlistUseAsync(
+                context.AgentId, pattern, resolvedPath)
+                .ConfigureAwait(false);
+        }
+    }
+
     // Fail-safe defaults when no UI is available (Saltzer/Schroeder fail-safe defaults, OWASP ASVS 4.1.4).
     // ask=Always → Deny: human approval is a precondition; without UI the only safe outcome is deny.
     private static ExecApprovalDecision FallbackDecision(
         ExecApprovalEvaluation context,
-        ExecAsk askFallback)
+        ExecSecurity askFallback,
+        out bool allowWasMatchDependent)
     {
-        return askFallback switch
+        allowWasMatchDependent = false;
+        var effectiveFallback = (ExecSecurity)Math.Min((int)context.Security, (int)askFallback);
+        if (effectiveFallback == ExecSecurity.Allowlist
+            && context.AllAllowlistResolutionsMatched)
         {
-            ExecAsk.Off => ExecApprovalDecision.AllowOnce,
-            ExecAsk.OnMiss => context.AllowlistSatisfied
-                ? ExecApprovalDecision.AllowOnce
-                : ExecApprovalDecision.Deny,
-            ExecAsk.Always => ExecApprovalDecision.Deny,
-            ExecAsk.Deny => ExecApprovalDecision.Deny,
+            allowWasMatchDependent = true;
+            return ExecApprovalDecision.AllowOnce;
+        }
+
+        return effectiveFallback switch
+        {
+            ExecSecurity.Full => ExecApprovalDecision.AllowOnce,
+            ExecSecurity.Allowlist => ExecApprovalDecision.Deny,
+            ExecSecurity.Deny => ExecApprovalDecision.Deny,
             _ => ExecApprovalDecision.Deny,  // defensive
         };
     }
@@ -228,7 +368,7 @@ public sealed class ExecApprovalsCoordinator : IExecApprovalV2Handler
         string correlationId)
         => new()
         {
-            DisplayCommand = context.DisplayCommand,  // NOT sanitized — presenter's responsibility (rail 11)
+            DisplayCommand = context.DisplayCommand,  // NOT sanitized — presenter's responsibility
             Cwd = identity.Cwd,
             Security = context.Security,
             Ask = context.Ask,
@@ -236,7 +376,7 @@ public sealed class ExecApprovalsCoordinator : IExecApprovalV2Handler
             ResolvedPath = context.Resolution?.ResolvedPath,
             SessionKey = identity.SessionKey,
             CorrelationId = correlationId,
-            // Host omitted in PR7 (no gateway wiring yet)
+            // Host omitted (no gateway wiring yet)
         };
 
     // Anti log-injection: replaces control characters in DisplayCommand before writing to logs.

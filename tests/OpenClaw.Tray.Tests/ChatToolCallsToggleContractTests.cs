@@ -5,65 +5,59 @@ namespace OpenClaw.Tray.Tests;
 public sealed class ChatToolCallsToggleContractTests
 {
     [Fact]
-    public void ProductionTimeline_HonorsComposerToolCallVisibilityToggle()
+    public void ProductionTimeline_HonorsSettingsToolCallVisibilityToggle()
     {
-        var source = File.ReadAllText(Path.Combine(
-            GetRepositoryRoot(),
-            "src",
-            "OpenClaw.Tray.WinUI",
-            "Chat",
-            "OpenClawChatTimeline.cs"));
+        var root = Read("src", "OpenClaw.Tray.WinUI", "Chat", "OpenClawChatRoot.cs");
+        var composer = Read("src", "OpenClaw.Tray.WinUI", "Chat", "OpenClawComposer.cs");
+        var timeline = Read("src", "OpenClaw.Tray.WinUI", "Chat", "OpenClawChatTimeline.cs");
+        var settings = Read("src", "OpenClaw.Tray.WinUI", "Pages", "SettingsPage.xaml.cs");
+        var app = Read("src", "OpenClaw.Tray.WinUI", "App.xaml.cs");
 
-        Assert.Matches(
-            new Regex(@"var\s+showToolCalls\s*=\s*ChatVisualResolver\.ShowToolCalls\(\)\s*;"),
-            source);
-        Assert.DoesNotContain(
-            "var showToolCalls    = !Props.EnableExplorationControls || ChatVisualResolver.ShowToolCalls();",
-            source);
-        Assert.Matches(
-            new Regex(@"var\s+collapseToolChipsVersion\s*=\s*ChatExplorationState\.CollapseToolChipsVersion\s*;"),
-            source);
+        // Root still owns the shared tool-call visibility state and feeds it to
+        // the timeline (independent of the composer).
+        Assert.Contains("ShowToolCalls: showToolCalls.Value", root);
+        Assert.Contains("ToolCallsCollapseVersion: toolCallsCollapseVersion.Value", root);
+        Assert.Contains("UseState(s_showToolCalls", root);
+        Assert.Contains("UseState(s_toolCallsCollapseVersion", root);
+        Assert.Contains("ToolCallsVisibilityChanged", root);
+
+        // The single writer now lives on the root as a public static, invoked by
+        // Settings and by startup seeding — no longer a composer callback.
+        Assert.Contains("public static void SetToolCallsVisible(bool", root);
+        Assert.Contains("s_showToolCalls = visible", root);
+        Assert.DoesNotContain("OnShowToolCallsChanged", root);
+
+        // The composer no longer hosts the tool-call toggle at all.
+        Assert.DoesNotContain("ShowToolCalls", composer);
+        Assert.DoesNotContain("OnShowToolCallsChanged", composer);
+
+        // Settings drives it: persists the setting and pushes it into the live
+        // timeline via the static writer.
+        Assert.Contains("OpenClawTray.Chat.OpenClawChatRoot.SetToolCallsVisible", settings);
+        Assert.Contains("ShowChatToolCalls", settings);
+
+        // Startup seeds visibility from the persisted setting.
+        Assert.Contains("SetToolCallsVisible(_settings.ShowChatToolCalls)", app);
+
+        // Timeline still consumes the props from the root.
+        Assert.Matches(new Regex(@"var\s+showToolCalls\s*=\s*Props\.ShowToolCalls\s*;"), timeline);
+        Assert.Matches(new Regex(@"var\s+collapseToolChipsVersion\s*=\s*Props\.ToolCallsCollapseVersion\s*;"), timeline);
     }
 
     [Fact]
-    public void TaskListToolBurst_LabelsHeaderAndExpandedBodyForScreenReaders()
+    public void ChatExplorationDesignSurface_IsRemoved()
     {
-        var source = File.ReadAllText(Path.Combine(
-            GetRepositoryRoot(),
-            "src",
-            "OpenClaw.Tray.WinUI",
-            "Chat",
-            "OpenClawChatTimeline.cs"));
+        var root = TestRepositoryPaths.GetRepositoryRoot();
+        var chatRoot = Read("src", "OpenClaw.Tray.WinUI", "Chat", "OpenClawChatRoot.cs");
+        var timeline = Read("src", "OpenClaw.Tray.WinUI", "Chat", "OpenClawChatTimeline.cs");
 
-        Assert.Matches(
-            new Regex(@"var\s+taskListHeaderAutomationName\s*=\s*\$""\{summaryLine\},\s*\{stepCountLabel\},\s*\{taskStatusText\},\s*\{"),
-            source);
-        Assert.Matches(
-            new Regex(@"var\s+headerButton\s*=\s*Button\(headerContent,\s*toggleTaskList\)\s*\.AutomationName\(taskListHeaderAutomationName\)", RegexOptions.Singleline),
-            source);
-        Assert.Matches(
-            new Regex(@"\.AutomationName\(\$""Tool steps for:\s*\{summaryLine\}\.\s*\{string\.Join\("";\s*"",\s*stepAutomationSummaries\)\}""\)", RegexOptions.Singleline),
-            source);
+        Assert.False(Directory.Exists(Path.Combine(root, "src", "OpenClaw.Tray.WinUI", "Chat", "Explorations")));
+        Assert.False(File.Exists(Path.Combine(root, "src", "OpenClaw.Tray.WinUI", "Windows", "ChatExplorationsWindow.cs")));
+        Assert.DoesNotContain("ChatExploration", chatRoot);
+        Assert.DoesNotContain("ChatExploration", timeline);
+        Assert.DoesNotContain("ToolBurstStyle", timeline);
     }
 
-    private static string GetRepositoryRoot()
-    {
-        var env = Environment.GetEnvironmentVariable("OPENCLAW_REPO_ROOT");
-        if (!string.IsNullOrWhiteSpace(env) && Directory.Exists(env))
-            return env;
-
-        var directory = new DirectoryInfo(AppContext.BaseDirectory);
-        while (directory != null)
-        {
-            if (File.Exists(Path.Combine(directory.FullName, "openclaw-windows-node.slnx")) &&
-                Directory.Exists(Path.Combine(directory.FullName, "src")))
-            {
-                return directory.FullName;
-            }
-
-            directory = directory.Parent;
-        }
-
-        throw new InvalidOperationException("Could not find repository root.");
-    }
+    private static string Read(params string[] parts)
+        => File.ReadAllText(Path.Combine(new[] { TestRepositoryPaths.GetRepositoryRoot() }.Concat(parts).ToArray()));
 }

@@ -21,26 +21,53 @@ This monorepo contains the Windows hub, shared client libraries, and CLI utiliti
 | Project | Description |
 |---------|-------------|
 | **OpenClaw.Tray.WinUI** | System tray application (WinUI 3) for quick access to OpenClaw |
-| **OpenClaw.Shared** | Shared gateway client library |
+| **OpenClaw.Connection** | Gateway registry, credential resolution, and connection manager |
+| **OpenClaw.Shared** | Shared gateway client library, capabilities, and MCP bridge |
+| **OpenClaw.Chat** | Native chat model and timeline reducer |
 | **OpenClaw.Cli** | CLI validator for WebSocket connect/send/probe using tray settings |
+| **OpenClaw.WinNode.Cli** | `winnode` CLI for invoking local Windows node/MCP capabilities |
+| **OpenClaw.SetupEngine** | Local gateway setup, WSL installation, and setup-code support |
+| **OpenClaw.SetupEngine.UI** | WinUI setup wizard pages hosted by the tray app |
+| **OpenClawTray.FunctionalUI** | In-repo declarative WinUI helper used by native chat and newer UI surfaces |
 
 ## 🚀 Quick Start
 
 > **End-user installer?** Download the latest stable x64 or ARM64 installer from the [OpenClaw Windows docs](https://docs.openclaw.ai/platforms/windows), or see [docs/SETUP.md](docs/SETUP.md) for step-by-step installation (no build required).
 >
 > **Managed WSL gateway?** Local setup creates a locked-down app-owned `OpenClawGateway` distro. See [docs/WSL_GATEWAY_ADMIN.md](docs/WSL_GATEWAY_ADMIN.md) for editing `openclaw.json` as the `openclaw` user and using root for protected-file administration.
+>
+> **Operator or node?** Start with [Operator and node concepts](docs/OPERATOR_NODE_CONCEPTS.md) for the beginner-facing glossary of gateway, operator, node, pairing, reapproval, and allowlisted node capabilities.
 
-Direct downloads from the latest OpenClaw release:
+Direct downloads from the latest OpenClaw Windows release:
 
-- [OpenClawCompanion-Setup-x64.exe](https://github.com/openclaw/openclaw/releases/latest/download/OpenClawCompanion-Setup-x64.exe)
-- [OpenClawCompanion-Setup-arm64.exe](https://github.com/openclaw/openclaw/releases/latest/download/OpenClawCompanion-Setup-arm64.exe)
-- [OpenClawCompanion-SHA256SUMS.txt](https://github.com/openclaw/openclaw/releases/latest/download/OpenClawCompanion-SHA256SUMS.txt)
+- [OpenClawCompanion-Setup-x64.exe](https://github.com/openclaw/openclaw-windows-node/releases/latest/download/OpenClawCompanion-Setup-x64.exe)
+- [OpenClawCompanion-Setup-arm64.exe](https://github.com/openclaw/openclaw-windows-node/releases/latest/download/OpenClawCompanion-Setup-arm64.exe)
+- [OpenClawCompanion-SHA256SUMS.txt](https://github.com/openclaw/openclaw-windows-node/releases/latest/download/OpenClawCompanion-SHA256SUMS.txt)
 
 ### Prerequisites
 - Windows 10 (20H2+) or Windows 11
 - .NET 10.0 SDK - https://dotnet.microsoft.com/download/dotnet/10.0
+- Node.js LTS with npm (for WinUI build assets)
 - Windows 10 SDK (for WinUI build) - install via Visual Studio or standalone
 - WebView2 Runtime - pre-installed on modern Windows, or get from https://developer.microsoft.com/microsoft-edge/webview2
+
+### Developer / Agent Setup
+
+Use the setup script to install or verify local Windows build prerequisites:
+
+```powershell
+# Install missing prerequisites with winget, trust the checkout, and verify setup
+.\scripts\setup-dev.ps1
+
+# Check only; do not install packages or change git safe.directory
+.\scripts\setup-dev.ps1 -CheckOnly
+
+# Install/verify prerequisites without adding the checkout to git safe.directory
+.\scripts\setup-dev.ps1 -NoTrustRepository
+
+# Setup and run the required build/test validation
+.\scripts\setup-dev.ps1 -RunValidation
+```
 
 ### Build
 
@@ -84,6 +111,9 @@ dotnet build src/OpenClaw.Tray.WinUI -r win-x64 -p:PackageMsix=true    # x64 MSI
 # Run isolated from your normal tray settings so multiple worktrees can run together
 .\run-app-local.ps1 -Isolated
 
+# Opt into side-by-side dev identity (separate mutex, protocol, gateway distro, and port)
+.\run-app-local.ps1 -Dev -Isolated
+
 # Alpha update testing from a Release build
 .\run-app-local.ps1 -Configuration Release -Isolated -UpdateChannel alpha
 
@@ -118,7 +148,7 @@ dotnet run --project src/OpenClaw.Cli -- --url ws://127.0.0.1:18789 --token "<to
 Modern Windows 11-style system tray companion that connects to your local OpenClaw gateway.
 
 ### Features
-- 🦞 **Lobster branding** - Pixel-art lobster tray icon with status colors
+- 🎨 **OpenClaw branding** - OpenClaw tray icon with status colors
 - 🎨 **Modern UI** - Windows 11 flyout menu with dark/light mode support
 - 💬 **Quick Send** - Send messages via global hotkey (Ctrl+Alt+Shift+C)
 - 🔄 **Auto-updates** - Automatic updates from GitHub Releases
@@ -132,7 +162,7 @@ Modern Windows 11-style system tray companion that connects to your local OpenCl
 - ⏱ **Cron Jobs** - Quick access to scheduled tasks
 - 🚀 **Auto-start** - Launch with Windows
 - ⚙️ **Settings** - Full configuration page
-- 🎯 **First-run onboarding** — 6-screen setup wizard (connection, permissions, chat, configuration)
+- 🎯 **First-run onboarding** — native WSL gateway setup with capability, permission, install, onboard, and completion screens
 
 #### Quick Send scope requirement
 
@@ -191,9 +221,11 @@ These features are available in Windows but not in the Mac app:
 | Channel control | Start/stop Telegram & WhatsApp |
 | Modern flyout menu | Windows 11-style with dark/light mode |
 | Deep links | `openclaw://` URL scheme with IPC |
-| First-run onboarding | 6-screen guided setup wizard (Welcome → Connection → Wizard → Permissions → Chat → Ready) |
+| First-run onboarding | Native setup flow: Security notice → Welcome/Advanced → Capabilities and permissions → Install progress → OpenClaw onboard → Complete |
 
 ### 🔌 Node Mode (Agent Control)
+
+If the operator/node split is new to you, read [Operator and node concepts](docs/OPERATOR_NODE_CONCEPTS.md) before enabling Node Mode.
 
 When Node Mode is enabled in Settings, your Windows PC becomes a **node** that the OpenClaw agent can control - just like the Mac app! The agent can:
 
@@ -371,21 +403,8 @@ Shared library containing:
 ## Development
 
 ### Project Structure
-```
-openclaw-windows-node/
-├── src/
-│   ├── OpenClaw.Shared/           # Shared gateway library
-│   └── OpenClaw.Tray.WinUI/       # System tray app (WinUI 3)
-├── tests/
-│   ├── OpenClaw.Shared.Tests/     # Shared library tests
-│   └── OpenClaw.Tray.Tests/       # Tray app helper tests
-├── docs/
-│   └── images/                    # Screenshots
-├── openclaw-windows-node.slnx     # Solution file
-├── README.md
-├── LICENSE
-└── .gitignore
-```
+
+See [DEVELOPMENT.md](DEVELOPMENT.md#project-structure) for the complete and current `src/` and `tests/` project inventory.
 
 ### Configuration
 
@@ -399,14 +418,15 @@ Default gateway: `ws://localhost:18789`
 
 ### First Run
 
-On first run, Molty launches a guided onboarding wizard that walks you through setup:
+On first run, Molty launches a guided setup flow:
 
-1. **Welcome** — introduces OpenClaw and starts the setup flow
-2. **Connection** — choose Local gateway, Remote gateway, or configure later. Paste a setup code or enter gateway URL and token manually. Tests the connection with Ed25519 device authentication.
-3. **Wizard** — gateway-driven configuration steps (AI provider selection, personality setup, communication channels). Steps are defined by your gateway.
-4. **Permissions** — reviews Windows system permissions (notifications, camera, microphone, screen capture, location) and links to system settings to grant them.
-5. **Chat** — meet your agent in a live chat powered by the gateway's web UI.
-6. **Ready** — summary of available features, option to launch at startup, and a Finish button.
+1. **Security notice** — confirms this is a trusted PC before local setup starts.
+2. **Welcome** — choose **Install a local gateway (WSL)** or connect to an existing gateway from Connections.
+3. **Capabilities** — choose a profile, review matching Windows permission status, and see exactly what setup will install.
+4. **Progress** — installs the app-owned `OpenClawGateway` WSL instance and keeps Live activity available but collapsed by default.
+5. **Gateway installed** — confirms the WSL gateway is running before moving into OpenClaw onboard.
+6. **OpenClaw onboard** — gateway-driven provider/model/key setup rendered as a transcript.
+7. **All set** — summary of available features, startup preference, and Finish.
 
 For detailed setup instructions, see [docs/SETUP.md](docs/SETUP.md). For the full onboarding architecture, see [docs/ONBOARDING_WIZARD.md](docs/ONBOARDING_WIZARD.md).
 

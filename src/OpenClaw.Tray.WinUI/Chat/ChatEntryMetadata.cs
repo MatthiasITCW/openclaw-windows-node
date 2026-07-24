@@ -36,10 +36,43 @@ namespace OpenClawTray.Chat;
 /// Percentage of the model's context window consumed by the conversation
 /// when this entry was generated (0–100). Shown as <c>23% ctx</c>.
 /// </param>
+/// <param name="ContextTokens">
+/// Total context window size captured with a session usage snapshot. Used by
+/// timestamp usage placement to render <c>usage/total (%)</c> exactly.
+/// </param>
+/// <param name="UsageContributionTokens">
+/// Raw token contribution reported for this assistant response before it was
+/// converted into the displayed cumulative session snapshot.
+/// </param>
+/// <param name="GatewayMessageId">
+/// Gateway-assigned stable message id from <c>__openclaw.id</c>, when known.
+/// Used to reconcile live entries with later <c>chat.history</c> rows.
+/// </param>
+/// <param name="OpenClawSeq">
+/// Monotonic per-session sequence from <c>__openclaw.seq</c>, when known.
+/// Prefer this over timestamps for transcript ordering and dedupe.
+/// </param>
+/// <param name="IsLocalQueuedSend">
+/// True for a locally queued user prompt promoted into the transcript before
+/// gateway history has provided its stable id/sequence.
+/// </param>
+/// <param name="LocalQueuedMessageId">
+/// Stable client-side id for a local send. Used to attach a later gateway
+/// identity to the exact optimistic transcript row without text matching.
+/// </param>
 public sealed record ChatEntryMetadata(
     DateTimeOffset? Timestamp,
     string? Model,
     int? InputTokens = null,
     int? OutputTokens = null,
     int? ResponseTokens = null,
-    int? ContextPercent = null);
+    int? ContextPercent = null,
+    long? ContextTokens = null,
+    int? UsageContributionTokens = null,
+    string? GatewayMessageId = null,
+    int? OpenClawSeq = null,
+    string? OpenClawKind = null,
+    long? CompactionTokensBefore = null,
+    long? CompactionTokensAfter = null,
+    bool IsLocalQueuedSend = false,
+    string? LocalQueuedMessageId = null);

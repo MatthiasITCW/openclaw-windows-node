@@ -22,7 +22,7 @@ The main product decision is deliberate: **do not make a native Windows gateway 
 
 Windows now has a strong foundation:
 
-- Node Mode with canvas, camera, screen snapshot/record, location, device info/status, system commands, notifications, and exec approval policy.
+- Node Mode with canvas, camera, screen snapshot/record, location, device info/status, system commands, notifications, exec approval policy, and local MCP `app.chat.*` automation commands.
 - Command Center status detail window with channels, sessions, usage, local/operator node inventory, allowlist diagnostics, pairing warnings, and activity stream.
 - SSH tunnel settings and service.
 - Activity Stream and support-bundle copy path that avoid storing invoke payloads.
@@ -438,7 +438,7 @@ Deliverables:
   - broad file system access if relevant
   - screen capture/graphics capture guidance
   - First read-only Command Center slice is implemented. It surfaces these settings pages and explanatory rows, but intentionally does not query, request, or exercise device permissions.
-  - Capability diagnostics copy is implemented for declared commands, gateway allowlist status, and privacy-sensitive opt-ins.
+  - Capability diagnostics distinguish approved/effective commands from pending declarations, surface pending approval/reapproval, and keep privacy-sensitive opt-ins explicit.
 - Mac-style onboarding security warning: **implemented in Setup Wizard Node Mode step, warning users that approved agents can run local commands and access enabled screen/camera/location/browser/canvas surfaces**
 - Topology choice onboarding: **first Settings guide implemented with local, WSL, SSH tunnel, and remote/Tailscale presets**
 - Exec approval dialog with sanitizer and three-button flow: **implemented for local `Prompt` policy decisions with Allow once / Always allow / Deny**
@@ -464,6 +464,15 @@ Deliverables:
 - Agent events ring expansion: **implemented first Command Center recent-activity panel with copy/open-stream actions**
 - Hover HUD / richer tray tooltip: **implemented with topology, channel, node, warning, and activity summary**
 - Update status: **implemented in Command Center support/debug section and copied support context, including current version, latest prompted version when known, and last check outcome**
+
+Recent native chat behavior implemented during this phase:
+
+- Queued-message UI tracks local send state (`Queued`, `Sending`, `Failed`) until the gateway confirms or rejects the turn.
+- Timeline virtualization keeps long chat histories responsive while preserving stable render identity for visible entries.
+- Completed sessions are hidden by default in the native chat session list, with active/in-progress sessions surfaced first.
+- TTS notification speech preserves full assistant text while UI preview truncation remains visual-only.
+- Slash-command suggestions use the gateway command catalog grouped into Mac-compatible command buckets.
+- Local MCP chat automation exposes `app.chat.snapshot`, `app.chat.send`, and `app.chat.reset` for current-thread inspection, send, and reset flows.
 
 Risk: medium; mostly UI and gateway method plumbing.
 

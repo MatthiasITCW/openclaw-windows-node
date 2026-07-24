@@ -38,12 +38,20 @@ public sealed record StepProgressEvent(string StepId, string DisplayName, StepOu
 
 public static class SetupStepFactory
 {
+    public static List<SetupStep> BuildWizardOnlySteps() =>
+    [
+        new RunGatewayWizardStep(),
+        new WindowsNodeBootstrapContextStep(),
+    ];
+
     public static List<SetupStep> BuildDefaultSteps()
     {
         return
         [
+            new ValidateDistroInstallPathStep(),
             new PreflightOsStep(),
             new PreflightWslStep(),
+            new PreflightWindowsTailscaleStep(),
             new CleanupStaleDistroStep(),
             new CleanupStaleGatewayStep(),
             new PreflightPortStep(),
@@ -51,14 +59,18 @@ public static class SetupStepFactory
             new ConfigureWslInstanceStep(),
             new ValidateWslLockdownStep(),
             new InstallCliStep(),
+            new InstallTailscaleStep(),
+            new AuthorizeTailscaleStep(),
             new ConfigureGatewayStep(),
             new InstallGatewayServiceStep(),
             new StartGatewayStep(),
+            new FinalizeTailscaleServeStep(),
             new MintBootstrapTokenStep(),
             new PairOperatorStep(),
             new PairNodeStep(),
             new VerifyEndToEndStep(),
             new RunGatewayWizardStep(),
+            new WindowsNodeBootstrapContextStep(),
             new StartKeepaliveStep(),
         ];
     }
@@ -70,13 +82,22 @@ public sealed class SetupPipeline
 {
     private readonly List<SetupStep> _steps;
     private readonly List<SetupStep> _completedSteps = new();
+    private readonly bool? _rollbackOnFailureOverride;
 
     public event EventHandler<StepProgressEvent>? StepProgress;
 
-    public SetupPipeline(IEnumerable<SetupStep> steps)
+    public SetupPipeline(IEnumerable<SetupStep> steps, bool? rollbackOnFailureOverride = null)
     {
         _steps = steps.ToList();
+        _rollbackOnFailureOverride = rollbackOnFailureOverride;
     }
+
+    internal static bool ShouldRunTrayArtifactCleanup(PipelineResult result, bool dryRun)
+        => !dryRun &&
+           !string.Equals(
+               result.FailedStepId,
+               ValidateDistroInstallPathStep.StepId,
+               StringComparison.Ordinal);
 
     public async Task<PipelineResult> RunAsync(SetupContext ctx)
     {
@@ -157,10 +178,18 @@ public sealed class SetupPipeline
                 continue;
             }
 
-            // Step failed — handle rollback if configured
-            ctx.Logger.Error($"Step '{step.Id}' failed: {result.Message}");
+            // Step failed — handle rollback if configured.
+            // When result.Error is set, StepCompleted already emitted an Error log for the
+            // exception, so we downgrade the summary to Warn to avoid duplicate Errors.
+            // When there is no exception (StepResult.Fail(message)), StepCompleted does NOT
+            // emit Error, so we keep this summary at Error so failed steps remain visible on
+            // Error-filtered dashboards.
+            if (result.Error is null)
+                ctx.Logger.Error($"SetupPipeline: Step '{step.Id}' failed: {result.Message}");
+            else
+                ctx.Logger.Warn($"SetupPipeline: Step '{step.Id}' failed: {result.Message}");
 
-            if (ctx.Config.RollbackOnFailure)
+            if (_rollbackOnFailureOverride ?? ctx.Config.RollbackOnFailure)
             {
                 await RollbackFailedStep(step, ctx);
                 await RollbackCompletedSteps(ctx);
@@ -229,6 +258,19 @@ public sealed class SetupPipeline
     {
         _completedSteps.Clear();
         var ct = ctx.CancellationToken;
+
+        if (!DistroInstallPathPolicy.TryGetManagedInstallPath(
+                ctx.LocalDataDir,
+                ctx.DistroName,
+                out _,
+                out var pathError))
+        {
+            ctx.Logger.Error($"Uninstall refused unsafe WSL distro path: {pathError}");
+            return new PipelineResult(
+                PipelineOutcome.Failed,
+                FailedStepId: ValidateDistroInstallPathStep.StepId,
+                Message: pathError);
+        }
 
         if (!ctx.Config.ConfirmDestructive && !ctx.Config.DryRun)
         {

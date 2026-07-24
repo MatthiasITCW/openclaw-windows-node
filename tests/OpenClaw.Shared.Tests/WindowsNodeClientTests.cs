@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -8,12 +9,37 @@ using System.Threading;
 using System.Threading.Tasks;
 using OpenClaw.Shared;
 using OpenClaw.Shared.Capabilities;
+using OpenClaw.Shared.Telemetry;
 using Xunit;
 
 namespace OpenClaw.Shared.Tests;
 
+[Collection(AppVersionInfoTestCollection.Name)]
 public class WindowsNodeClientTests
 {
+    private sealed class CapturingWindowsNodeClient(
+        string gatewayUrl,
+        string token,
+        string dataPath) : WindowsNodeClient(gatewayUrl, token, dataPath)
+    {
+        public ConcurrentQueue<string> SentMessages { get; } = new();
+
+        protected override Task SendRawAsync(string message)
+        {
+            SentMessages.Enqueue(message);
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class ThrowingWindowsNodeClient(
+        string gatewayUrl,
+        string token,
+        string dataPath) : WindowsNodeClient(gatewayUrl, token, dataPath)
+    {
+        protected override Task SendRawAsync(string message) =>
+            Task.FromException(new IOException("simulated gateway send failure"));
+    }
+
     [Theory]
     [InlineData("http://localhost:18789", "ws://localhost:18789")]
     [InlineData("https://host.tailnet.ts.net", "wss://host.tailnet.ts.net")]
@@ -75,6 +101,45 @@ public class WindowsNodeClientTests
             {
                 Directory.Delete(dataPath, true);
             }
+        }
+    }
+
+    [Theory]
+    [InlineData("rate limit exceeded", GatewayErrorKind.RateLimited)]
+    [InlineData("too many failed authentication attempts", GatewayErrorKind.RateLimited)]
+    [InlineData("device token mismatch", GatewayErrorKind.TokenDrift)]
+    [InlineData("origin not allowed", GatewayErrorKind.Auth)]
+    [InlineData("gateway internal error", GatewayErrorKind.Server)]
+    public void HandleResponse_TerminalError_EmitsFiniteFailureClassification(
+        string message,
+        GatewayErrorKind expectedKind)
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+
+        try
+        {
+            using var client = new WindowsNodeClient("ws://localhost:18789", "test-token", dataPath);
+            GatewayErrorKind? actualKind = null;
+            client.ConnectionFailure += (_, kind) => actualKind = kind;
+            using var document = JsonDocument.Parse(
+                $$"""
+                  {
+                    "type": "res",
+                    "ok": false,
+                    "error": {
+                      "message": "{{message}}",
+                      "code": "TEST_ERROR"
+                    }
+                  }
+                  """);
+            client.HandleResponse(document.RootElement);
+
+            Assert.Equal(expectedKind, actualKind);
+        }
+        finally
+        {
+            Directory.Delete(dataPath, true);
         }
     }
 
@@ -373,9 +438,57 @@ public class WindowsNodeClientTests
             Assert.Single(pairingEvents);
             Assert.Equal(PairingStatus.Pending, pairingEvents[0].Status);
             Assert.Contains("req-123", pairingEvents[0].Message);
+            Assert.Equal("req-123", pairingEvents[0].RequestId);
+            Assert.Equal(PairingApprovalKind.DevicePair, pairingEvents[0].ApprovalKind);
             Assert.DoesNotContain(ConnectionStatus.Error, statusChanges);
             Assert.True(client.IsPendingApproval);
             Assert.False(client.IsPaired);
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
+    public void HandleResponse_NotPairedError_WithUnsafeRequestId_DoesNotSurfaceRequestId()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+
+        try
+        {
+            using var client = new WindowsNodeClient("ws://localhost:18789", "test-token", dataPath);
+
+            var pairingEvents = new List<PairingStatusEventArgs>();
+            client.PairingStatusChanged += (_, e) => pairingEvents.Add(e);
+
+            var json = """
+                {
+                    "type": "res",
+                    "ok": false,
+                    "error": {
+                        "message": "Device approval required",
+                        "code": "NOT_PAIRED",
+                        "details": {
+                            "reason": "role-upgrade",
+                            "requestId": "req-1 && bad"
+                        }
+                    }
+                }
+                """;
+            var root = JsonDocument.Parse(json).RootElement;
+
+            var handleResponseMethod = typeof(WindowsNodeClient).GetMethod(
+                "HandleResponse",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            handleResponseMethod!.Invoke(client, [root]);
+
+            Assert.Single(pairingEvents);
+            Assert.Equal(PairingApprovalKind.DevicePair, pairingEvents[0].ApprovalKind);
+            Assert.Null(pairingEvents[0].RequestId);
+            Assert.DoesNotContain("req-1 && bad", pairingEvents[0].Message);
         }
         finally
         {
@@ -477,13 +590,16 @@ public class WindowsNodeClientTests
                     "type": "event",
                     "event": "node.pair.requested",
                     "payload": {
-                        "deviceId": "{{client.FullDeviceId}}"
+                        "deviceId": "{{client.FullDeviceId}}",
+                        "requestId": "node-pair-req"
                     }
                 }
                 """);
 
             Assert.Single(pairingEvents);
             Assert.Equal(PairingStatus.Pending, pairingEvents[0].Status);
+            Assert.Equal("node-pair-req", pairingEvents[0].RequestId);
+            Assert.Equal(PairingApprovalKind.NodePair, pairingEvents[0].ApprovalKind);
             Assert.True(client.IsPendingApproval);
         }
         finally
@@ -518,6 +634,79 @@ public class WindowsNodeClientTests
 
             Assert.Empty(pairingEvents);
             Assert.False(client.IsPendingApproval);
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
+    public async Task HandleEvent_NodePairRequestedWithoutRequestId_EmitsPendingDiscoveryCommand()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+
+        try
+        {
+            using var client = new WindowsNodeClient("ws://localhost:18789", "test-token", dataPath);
+
+            var pairingEvents = new List<PairingStatusEventArgs>();
+            client.PairingStatusChanged += (_, e) => pairingEvents.Add(e);
+
+            await InvokeHandleEventAsync(client, $$"""
+                {
+                    "type": "event",
+                    "event": "node.pair.requested",
+                    "payload": {
+                        "deviceId": "{{client.FullDeviceId}}"
+                    }
+                }
+                """);
+
+            Assert.Single(pairingEvents);
+            Assert.Equal(PairingStatus.Pending, pairingEvents[0].Status);
+            Assert.Equal(PairingApprovalKind.NodePair, pairingEvents[0].ApprovalKind);
+            Assert.Null(pairingEvents[0].RequestId);
+            Assert.Contains("openclaw nodes pending", pairingEvents[0].Message);
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
+    public async Task HandleEvent_NodePairRequestedWithUnsafeRequestId_DoesNotEmbedItInApprovalCommand()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+
+        try
+        {
+            using var client = new WindowsNodeClient("ws://localhost:18789", "test-token", dataPath);
+
+            var pairingEvents = new List<PairingStatusEventArgs>();
+            client.PairingStatusChanged += (_, e) => pairingEvents.Add(e);
+
+            await InvokeHandleEventAsync(client, $$"""
+                {
+                    "type": "event",
+                    "event": "node.pair.requested",
+                    "payload": {
+                        "deviceId": "{{client.FullDeviceId}}",
+                        "requestId": "req-1; rm -rf /"
+                    }
+                }
+                """);
+
+            Assert.Single(pairingEvents);
+            Assert.Equal(PairingApprovalKind.NodePair, pairingEvents[0].ApprovalKind);
+            Assert.Null(pairingEvents[0].RequestId);
+            Assert.Contains("openclaw nodes pending", pairingEvents[0].Message);
+            Assert.DoesNotContain("rm -rf", pairingEvents[0].Message);
         }
         finally
         {
@@ -1314,6 +1503,8 @@ public class WindowsNodeClientTests
         private readonly TaskCompletionSource<bool> _executedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public int ExecuteCount { get; private set; }
         public string? LastCommand { get; private set; }
+        public NodeInvokeRequest? LastRequest { get; private set; }
+        public NodeInvokeResponse? Response { get; set; }
         /// <summary>Completes when ExecuteAsync is first called. Use in tests to await fire-and-forget dispatch.</summary>
         public Task ExecutedTask => _executedTcs.Task;
 
@@ -1331,8 +1522,10 @@ public class WindowsNodeClientTests
         {
             ExecuteCount++;
             LastCommand = request.Command;
+            LastRequest = request;
             _executedTcs.TrySetResult(true);
-            return Task.FromResult(new NodeInvokeResponse { Id = request.Id, Ok = true, Payload = new { dispatched = true } });
+            return Task.FromResult(Response ??
+                new NodeInvokeResponse { Id = request.Id, Ok = true, Payload = new { dispatched = true } });
         }
     }
 
@@ -1470,6 +1663,123 @@ public class WindowsNodeClientTests
     }
 
     [Fact]
+    public async Task CommandDispatch_ReqPath_PropagatesParamsSessionKey()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+
+        try
+        {
+            using var client = new WindowsNodeClient("ws://localhost:18789", "test-token", dataPath);
+            var cap = new MockCapability("mock", "mock.ping");
+            client.RegisterCapability(cap);
+
+            var json = """
+                {
+                  "type": "req",
+                  "id": "req-session-params",
+                  "method": "node.invoke",
+                  "params": {
+                    "requestId": "inv-session-params",
+                    "command": "mock.ping",
+                    "sessionKey": "chat-thread-from-params",
+                    "args": {}
+                  }
+                }
+                """;
+
+            await InvokeProcessMessageAsync(client, json);
+            await cap.ExecutedTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal("chat-thread-from-params", cap.LastRequest?.SessionKey);
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
+    public async Task CommandDispatch_ReqPath_PropagatesArgsSessionKey()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+
+        try
+        {
+            using var client = new WindowsNodeClient("ws://localhost:18789", "test-token", dataPath);
+            var cap = new MockCapability("mock", "mock.ping");
+            client.RegisterCapability(cap);
+
+            var json = """
+                {
+                  "type": "req",
+                  "id": "req-session-args",
+                  "method": "node.invoke",
+                  "params": {
+                    "requestId": "inv-session-args",
+                    "command": "mock.ping",
+                    "args": {
+                      "sessionKey": "chat-thread-from-args"
+                    }
+                  }
+                }
+                """;
+
+            await InvokeProcessMessageAsync(client, json);
+            await cap.ExecutedTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal("chat-thread-from-args", cap.LastRequest?.SessionKey);
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
+    public async Task CommandDispatch_ReqPath_ParamsSessionKeyOverridesArgsSessionKey()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+
+        try
+        {
+            using var client = new WindowsNodeClient("ws://localhost:18789", "test-token", dataPath);
+            var cap = new MockCapability("mock", "mock.ping");
+            client.RegisterCapability(cap);
+
+            var json = """
+                {
+                  "type": "req",
+                  "id": "req-session-override",
+                  "method": "node.invoke",
+                  "params": {
+                    "requestId": "inv-session-override",
+                    "command": "mock.ping",
+                    "sessionKey": "trusted-session",
+                    "args": {
+                      "sessionKey": "spoofed-session"
+                    }
+                  }
+                }
+                """;
+
+            await InvokeProcessMessageAsync(client, json);
+            await cap.ExecutedTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal("trusted-session", cap.LastRequest?.SessionKey);
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
     public async Task CommandDispatch_UnknownCommand_DoesNotInvokeAnyCapability()
     {
         var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
@@ -1589,6 +1899,251 @@ public class WindowsNodeClientTests
     }
 
     [Fact]
+    public async Task CommandDispatch_EventPath_EmitsTypedSemanticFailureCompletion()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+
+        try
+        {
+            using var client = new WindowsNodeClient("ws://localhost:18789", "test-token", dataPath);
+            var capability = new MockCapability("system", "system.run")
+            {
+                Response = new NodeInvokeResponse
+                {
+                    Ok = true,
+                    Payload = new { success = false, exitCode = 7, timedOut = false },
+                    Diagnostic = new NodeToolDiagnostic(
+                        NodeToolErrorCategory.CommandFailed,
+                        NodeToolExecutionMode.Sandbox),
+                },
+            };
+            client.RegisterCapability(capability);
+            var completionSource = new TaskCompletionSource<NodeToolTelemetryCompletion>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            client.ToolTelemetryCompleted += (_, completion) =>
+                completionSource.TrySetResult(completion);
+
+            await InvokeProcessMessageAsync(client, """
+                {
+                  "type": "event",
+                  "event": "node.invoke.request",
+                  "payload": {
+                    "requestId": "inv-telemetry",
+                    "command": "SyStEm.RuN",
+                    "args": {}
+                  }
+                }
+                """);
+            var completion = await completionSource.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.NotNull(capability.LastRequest!.Telemetry);
+            Assert.Equal("system.run", completion.Command);
+            Assert.Equal(NodeToolTransport.Gateway, completion.Transport);
+            Assert.Equal(NodeToolOutcome.Failure, completion.Outcome);
+            Assert.Equal(NodeToolErrorCategory.CommandFailed, completion.ErrorCategory);
+            Assert.Equal(NodeToolExecutionMode.Sandbox, completion.ExecutionMode);
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
+    public async Task CommandDispatch_RequestPath_ThrowingCompletionSubscriber_DoesNotSuppressResponse()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+
+        try
+        {
+            using var client = new CapturingWindowsNodeClient(
+                "ws://localhost:18789",
+                "test-token",
+                dataPath);
+            var capability = new MockCapability("mock", "mock.ping");
+            client.RegisterCapability(capability);
+            var laterSubscriberCalled = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            client.InvokeCompleted += (_, _) => throw new InvalidOperationException("subscriber failure");
+            client.InvokeCompleted += (_, args) =>
+            {
+                if (args.RequestId == "invoke-throw-request")
+                {
+                    laterSubscriberCalled.TrySetResult();
+                }
+            };
+
+            await InvokeProcessMessageAsync(
+                client,
+                BuildNodeInvokeRequest("invoke-throw-request", "mock.ping"));
+
+            await laterSubscriberCalled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var responseJson = await WaitForSentMessageAsync(
+                client,
+                message => message.Contains("\"id\":\"invoke-throw-request\"", StringComparison.Ordinal));
+            using var response = JsonDocument.Parse(responseJson);
+            Assert.Equal("res", response.RootElement.GetProperty("type").GetString());
+            Assert.True(response.RootElement.GetProperty("ok").GetBoolean());
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
+    public async Task CommandDispatch_EventPath_ThrowingCompletionSubscriber_DoesNotSuppressResult()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+
+        try
+        {
+            using var client = new CapturingWindowsNodeClient(
+                "ws://localhost:18789",
+                "test-token",
+                dataPath);
+            var capability = new MockCapability("mock", "mock.ping");
+            client.RegisterCapability(capability);
+            var laterSubscriberCalled = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            client.InvokeCompleted += (_, _) => throw new InvalidOperationException("subscriber failure");
+            client.InvokeCompleted += (_, args) =>
+            {
+                if (args.RequestId == "invoke-throw-event")
+                {
+                    laterSubscriberCalled.TrySetResult();
+                }
+            };
+
+            await InvokeProcessMessageAsync(client, """
+                {
+                  "type": "event",
+                  "event": "node.invoke.request",
+                  "payload": {
+                    "requestId": "invoke-throw-event",
+                    "command": "mock.ping",
+                    "args": {}
+                  }
+                }
+                """);
+
+            await laterSubscriberCalled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var responseJson = await WaitForSentMessageAsync(
+                client,
+                message => message.Contains("\"method\":\"node.invoke.result\"", StringComparison.Ordinal) &&
+                           message.Contains("\"id\":\"invoke-throw-event\"", StringComparison.Ordinal));
+            using var response = JsonDocument.Parse(responseJson);
+            Assert.Equal("req", response.RootElement.GetProperty("type").GetString());
+            Assert.True(response.RootElement.GetProperty("params").GetProperty("ok").GetBoolean());
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
+    public async Task CommandDispatch_ReqPath_EmitsTypedSemanticFailureCompletion()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+
+        try
+        {
+            using var client = new WindowsNodeClient("ws://localhost:18789", "test-token", dataPath);
+            var capability = new MockCapability("system", "system.run")
+            {
+                Response = new NodeInvokeResponse
+                {
+                    Ok = true,
+                    Payload = new { success = false, exitCode = -1, timedOut = true },
+                    Diagnostic = new NodeToolDiagnostic(
+                        NodeToolErrorCategory.Timeout,
+                        NodeToolExecutionMode.Host),
+                },
+            };
+            client.RegisterCapability(capability);
+            var completionSource = new TaskCompletionSource<NodeToolTelemetryCompletion>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            client.ToolTelemetryCompleted += (_, completion) =>
+                completionSource.TrySetResult(completion);
+
+            await InvokeProcessMessageAsync(client, """
+                {
+                  "type": "req",
+                  "id": "req-telemetry",
+                  "method": "node.invoke",
+                  "params": {
+                    "requestId": "inv-telemetry",
+                    "command": "SYSTEM.RUN",
+                    "args": {}
+                  }
+                }
+                """);
+            var completion = await completionSource.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.NotNull(capability.LastRequest!.Telemetry);
+            Assert.Equal("system.run", completion.Command);
+            Assert.Equal(NodeToolTransport.Gateway, completion.Transport);
+            Assert.Equal(NodeToolOutcome.Failure, completion.Outcome);
+            Assert.Equal(NodeToolErrorCategory.Timeout, completion.ErrorCategory);
+            Assert.Equal(NodeToolExecutionMode.Host, completion.ExecutionMode);
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
+    public async Task CommandDispatch_ReqPath_SendFailure_CompletesTransportFailureExactlyOnce()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+
+        try
+        {
+            using var client = new ThrowingWindowsNodeClient(
+                "ws://localhost:18789",
+                "test-token",
+                dataPath);
+            var capability = new MockCapability("mock", "mock.ping");
+            client.RegisterCapability(capability);
+            var completionSource = new TaskCompletionSource<NodeToolTelemetryCompletion>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var completionCount = 0;
+            client.ToolTelemetryCompleted += (_, completion) =>
+            {
+                Interlocked.Increment(ref completionCount);
+                completionSource.TrySetResult(completion);
+            };
+
+            await InvokeProcessMessageAsync(
+                client,
+                BuildNodeInvokeRequest("invoke-send-failure", "mock.ping"));
+            var completion = await completionSource.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(1, Volatile.Read(ref completionCount));
+            Assert.Equal("mock.ping", completion.Command);
+            Assert.Equal(NodeToolOutcome.Failure, completion.Outcome);
+            Assert.Equal(NodeToolErrorCategory.TransportFailure, completion.ErrorCategory);
+            Assert.Equal(typeof(IOException).FullName, completion.ErrorType);
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
     public async Task CommandDispatch_SlowCapability_DoesNotBlockNextInvoke()
     {
         var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
@@ -1673,6 +2228,225 @@ public class WindowsNodeClientTests
     }
 
     [Fact]
+    public async Task CommandDispatch_RequestCancel_CancelsMatchingInvoke()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+        var blocking = new BlockingCapability("mock", "mock.slow");
+
+        try
+        {
+            using var client = new CapturingWindowsNodeClient(
+                "ws://localhost:18789",
+                "test-token",
+                dataPath);
+            client.RegisterCapability(blocking);
+            var completedTcs = new TaskCompletionSource<NodeInvokeCompletedEventArgs>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var telemetryTcs = new TaskCompletionSource<NodeToolTelemetryCompletion>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            client.InvokeCompleted += (_, args) =>
+            {
+                if (args.RequestId == "inv-cancel")
+                {
+                    completedTcs.TrySetResult(args);
+                }
+            };
+            client.ToolTelemetryCompleted += (_, completion) =>
+                telemetryTcs.TrySetResult(completion);
+
+            await InvokeProcessMessageAsync(client, BuildNodeInvokeRequest("inv-cancel", "mock.slow"));
+            await blocking.ExpectedEnteredTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+            await InvokeProcessMessageAsync(client, """
+                {
+                  "type": "req",
+                  "id": "cancel-request",
+                  "method": "node.invoke.cancel",
+                  "params": {
+                    "requestId": "inv-cancel"
+                  }
+                }
+                """);
+
+            var cancelResponseJson = Assert.Single(
+                client.SentMessages,
+                message => message.Contains("\"id\":\"cancel-request\"", StringComparison.Ordinal));
+            using var cancelResponse = JsonDocument.Parse(cancelResponseJson);
+            Assert.Equal("res", cancelResponse.RootElement.GetProperty("type").GetString());
+            Assert.True(cancelResponse.RootElement.GetProperty("ok").GetBoolean());
+            Assert.True(
+                cancelResponse.RootElement
+                    .GetProperty("payload")
+                    .GetProperty("cancelled")
+                    .GetBoolean());
+
+            await blocking.AllCompletedTask.WaitAsync(TimeSpan.FromSeconds(5));
+            var completed = await completedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(completed.Ok);
+            Assert.Equal("cancelled", completed.Error);
+            var telemetry = await telemetryTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(NodeToolOutcome.Canceled, telemetry.Outcome);
+            Assert.Equal(NodeToolErrorCategory.Other, telemetry.ErrorCategory);
+        }
+        finally
+        {
+            blocking.Release();
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
+    public async Task CommandDispatch_ShutdownCancellation_EmitsCanceledTelemetry()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+        var blocking = new BlockingCapability("mock", "mock.slow");
+
+        try
+        {
+            using var client = new WindowsNodeClient(
+                "ws://localhost:18789",
+                "test-token",
+                dataPath);
+            client.RegisterCapability(blocking);
+            var telemetryTcs = new TaskCompletionSource<NodeToolTelemetryCompletion>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            client.ToolTelemetryCompleted += (_, completion) =>
+                telemetryTcs.TrySetResult(completion);
+
+            await InvokeProcessMessageAsync(
+                client,
+                BuildNodeInvokeRequest("shutdown-cancel", "mock.slow"));
+            await blocking.ExpectedEnteredTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var onDisconnected = typeof(WindowsNodeClient).GetMethod(
+                "OnDisconnected",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            onDisconnected!.Invoke(client, null);
+
+            await blocking.AllCompletedTask.WaitAsync(TimeSpan.FromSeconds(5));
+            var telemetry = await telemetryTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(NodeToolOutcome.Canceled, telemetry.Outcome);
+            Assert.Equal(NodeToolErrorCategory.Other, telemetry.ErrorCategory);
+        }
+        finally
+        {
+            blocking.Release();
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
+    public async Task CommandDispatch_EventCancel_CancelsMatchingEventInvoke()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+        var blocking = new BlockingCapability("mock", "mock.slow");
+
+        try
+        {
+            using var client = new WindowsNodeClient("ws://localhost:18789", "test-token", dataPath);
+            client.RegisterCapability(blocking);
+            var completedTcs = new TaskCompletionSource<NodeInvokeCompletedEventArgs>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            client.InvokeCompleted += (_, args) =>
+            {
+                if (args.RequestId == "event-cancel")
+                {
+                    completedTcs.TrySetResult(args);
+                }
+            };
+
+            await InvokeProcessMessageAsync(client, """
+                {
+                  "type": "event",
+                  "event": "node.invoke.request",
+                  "payload": {
+                    "requestId": "event-cancel",
+                    "command": "mock.slow",
+                    "args": {}
+                  }
+                }
+
+                """);
+            await blocking.ExpectedEnteredTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+            await InvokeProcessMessageAsync(client, """
+                {
+                  "type": "event",
+                  "event": "node.invoke.cancel",
+                  "payload": {
+                    "invokeId": "event-cancel"
+                  }
+                }
+                """);
+
+            await blocking.AllCompletedTask.WaitAsync(TimeSpan.FromSeconds(5));
+            var completed = await completedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(completed.Ok);
+            Assert.Equal("cancelled", completed.Error);
+        }
+        finally
+        {
+            blocking.Release();
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
+    public async Task CommandDispatch_RequestNotificationCancel_ReadsParamsWithoutResponseId()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataPath);
+        var blocking = new BlockingCapability("mock", "mock.slow");
+
+        try
+        {
+            using var client = new WindowsNodeClient("ws://localhost:18789", "test-token", dataPath);
+            client.RegisterCapability(blocking);
+            var completedTcs = new TaskCompletionSource<NodeInvokeCompletedEventArgs>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            client.InvokeCompleted += (_, args) =>
+            {
+                if (args.RequestId == "notification-cancel")
+                {
+                    completedTcs.TrySetResult(args);
+                }
+            };
+
+            await InvokeProcessMessageAsync(
+                client,
+                BuildNodeInvokeRequest("notification-cancel", "mock.slow"));
+            await blocking.ExpectedEnteredTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+            await InvokeProcessMessageAsync(client, """
+                {
+                  "type": "req",
+                  "method": "node.invoke.cancel",
+                  "params": {
+                    "invokeId": "notification-cancel"
+                  }
+                }
+                """);
+
+            await blocking.AllCompletedTask.WaitAsync(TimeSpan.FromSeconds(5));
+            var completed = await completedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(completed.Ok);
+            Assert.Equal("cancelled", completed.Error);
+        }
+        finally
+        {
+            blocking.Release();
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, true);
+        }
+    }
+
+    [Fact]
     public async Task CommandDispatch_ArgsSurviveAfterProcessMessageReturns()
     {
         var dataPath = Path.Combine(Path.GetTempPath(), $"openclaw-node-test-{Guid.NewGuid():N}");
@@ -1723,6 +2497,25 @@ public class WindowsNodeClientTests
         Assert.NotNull(processMethod);
         var task = (Task)processMethod!.Invoke(client, [json])!;
         await task;
+    }
+
+    private static async Task<string> WaitForSentMessageAsync(
+        CapturingWindowsNodeClient client,
+        Func<string, bool> predicate)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!timeout.IsCancellationRequested)
+        {
+            var message = client.SentMessages.FirstOrDefault(predicate);
+            if (message != null)
+            {
+                return message;
+            }
+
+            await Task.Delay(10, timeout.Token);
+        }
+
+        throw new TimeoutException("Expected gateway response was not sent.");
     }
 
     private static string BuildNodeInvokeRequest(string requestId, string command)

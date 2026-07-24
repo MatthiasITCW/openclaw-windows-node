@@ -107,9 +107,9 @@ verifier fails closed on unknown `.exe` files so future payload changes are
 reviewed deliberately.
 
 CI also checks native runtime dependencies before release packaging. Both the
-x64 and ARM64 portable payloads must ship `vcruntime140.dll` next to every
-`libsodium.dll` copy. Both build legs source their loose VC runtime DLLs from
-the Visual Studio install on the CI runner (resolved via `vswhere` in
+x64 and ARM64 portable payloads must ship `vcruntime140.dll` in the payload
+root for the native speech stack. Both build legs source their loose VC runtime
+DLLs from the Visual Studio install on the CI runner (resolved via `vswhere` in
 `src\Directory.Build.targets`). This ensures the bundled CRT is new enough for
 `onnxruntime` — the `VCRuntime.CefSharp.140` NuGet is only used as a dev-time
 convenience for local `dotnet build` (not publish). The release validation
@@ -121,7 +121,7 @@ The release job must Authenticode-verify Microsoft's x64 and ARM64 Visual C++
 Runtime redistributables before passing the
 architecture-matching redistributable to Inno. The installer runs the
 redistributable before launching the tray so clean or stale Windows hosts can
-repair the runtime before Ed25519 device keys are generated or loaded, and it
+repair the runtime before native speech components initialize, and it
 skips the post-install tray launch if the runtime installer fails.
 
 The current Azure Artifact Signing resource is:
@@ -161,12 +161,11 @@ For alpha tags, the **Build and Test** workflow should run:
 
 - `repo-hygiene`
 - `test`
-- `e2etests`
-- `build (win-x64)`
-- `build (win-arm64)`
+- `e2etests` shards: `setup-connect`, `revocation-recovery`, and `network-recovery`
+- `build` matrix entries shown by GitHub as `build (win-x64)` and `build (win-arm64)`
 - `release`
 
-MSIX jobs may appear as skipped while MSIX is paused.
+The `setup-connect` E2E shard contains the MXC proof tests for the gateway -> Windows node -> `system.run` path and validates that the expected proof test names appear in the TRX output. GitHub-hosted runners may report those MXC proofs as skipped when the host is not MXC-capable; use `.\scripts\validate-mxc-e2e.ps1` for required local/self-hosted MXC merge validation. The `build-msix` job is disabled with `if: false` while MSIX is paused for alpha releases, so it should not appear in the required run list.
 
 The release job should:
 

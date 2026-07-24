@@ -5,8 +5,8 @@ namespace OpenClaw.Tray.Tests;
 
 /// <summary>
 /// Pins the <c>FluentIconCatalog</c> contract: every advertised glyph is a
-/// single Unicode Private Use Area character (or the documented Brand
-/// emoji), and the helper builder uses the SymbolThemeFontFamily resource.
+/// single Unicode Private Use Area character, and the helper builder uses
+/// the SymbolThemeFontFamily resource.
 ///
 /// We parse the source rather than reflect on the assembly because
 /// <c>OpenClaw.Tray.Tests</c> is a pure net10.0 project that doesn't
@@ -20,13 +20,12 @@ public sealed class FluentIconCatalogTests
         "Sessions", "Approvals", "Devices", "Hostname", "Permissions",
         "Browser", "Camera", "Canvas", "Screen", "Location", "Voice", "Speech", "System", "Terminal", "Operator",
         "Dashboard", "OpenInBrowser", "Chat", "CanvasAct", "VoiceAct", "Settings",
-        "Setup", "About", "Exit",
+        "Setup", "About", "Notifications", "Exit",
         "Add", "Back", "Sync", "Lock", "Plug", "MoreOverflow",
         "People", "Money", "ServerEnvironment", "CapabilityOff", "Channels",
         "ChevronR", "Check",
-        "Brand",
         // Diagnostics surface (see src/OpenClaw.Tray.WinUI/Pages/DebugPage.xaml).
-        "Bug", "Briefcase", "Folder", "Copy", "Document", "Refresh", "Reset", "Clear", "Develop",
+        "Bug", "Briefcase", "Folder", "Copy", "Document", "Refresh", "Reset", "Clear", "Develop", "Telemetry",
         // Workspace surface (see src/OpenClaw.Tray.WinUI/Pages/WorkspacePage.xaml).
         "Workspace",
     };
@@ -34,15 +33,14 @@ public sealed class FluentIconCatalogTests
     private static string ReadCatalogSource()
     {
         var path = Path.Combine(
-            GetRepositoryRoot(),
+            TestRepositoryPaths.GetRepositoryRoot(),
             "src", "OpenClaw.Tray.WinUI", "Helpers", "FluentIconCatalog.cs");
         return File.ReadAllText(path);
     }
 
     private static IDictionary<string, string> ParseConstants(string source)
     {
-        // Matches:   public const string Name = "\uXXXX";   or
-        //            public const string Name = "🦞";
+        // Matches:   public const string Name = "\uXXXX";
         var rx = new Regex(
             @"public\s+const\s+string\s+(?<name>\w+)\s*=\s*""(?<value>(?:\\u[0-9A-Fa-f]{4}|[^""\\]|\\.)*)"";",
             RegexOptions.Compiled);
@@ -74,9 +72,6 @@ public sealed class FluentIconCatalogTests
         var map = ParseConstants(src);
         foreach (var name in ExpectedConstants)
         {
-            if (name == "Brand")
-                continue; // Brand is an emoji surrogate pair by design.
-
             Assert.True(map.TryGetValue(name, out var value),
                 $"FluentIconCatalog.{name} not found in source");
             Assert.True(value!.Length == 1,
@@ -95,27 +90,45 @@ public sealed class FluentIconCatalogTests
         Assert.Contains("SymbolThemeFontFamily", src);
     }
 
-    private static string GetRepositoryRoot()
+    [Fact]
+    public void NativeWinUiSources_DoNotHardcodeSegoeFluentIcons()
     {
-        var env = Environment.GetEnvironmentVariable("OPENCLAW_REPO_ROOT");
-        if (!string.IsNullOrWhiteSpace(env) && Directory.Exists(env))
-            return env;
-
-        var directory = new DirectoryInfo(AppContext.BaseDirectory);
-        while (directory != null)
+        var repositoryRoot = TestRepositoryPaths.GetRepositoryRoot();
+        var sourceRoots = new[]
         {
-            if (File.Exists(Path.Combine(directory.FullName, "openclaw-windows-node.slnx")) &&
-                Directory.Exists(Path.Combine(directory.FullName, "src")))
-            {
-                return directory.FullName;
-            }
+            Path.Combine(repositoryRoot, "src", "OpenClaw.Tray.WinUI"),
+            Path.Combine(repositoryRoot, "src", "OpenClaw.SetupEngine.UI"),
+        };
+        var hardcodedIconFont = new Regex(
+            @"FontFamily\s*\(\s*""Segoe Fluent Icons""\s*\)|FontFamily\s*=\s*""Segoe Fluent Icons""",
+            RegexOptions.Compiled);
 
-            directory = directory.Parent;
+        var offenders = sourceRoots
+            .SelectMany(sourceRoot => Directory
+                .EnumerateFiles(sourceRoot, "*", SearchOption.AllDirectories)
+                .Where(path => path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)
+                    || path.EndsWith(".xaml", StringComparison.OrdinalIgnoreCase))
+                .Where(path => !IsBuildArtifact(sourceRoot, path)))
+            .SelectMany(path => File.ReadLines(path)
+                .Select((line, index) => (path, line, lineNumber: index + 1)))
+            .Where(item => hardcodedIconFont.IsMatch(item.line))
+            .Select(item => $"{Path.GetRelativePath(repositoryRoot, item.path)}:{item.lineNumber}")
+            .ToArray();
+
+        Assert.True(
+            offenders.Length == 0,
+            "Use the SymbolThemeFontFamily theme resource/property so icon glyphs fall back to Segoe MDL2 Assets on Windows 10:"
+            + Environment.NewLine
+            + string.Join(Environment.NewLine, offenders));
+
+        static bool IsBuildArtifact(string sourceRoot, string path)
+        {
+            var relative = Path.GetRelativePath(sourceRoot, path);
+            return relative.StartsWith($"bin{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase)
+                || relative.StartsWith($"obj{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase);
         }
-
-        throw new InvalidOperationException(
-            "Could not find repository root. Set OPENCLAW_REPO_ROOT to the repo path.");
     }
+
 }
 
 /// <summary>
@@ -128,7 +141,7 @@ public sealed class TrayMenuPopupCompositionTests
     private static string ReadAppXaml()
     {
         var path = Path.Combine(
-            GetRepositoryRoot(),
+            TestRepositoryPaths.GetRepositoryRoot(),
             "src", "OpenClaw.Tray.WinUI", "App.xaml.cs");
         return File.ReadAllText(path);
     }
@@ -136,7 +149,7 @@ public sealed class TrayMenuPopupCompositionTests
     private static string ReadStateBuilder()
     {
         var path = Path.Combine(
-            GetRepositoryRoot(),
+            TestRepositoryPaths.GetRepositoryRoot(),
             "src", "OpenClaw.Tray.WinUI", "Services", "TrayMenuStateBuilder.cs");
         return File.ReadAllText(path);
     }
@@ -144,7 +157,7 @@ public sealed class TrayMenuPopupCompositionTests
     private static string ReadHubWindowXaml()
     {
         var path = Path.Combine(
-            GetRepositoryRoot(),
+            TestRepositoryPaths.GetRepositoryRoot(),
             "src", "OpenClaw.Tray.WinUI", "Windows", "HubWindow.xaml.cs");
         return File.ReadAllText(path);
     }
@@ -273,25 +286,4 @@ public sealed class TrayMenuPopupCompositionTests
         Assert.True(selectIndex >= 0, "NavigateInternal must select a nav item by tag before falling back to direct navigation.");
     }
 
-    private static string GetRepositoryRoot()
-    {
-        var env = Environment.GetEnvironmentVariable("OPENCLAW_REPO_ROOT");
-        if (!string.IsNullOrWhiteSpace(env) && Directory.Exists(env))
-            return env;
-
-        var directory = new DirectoryInfo(AppContext.BaseDirectory);
-        while (directory != null)
-        {
-            if (File.Exists(Path.Combine(directory.FullName, "openclaw-windows-node.slnx")) &&
-                Directory.Exists(Path.Combine(directory.FullName, "src")))
-            {
-                return directory.FullName;
-            }
-
-            directory = directory.Parent;
-        }
-
-        throw new InvalidOperationException(
-            "Could not find repository root. Set OPENCLAW_REPO_ROOT to the repo path.");
-    }
 }

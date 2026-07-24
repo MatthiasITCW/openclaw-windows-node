@@ -6,10 +6,10 @@ using Microsoft.UI.Xaml.Media;
 using Microsoft.Web.WebView2.Core;
 using OpenClaw.Shared;
 using OpenClawTray.Chat;
-using OpenClawTray.Chat.Explorations;
 using OpenClawTray.Helpers;
 using OpenClawTray.Services;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -29,6 +29,9 @@ public sealed partial class ChatWindow : WindowEx
     private IChatDataProvider? _mountedProvider;
     private bool _webViewInitialized;
     private bool _webViewMode;
+    private bool _shownNearTray;
+    private readonly SemaphoreSlim _speakerMuteGate = new(1, 1);
+    private int _voiceSettingsDialogOpen;
     public bool IsClosed { get; private set; }
 
     [DllImport("user32.dll")] private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
@@ -71,6 +74,7 @@ public sealed partial class ChatWindow : WindowEx
         _token = token;
         _chatUrl = ChatSurfaceResolver.BuildChatUrl(gatewayUrl, token);
         InitializeComponent();
+        Title = AppIdentity.DecorateWindowTitle("OpenClaw Chat");
 
         this.SetWindowSize(DefaultChatWidth, DefaultChatHeight);
         this.SetIcon("Assets\\openclaw.ico");
@@ -104,7 +108,7 @@ public sealed partial class ChatWindow : WindowEx
             escAccel.Invoked += (_, args) =>
             {
                 args.Handled = true;
-                this.Hide();
+                HideNearTray();
             };
             contentRoot.KeyboardAccelerators.Add(escAccel);
             // Suppress the default "Esc" tooltip that WinUI shows for
@@ -128,13 +132,8 @@ public sealed partial class ChatWindow : WindowEx
         OpenClawTray.Chat.DebugChatSurfaceOverrides.Changed -= OnDebugOverrideChanged;
         OpenClawTray.Chat.DebugChatSurfaceOverrides.Changed += OnDebugOverrideChanged;
 
-        // ChatExploration backdrop / theme — re-apply when toggled live.
-        ChatExplorationState.Changed -= OnExplorationChanged;
-        ChatExplorationState.Changed += OnExplorationChanged;
-
         ApplyChatSurface();
         ApplySystemBackdrop();
-        ApplyPreviewTheme();
     }
 
     private const int DefaultChatWidth = 480;
@@ -163,39 +162,9 @@ public sealed partial class ChatWindow : WindowEx
 
     private void OnDebugOverrideChanged(object? sender, EventArgs e) => ApplyChatSurface();
 
-    private void OnExplorationChanged(object? sender, EventArgs e)
-    {
-        // Marshal back to UI thread — Changed may fire from anywhere.
-        DispatcherQueue?.TryEnqueue(() =>
-        {
-            ApplySystemBackdrop();
-            ApplyPreviewTheme();
-        });
-    }
-
-    /// <summary>
-    /// Swap <see cref="Window.SystemBackdrop"/> based on
-    /// <see cref="ChatExplorationState.BackdropMode"/>. When
-    /// <see cref="ChatExplorationState.UsesHostBackdrop"/> is true (embedded
-    /// chat scenarios), leave whatever the host already set in place.
-    /// </summary>
     private void ApplySystemBackdrop()
     {
-        if (ChatExplorationState.UsesHostBackdrop) return;
-
-        SystemBackdrop = ChatExplorationState.BackdropMode switch
-        {
-            ChatBackdropMode.Mica     => new MicaBackdrop { Kind = MicaKind.Base },
-            ChatBackdropMode.MicaAlt  => new MicaBackdrop { Kind = MicaKind.BaseAlt },
-            ChatBackdropMode.Acrylic  => new DesktopAcrylicBackdrop(),
-            _ /* Solid */             => null!,
-        };
-    }
-
-    private void ApplyPreviewTheme()
-    {
-        if (Content is FrameworkElement root)
-            root.RequestedTheme = ChatVisualResolver.ResolvePreviewTheme();
+        SystemBackdrop = new DesktopAcrylicBackdrop();
     }
 
     private void ApplyChatSurface()
@@ -224,11 +193,13 @@ public sealed partial class ChatWindow : WindowEx
         LoadingRing.Visibility = Visibility.Collapsed;
         ErrorPanel.Visibility = Visibility.Collapsed;
         TryMountFunctionalChat();
+        UpdateNativeChatSurfaceActive();
     }
 
     private void ShowWebViewSurface()
     {
         _webViewMode = true;
+        UpdateNativeChatSurfaceActive();
 
         // Tear down native chat so the WebView2 owns the row.
         DisposeFunctionalHost();
@@ -271,7 +242,7 @@ public sealed partial class ChatWindow : WindowEx
         WebView.Visibility = Visibility.Collapsed;
         PlaceholderPanel.Visibility = Visibility.Collapsed;
         ErrorPanel.Visibility = Visibility.Visible;
-        ErrorText.Text = "Unable to load chat. The gateway URL or token is not available.";
+        ErrorText.Text = LocalizationHelper.GetString("ChatWindow_UnableToLoadChatCredentials");
     }
 
     private void StopWebViewNavigation()
@@ -319,7 +290,7 @@ public sealed partial class ChatWindow : WindowEx
                 LoadingRing.Visibility = Visibility.Collapsed;
                 WebView.Visibility = Visibility.Collapsed;
                 ErrorPanel.Visibility = Visibility.Visible;
-                ErrorText.Text = "Unable to load chat. The gateway URL or token is not available.";
+                ErrorText.Text = LocalizationHelper.GetString("ChatWindow_UnableToLoadChatCredentials");
                 return;
             }
 
@@ -337,7 +308,7 @@ public sealed partial class ChatWindow : WindowEx
                 LoadingRing.Visibility = Visibility.Collapsed;
                 WebView.Visibility = Visibility.Collapsed;
                 ErrorPanel.Visibility = Visibility.Visible;
-                ErrorText.Text = $"Unable to load chat. Please try again. ({ex.Message})";
+                ErrorText.Text = LocalizationHelper.Format("ChatWindow_UnableToLoadChatRetryFormat", ex.Message);
                 Logger.Warn($"ChatWindow.RefreshCredentials navigate failed: {ex.Message}");
             }
         }
@@ -404,7 +375,7 @@ public sealed partial class ChatWindow : WindowEx
             LoadingRing.Visibility = Visibility.Collapsed;
             PlaceholderPanel.Visibility = Visibility.Collapsed;
             ErrorPanel.Visibility = Visibility.Visible;
-            ErrorText.Text = $"WebView2 failed: {ex.Message}";
+            ErrorText.Text = LocalizationHelper.Format("ChatWindow_WebViewFailedFormat", ex.Message);
         }
     }
 
@@ -433,12 +404,13 @@ public sealed partial class ChatWindow : WindowEx
     {
         var app = App.Current as App;
         var provider = app?.ChatProvider;
-        Func<string, Task>? readAloud = app is null ? null : app.SpeakChatTextAsync;
+        Func<string, Task>? readAloud = app is null ? null : ReadChatTextAloudAsync;
 
         if (_functionalHost is not null && ReferenceEquals(_mountedProvider, provider))
         {
             PlaceholderPanel.Visibility = Visibility.Collapsed;
             ChatHost.Visibility = Visibility.Visible;
+            UpdateNativeChatSurfaceActive();
             return;
         }
 
@@ -448,6 +420,7 @@ public sealed partial class ChatWindow : WindowEx
         {
             PlaceholderPanel.Visibility = Visibility.Visible;
             ChatHost.Visibility = Visibility.Collapsed;
+            UpdateNativeChatSurfaceActive();
             return;
         }
 
@@ -462,10 +435,11 @@ public sealed partial class ChatWindow : WindowEx
             onVoiceRequest: VoiceTranscribeAsync,
             onAttachClick: OnAttachClicked,
             onSettingsClick: () => appInstance?.ShowHub("voice"),
-            onSpeakerMuteChanged: muted => appInstance?.SetChatSpeakerMuted(muted),
-            initialMuted: appInstance?.Settings?.VoiceTtsEnabled == false,
+            onSpeakerMuteChanged: muted => _ = OnSpeakerMuteChangedAsync(muted),
+            initialMuted: ShouldStartSpeakerMuted(appInstance?.Settings),
             isCompact: true);
         _mountedProvider = provider;
+        UpdateNativeChatSurfaceActive();
     }
 
     private void DisposeFunctionalHost()
@@ -473,30 +447,27 @@ public sealed partial class ChatWindow : WindowEx
         var host = _functionalHost;
         _functionalHost = null;
         _mountedProvider = null;
-        // slopwatch-ignore: SW003 Cleanup is best-effort; failure cannot improve caller state and the original outcome is preserved.
-        try { host?.Dispose(); } catch { /* tear-down race — non-fatal */ }
+        UpdateNativeChatSurfaceActive();
+        try { host?.Dispose(); }
+        catch (Exception ex) { Logger.Debug($"ChatWindow: functional host dispose tear-down race: {ex.Message}"); }
     }
 
-    private void EagerlyLoadChatHistory()
+    private void SetShownNearTray(bool shown)
     {
-        var provider = (App.Current as App)?.ChatProvider;
-        if (provider is null) return;
+        _shownNearTray = shown;
+        UpdateNativeChatSurfaceActive();
+    }
 
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                // LoadAsync seeds from cached sessions; the important thing is
-                // it triggers the Changed event with the current snapshot.
-                var snap = await provider.LoadAsync();
-                // If there's a default thread, load its history so the
-                // timeline has entries to render on the very first show.
-                if (snap.DefaultThreadId is { } threadId)
-                    await provider.LoadHistoryAsync(threadId);
-            }
-            // slopwatch-ignore: SW003 UI helper action is best-effort and failure should not break the owning UI flow.
-            catch { /* best effort — the normal mount path will retry */ }
-        });
+    public void HideNearTray()
+    {
+        SetShownNearTray(false);
+        this.Hide();
+    }
+
+    private void UpdateNativeChatSurfaceActive()
+    {
+        if (App.Current is App app)
+            app.SetTrayNativeChatSurfaceActive(_shownNearTray && !_webViewMode && _functionalHost is not null);
     }
 
     private void OnAttachClicked()
@@ -512,7 +483,8 @@ public sealed partial class ChatWindow : WindowEx
             await ShowVoiceSettingsDialogAsync(
                 LocalizationHelper.GetString("ChatVoiceDialog_InputOffTitle"),
                 LocalizationHelper.GetString("ChatVoiceDialog_InputOffMessage"),
-                () => app?.ShowHub("voice"));
+                LocalizationHelper.GetString("ChatVoiceDialog_OpenPermissionsSettings"),
+                () => app?.ShowHub("permissions"));
             return null;
         }
 
@@ -523,7 +495,8 @@ public sealed partial class ChatWindow : WindowEx
             await ShowVoiceSettingsDialogAsync(
                 LocalizationHelper.GetString("ChatVoiceDialog_InputOffTitle"),
                 LocalizationHelper.GetString("ChatVoiceDialog_InputOffMessage"),
-                () => app.ShowHub("voice"));
+                LocalizationHelper.GetString("ChatVoiceDialog_OpenPermissionsSettings"),
+                () => app.ShowHub("permissions"));
             return null;
         }
 
@@ -533,6 +506,7 @@ public sealed partial class ChatWindow : WindowEx
             await ShowVoiceSettingsDialogAsync(
                 LocalizationHelper.GetString("ChatVoiceDialog_ModelRequiredTitle"),
                 LocalizationHelper.GetString("ChatVoiceDialog_ModelRequiredMessage"),
+                LocalizationHelper.GetString("ChatVoiceDialog_OpenVoiceSettings"),
                 () => app.ShowHub("voice"));
             return null;
         }
@@ -562,8 +536,84 @@ public sealed partial class ChatWindow : WindowEx
         }
     }
 
-    private async Task ShowVoiceSettingsDialogAsync(string title, string message, Action openVoiceSettings)
+    private async Task ReadChatTextAloudAsync(string text)
     {
+        if (!await EnsureTtsReadyForChatAsync())
+            return;
+
+        if (App.Current is App app)
+            await app.SpeakChatTextAsync(text);
+    }
+
+    private async Task OnSpeakerMuteChangedAsync(bool muted)
+    {
+        if (!await _speakerMuteGate.WaitAsync(0))
+            return;
+
+        try
+        {
+            if (App.Current is not App app)
+                return;
+
+            if (muted)
+            {
+                app.SetChatSpeakerMuted(true);
+                return;
+            }
+
+            if (IsTtsReadyForChat(app.Settings))
+            {
+                app.SetChatSpeakerMuted(false);
+                return;
+            }
+
+            app.SetChatSpeakerMuted(true);
+            _functionalHost?.SetSpeakerMuted(true);
+            await ShowTtsUnavailableDialogAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"Speaker mute change failed: {ex.Message}");
+        }
+        finally
+        {
+            _speakerMuteGate.Release();
+        }
+    }
+
+    private async Task<bool> EnsureTtsReadyForChatAsync()
+    {
+        if (App.Current is App app && IsTtsReadyForChat(app.Settings))
+            return true;
+
+        await ShowTtsUnavailableDialogAsync();
+        return false;
+    }
+
+    private static bool IsTtsReadyForChat(SettingsManager? settings)
+    {
+        return SpeechSetupReadiness.IsChatTtsPlaybackReady(settings);
+    }
+
+    private async Task ShowTtsUnavailableDialogAsync()
+    {
+        await ShowVoiceSettingsDialogAsync(
+            LocalizationHelper.GetString("ChatVoiceDialog_OutputOffTitle"),
+            LocalizationHelper.GetString("ChatVoiceDialog_OutputOffMessage"),
+            LocalizationHelper.GetString("ChatVoiceDialog_OpenPermissionsSettings"),
+            () => (App.Current as App)?.ShowHub("permissions"));
+    }
+
+    private static bool ShouldStartSpeakerMuted(SettingsManager? settings)
+    {
+        return !SpeechSetupReadiness.IsAutomaticChatTtsEnabled(settings);
+    }
+
+    private async Task ShowVoiceSettingsDialogAsync(string title, string message, string primaryButtonText, Action openSettings)
+    {
+        if (Interlocked.Exchange(ref _voiceSettingsDialogOpen, 1) == 1)
+            return;
+
         var tcs = new TaskCompletionSource();
         if (DispatcherQueue is null || !DispatcherQueue.TryEnqueue(async () =>
         {
@@ -573,7 +623,7 @@ public sealed partial class ChatWindow : WindowEx
                 {
                     Title = title,
                     Content = message,
-                    PrimaryButtonText = LocalizationHelper.GetString("ChatVoiceDialog_OpenVoiceSettings"),
+                    PrimaryButtonText = primaryButtonText,
                     CloseButtonText = LocalizationHelper.GetString("ChatVoiceDialog_Dismiss"),
                     DefaultButton = ContentDialogButton.Primary,
                     XamlRoot = Content?.XamlRoot
@@ -594,7 +644,7 @@ public sealed partial class ChatWindow : WindowEx
                 };
 
                 if (await dialog.ShowAsync() == ContentDialogResult.Primary)
-                    openVoiceSettings();
+                    openSettings();
             }
             catch (InvalidOperationException ex)
             {
@@ -606,10 +656,18 @@ public sealed partial class ChatWindow : WindowEx
             }
         }))
         {
+            Interlocked.Exchange(ref _voiceSettingsDialogOpen, 0);
             return;
         }
 
-        await tcs.Task;
+        try
+        {
+            await tcs.Task;
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _voiceSettingsDialogOpen, 0);
+        }
     }
 
     private async Task PickAndAttachFileAsync()
@@ -622,13 +680,16 @@ public sealed partial class ChatWindow : WindowEx
             ChatWindowPinState.IsPinned = true;
 
             var hwnd = WinRT.Interop.WindowNative.GetWindowHandle((Window)this);
-            var path = await Win32FilePickerHelper.PickSingleFileAsync(hwnd, "Attach file");
-            if (path is null) return;
-            Logger.Info($"[ChatWindow] File selected: {path}");
+            var paths = await Win32FilePickerHelper.PickMultipleFilesAsync(hwnd, "Attach files");
+            if (paths.Count == 0) return;
 
-            Logger.Info($"[ChatWindow] File selected: {path}");
-            var attachment = await ChatAttachment.FromFileAsync(path);
-            _functionalHost?.AttachFile(attachment);
+            var attachments = new List<ChatAttachment>(paths.Count);
+            foreach (var path in paths)
+            {
+                Logger.Info($"[ChatWindow] File selected: {path}");
+                attachments.Add(await ChatAttachment.FromFileAsync(path));
+            }
+            _functionalHost?.AttachFiles(attachments);
         }
         catch (InvalidOperationException ex)
         {
@@ -659,8 +720,7 @@ public sealed partial class ChatWindow : WindowEx
             };
             await dialog.ShowAsync();
         }
-        // slopwatch-ignore: SW003 UI helper action is best-effort and failure should not break the owning UI flow.
-        catch { /* dialog display failed, already logged */ }
+        catch (Exception ex) { Logger.Debug($"ChatWindow: dialog display failed (already logged upstream): {ex.Message}"); }
     }
 
     private bool _backdropAppliedOnce;
@@ -693,7 +753,7 @@ public sealed partial class ChatWindow : WindowEx
         // Pinned via Chat exploration panel — keep open so the user can
         // preview backdrop/composer changes side-by-side.
         if (ChatWindowPinState.IsPinned) return;
-        this.Hide();
+        HideNearTray();
     }
 
     private static Microsoft.UI.Xaml.Controls.TextBox? FindFirstFocusableTextBox(DependencyObject root)
@@ -711,7 +771,7 @@ public sealed partial class ChatWindow : WindowEx
 
     private void OnCloseClick(object sender, RoutedEventArgs e)
     {
-        this.Hide();
+        HideNearTray();
     }
 
     /// <summary>Position near the system tray and show with animation.</summary>
@@ -741,13 +801,14 @@ public sealed partial class ChatWindow : WindowEx
         const uint SWP_NOACTIVATE = 0x0010;
         SetWindowPos(hwnd, IntPtr.Zero, x, y, panelWPx, panelHPx, SWP_NOZORDER | SWP_NOACTIVATE);
 
+        // Mark active before remount/show work below can pump messages; otherwise
+        // an approval arriving during this narrow window may choose native fallback
+        // even though the tray chat is already in the process of opening.
+        SetShownNearTray(true);
+
         // Provider may have arrived after construction — re-apply surface so
         // a native-mode window swaps placeholder → live tree on first show.
         ApplyChatSurface();
-
-        // Eagerly load chat history so the tray popup renders messages
-        // immediately instead of showing the zero-state while history loads.
-        EagerlyLoadChatHistory();
 
         this.Show();
         SetForegroundWindow(hwnd);
@@ -761,7 +822,7 @@ public sealed partial class ChatWindow : WindowEx
     {
         // Intercept close → hide instead (keeps native chat state warm).
         args.Handled = true;
-        this.Hide();
+        HideNearTray();
     }
 
     /// <summary>Actually close and dispose (called on app shutdown).</summary>
@@ -775,8 +836,8 @@ public sealed partial class ChatWindow : WindowEx
             app.SpeakerMuteChanged -= OnSpeakerMuteChanged;
         }
         OpenClawTray.Chat.DebugChatSurfaceOverrides.Changed -= OnDebugOverrideChanged;
-        ChatExplorationState.Changed -= OnExplorationChanged;
         IsClosed = true;
+        SetShownNearTray(false);
         DisposeFunctionalHost();
         Close();
     }
@@ -788,10 +849,12 @@ public sealed partial class ChatWindow : WindowEx
         try
         {
             (App.Current as App)?.ShowHub("chat");
-            this.Hide();
+            HideNearTray();
         }
-        // slopwatch-ignore: SW003 UI helper action is best-effort and failure should not break the owning UI flow.
-        catch { }
+        catch (Exception ex)
+        {
+            Logger.Warn($"ChatWindow: Failed to pop out chat to hub: {ex.Message}");
+        }
     }
 
     private void RequestChatInputFocus()

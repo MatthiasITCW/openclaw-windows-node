@@ -3,9 +3,10 @@ using OpenClaw.Shared;
 using OpenClawTray.Helpers;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
 using OpenClawTray.FunctionalUI;
 using OpenClawTray.FunctionalUI.Core;
-using OpenClawTray.Chat.Explorations;
+using OpenClawTray.Services;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -23,6 +24,26 @@ namespace OpenClawTray.Chat;
 /// </summary>
 public sealed class OpenClawChatRoot : Component
 {
+    private static bool s_showToolCalls = true;
+    private static int s_toolCallsCollapseVersion;
+    private static event EventHandler? ToolCallsVisibilityChanged;
+
+    /// <summary>
+    /// Sets whether tool-call / usage chips are shown in the chat timeline. This
+    /// is the single writer for the tool-call visibility state now that the
+    /// toggle lives in the Settings "Chat" section (previously a composer
+    /// toggle). Bumps the collapse version when hiding so already-expanded tool
+    /// chips collapse, updates the shared static, and notifies any mounted
+    /// <see cref="OpenClawChatRoot"/> so its timeline re-renders.
+    /// </summary>
+    public static void SetToolCallsVisible(bool visible)
+    {
+        if (!visible && s_showToolCalls)
+            s_toolCallsCollapseVersion++;
+        s_showToolCalls = visible;
+        ToolCallsVisibilityChanged?.Invoke(null, EventArgs.Empty);
+    }
+
     private readonly IChatDataProvider _provider;
     private readonly string? _initialThreadId;
     private readonly Func<string, Task>? _onReadAloud;
@@ -31,12 +52,15 @@ public sealed class OpenClawChatRoot : Component
     private readonly Action? _onAttachClick;
     private readonly Action? _onSettingsClick;
     private readonly Action<bool>? _onSpeakerMuteChanged;
+    private readonly Func<string, string?, Task<bool>>? _confirmResetAsync;
     private readonly bool _initialMuted;
     private readonly bool _isCompact;
-    private Action<ChatAttachment>? _onFileAttached;
+    private Action<IReadOnlyList<ChatAttachment>>? _onFilesAttached;
     private Action<string?>? _setVoiceTranscript;
     private Action<float>? _setVoiceAudioLevel;
     private Action? _scrollToBottomToken;
+    private Action<string>? _selectThread;
+    private string? _pendingSelectedThreadId;
     /// <summary>
     /// Programmatically start voice recording from outside the composer.
     /// Set by the composer during render.
@@ -51,12 +75,12 @@ public sealed class OpenClawChatRoot : Component
 
     /// <summary>
     /// Callback invoked by the host window/page after a file is selected.
-    /// Sets the pending attachment and triggers a re-render.
+    /// Appends pending attachments and triggers a re-render.
     /// </summary>
-    public Action<ChatAttachment>? OnFileAttached
+    public Action<IReadOnlyList<ChatAttachment>>? OnFilesAttached
     {
-        get => _onFileAttached;
-        set => _onFileAttached = value;
+        get => _onFilesAttached;
+        set => _onFilesAttached = value;
     }
 
     /// <summary>
@@ -87,6 +111,7 @@ public sealed class OpenClawChatRoot : Component
         Action? onAttachClick = null,
         Action? onSettingsClick = null,
         Action<bool>? onSpeakerMuteChanged = null,
+        Func<string, string?, Task<bool>>? confirmResetAsync = null,
         bool initialMuted = false,
         bool isCompact = false)
     {
@@ -98,64 +123,73 @@ public sealed class OpenClawChatRoot : Component
         _onAttachClick = onAttachClick;
         _onSettingsClick = onSettingsClick;
         _onSpeakerMuteChanged = onSpeakerMuteChanged;
+        _confirmResetAsync = confirmResetAsync;
         _initialMuted = initialMuted;
         _isCompact = isCompact;
     }
 
     public override Element Render()
     {
-        // Subscribe to ChatExplorationState — without this, FunctionalUI may skip
-        // re-rendering child Components (Composer/Timeline) because the props
-        // they receive don't change. Bumping this Root's state invalidates
-        // the whole tree so toggles always show in the live preview.
-        var explorationRev = UseState(0, threadSafe: true);
-        var explorationRevRef = UseRef(0);
-        var pendingAttachment = UseState<ChatAttachment?>(null, threadSafe: true);
+        var pendingAttachments = UseState<IReadOnlyList<ChatAttachment>>(Array.Empty<ChatAttachment>(), threadSafe: true);
+        var pendingAttachmentsRef = UseRef<IReadOnlyList<ChatAttachment>>(pendingAttachments.Value);
+        pendingAttachmentsRef.Current = pendingAttachments.Value;
         var speakerMuted = UseState(_initialMuted, threadSafe: true);
         var voiceTranscript = UseState<string?>(null, threadSafe: true);
         var voiceAudioLevel = UseState(0f, threadSafe: true);
         var scrollToBottomToken = UseState(0, threadSafe: true);
+        var showToolCalls = UseState(s_showToolCalls, threadSafe: true);
+        var toolCallsCollapseVersion = UseState(s_toolCallsCollapseVersion, threadSafe: true);
+        var chatSurfaceHeight = UseState<double?>(null, threadSafe: true);
         // Guards a duplicate suggestion-button click before the snapshot
         // reflects the optimistic local user entry (which then ordinarily
         // hides the zero-state buttons via the isEmptyConversation check).
         // Cleared automatically when the next snapshot arrives.
         var firstSendInFlight = UseState(false, threadSafe: true);
 
-        // Wire the OnFileAttached callback so the host window/page can set the
-        // pending attachment after the file picker completes.
-        _onFileAttached = att => pendingAttachment.Set(att);
+        void SetPendingAttachments(IReadOnlyList<ChatAttachment> attachments)
+        {
+            pendingAttachmentsRef.Current = attachments;
+            pendingAttachments.Set(attachments);
+        }
+
+        // Wire the attachment callback so the host window/page can append
+        // pending attachments after the file picker completes.
+        _onFilesAttached = attachments =>
+        {
+            if (attachments.Count == 0)
+                return;
+
+            SetPendingAttachments(pendingAttachmentsRef.Current.Concat(attachments).ToArray());
+        };
         _setVoiceTranscript = voiceTranscript.Set;
         _setVoiceAudioLevel = voiceAudioLevel.Set;
         _scrollToBottomToken = () => scrollToBottomToken.Set(scrollToBottomToken.Value + 1);
         SetSpeakerMuted = muted => speakerMuted.Set(muted);
-        UseEffect((Func<Action>)(() =>
-        {
-            // Defer the re-render via DispatcherQueue. When the user picks an
-            // item from a ComboBox in the explorations panel, SelectionChanged
-            // fires synchronously; if we re-render this whole tree inline the
-            // ComboBox's own post-selection bookkeeping races with our
-            // reconciliation and the dropdown can become unresponsive on the
-            // next click. Posting back to the dispatcher lets the ComboBox
-            // finish its event handling before we reshape the tree.
-            var dq = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
-            EventHandler h = (_, _) =>
-            {
-                explorationRevRef.Current++;
-                if (dq is not null)
-                    dq.TryEnqueue(() => explorationRev.Set(explorationRevRef.Current));
-                else
-                    explorationRev.Set(explorationRevRef.Current);
-            };
-            ChatExplorationState.Changed += h;
-            return () => ChatExplorationState.Changed -= h;
-        }));
-
         var snapshotState = UseState<ChatDataSnapshot?>(null, threadSafe: true);
-        var selectedIdState = UseState<string?>(_initialThreadId, threadSafe: true);
+        var initialSelectedId = _initialThreadId ?? (_provider as OpenClawChatDataProvider)?.CachedLastChatState?.DefaultThreadId;
+        var selectedIdState = UseState<string?>(initialSelectedId, threadSafe: true);
         // UseRef tracks the selected ID across renders so that closures captured
         // inside UseEffect always read the latest value (UseState structs go stale).
-        var selectedIdRef = UseRef<string?>(_initialThreadId);
+        var selectedIdRef = UseRef<string?>(initialSelectedId);
         selectedIdRef.Current = selectedIdState.Value;
+        _selectThread = threadId =>
+        {
+            _pendingSelectedThreadId = threadId;
+            selectedIdState.Set(threadId);
+            selectedIdRef.Current = threadId;
+        };
+
+        UseEffect((Func<Action>)(() =>
+        {
+            EventHandler onToolCallsVisibilityChanged = (_, _) =>
+            {
+                showToolCalls.Set(s_showToolCalls);
+                toolCallsCollapseVersion.Set(s_toolCallsCollapseVersion);
+            };
+
+            ToolCallsVisibilityChanged += onToolCallsVisibilityChanged;
+            return () => ToolCallsVisibilityChanged -= onToolCallsVisibilityChanged;
+        }));
 
         UseEffect((Func<Action>)(() =>
         {
@@ -193,31 +227,24 @@ public sealed class OpenClawChatRoot : Component
         var selectedIdForMetadata = selectedIdState.Value ?? snapshot?.DefaultThreadId;
         var entryMetaSnapshot = UseMemo<IReadOnlyDictionary<string, ChatEntryMetadata>?>(() =>
         {
-            if (selectedIdForMetadata is null || _provider is not OpenClawChatDataProvider nativeForMeta)
+            if (selectedIdForMetadata is null)
                 return null;
 
-            return nativeForMeta.GetEntryMetadata(selectedIdForMetadata);
+            return _provider switch
+            {
+                OpenClawChatDataProvider nativeForMeta => nativeForMeta.GetEntryMetadata(selectedIdForMetadata),
+                _ => null
+            };
         }, selectedIdForMetadata ?? string.Empty, snapshot is null ? string.Empty : snapshot);
-
-        // Preview override (G) — only honored when the chat is bound to a
-        // fake provider (i.e. the explorations window). Real production
-        // chat surfaces ignore PreviewState so a stray Loading/EmptyZero
-        // setting in the explorations panel can't black out the real UI.
-        var previewState = _provider is FakeChatDataProvider
-            ? ChatExplorationState.PreviewState
-            : ChatPreviewState.Live;
 
         Element BuildLoadingElement()
         {
-            var loadingBg = ChatExplorationState.BackdropMode == ChatBackdropMode.Solid
-                ? (Microsoft.UI.Xaml.Media.Brush)Microsoft.UI.Xaml.Application.Current.Resources["LayerFillColorDefaultBrush"]
-                : (Microsoft.UI.Xaml.Media.Brush)new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.Transparent);
             return Border(
                 VStack(8,
                     ProgressRing().Size(28, 28).HAlign(HorizontalAlignment.Center),
                     Caption(LocalizationHelper.GetString("Chat_Root_ConnectingToGateway")).Foreground(SecondaryText).HAlign(HorizontalAlignment.Center)
                 ).VAlign(VerticalAlignment.Center).HAlign(HorizontalAlignment.Center)
-            ).Background(loadingBg);
+            ).Background(new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.Transparent));
         }
 
         if (snapshot is null)
@@ -229,6 +256,24 @@ public sealed class OpenClawChatRoot : Component
         var selectedThread = selectedId is { } id
             ? Array.Find(snapshot.Threads, t => t.Id == id)
             : null;
+        if (selectedThread is not null &&
+            string.Equals(_pendingSelectedThreadId, selectedThread.Id, StringComparison.Ordinal))
+        {
+            _pendingSelectedThreadId = null;
+        }
+        if (selectedThread is null
+            && selectedIdState.Value is { } staleSelectedId
+            && snapshot.DefaultThreadId is { } fallbackThreadId
+            && ChatLifecycleSelectionPolicy.ShouldFallback(
+                staleSelectedId,
+                _pendingSelectedThreadId,
+                fallbackThreadId))
+        {
+            selectedId = fallbackThreadId;
+            selectedThread = Array.Find(snapshot.Threads, t => t.Id == fallbackThreadId);
+            selectedIdState.Set(fallbackThreadId);
+            selectedIdRef.Current = fallbackThreadId;
+        }
 
         // If no real session is selected yet but the provider exposes a ready
         // compose target (gateway connected + handshake snapshot resolved),
@@ -239,9 +284,12 @@ public sealed class OpenClawChatRoot : Component
         // same Id and `selectedThread` resolves to it on the next render
         // without any re-keying or migration.
         ChatThread? composeOnlyThread = null;
-        if (selectedThread is null
-            && snapshot.ComposeTarget.IsReady
-            && snapshot.ComposeTarget.SessionKey is { } composeKey)
+        var pendingComposeKey = ChatLifecycleSelectionPolicy.RetainPendingForSelection(
+            _pendingSelectedThreadId,
+            selectedIdState.Value);
+        var composeKey = pendingComposeKey ??
+            (snapshot.ComposeTarget.IsReady ? snapshot.ComposeTarget.SessionKey : null);
+        if (selectedThread is null && composeKey is not null)
         {
             // Use last-known state from the data provider so the composer shows
             // the previous session title/model while reconnecting instead of
@@ -250,8 +298,12 @@ public sealed class OpenClawChatRoot : Component
             composeOnlyThread = new ChatThread
             {
                 Id = composeKey,
-                Title = lastState?.ThreadTitle ?? "OpenClaw Windows Tray",
+                AgentId = snapshot.ComposeTarget.AgentId,
+                Title = _pendingSelectedThreadId is not null
+                    ? LocalizationHelper.GetString("Chat_PendingNewSessionTitle")
+                    : lastState?.ThreadTitle ?? "OpenClaw Windows Tray",
                 Model = lastState?.Model,
+                ModelProvider = lastState?.ModelProvider,
                 Status = ChatThreadStatus.Running,
                 Activity = ChatActivity.Idle,
             };
@@ -262,11 +314,18 @@ public sealed class OpenClawChatRoot : Component
         // exists yet so the zero-state still shows; `composeOnlyThread` exists
         // so the composer can be wired up.
         var effectiveThread = selectedThread ?? composeOnlyThread;
+        var connectedRaw = snapshot.ConnectionStatus;
+        var hostConnected = connectedRaw is not null
+            && connectedRaw.StartsWith("Connected", StringComparison.OrdinalIgnoreCase);
 
         // Lazy-load history the first time a real (materialized) thread is
         // selected. Don't fire for the compose-only synthetic thread — it
-        // doesn't exist server-side yet, so chat.history would 404.
-        if (selectedThread is not null && _provider is OpenClawChatDataProvider native)
+        // doesn't exist server-side yet, so chat.history would 404. A
+        // disconnected render must not replace a request canceled by the
+        // connection-generation boundary.
+        if (hostConnected &&
+            selectedThread is not null &&
+            _provider is OpenClawChatDataProvider native)
         {
             var threadId = selectedThread.Id;
             RunFireAndForget(ct => native.LoadHistoryAsync(threadId, force: false, ct));
@@ -277,11 +336,24 @@ public sealed class OpenClawChatRoot : Component
         var timeline = effectiveThread is not null && snapshot.Timelines.TryGetValue(effectiveThread.Id, out var tl)
             ? tl
             : ChatTimelineState.Initial();
+        var timelineGeneration = 0L;
+        if (effectiveThread is not null
+            && snapshot.TimelineGenerations is { } generations
+            && generations.TryGetValue(effectiveThread.Id, out var generation))
+        {
+            timelineGeneration = generation;
+        }
+        var queuedMessages = Array.Empty<ChatQueuedMessage>();
+        if (effectiveThread is not null
+            && snapshot.QueuedMessagesByThread is { } queuedByThread
+            && queuedByThread.TryGetValue(effectiveThread.Id, out var queuedForThread))
+        {
+            queuedMessages = queuedForThread.ToArray();
+        }
+        var hasPendingQueuedSend = queuedMessages.Any(message =>
+            message.SendState is ChatQueuedMessageSendState.Queued or ChatQueuedMessageSendState.Sending);
 
         var entries = (IReadOnlyList<ChatTimelineItem>)timeline.Entries;
-        var connectedRaw = snapshot.ConnectionStatus;
-        var hostConnected = connectedRaw is not null
-            && connectedRaw.StartsWith("Connected", StringComparison.OrdinalIgnoreCase);
         var connState = (connectedRaw is not null && connectedRaw.StartsWith("Incompatible", StringComparison.OrdinalIgnoreCase))
             ? "incompatible-gateway"
             : hostConnected ? "connected"
@@ -298,6 +370,10 @@ public sealed class OpenClawChatRoot : Component
         // Keep the same dictionary instance across composer-only renders so the
         // timeline can skip re-rendering while the user types.
         var entryMeta = effectiveThread is null ? null : entryMetaSnapshot;
+        var usageSummary = showToolCalls.Value
+            ? (ChatUsageFormatter.Format(entries, entryMeta)
+                ?? ChatUsageFormatter.Format(effectiveThread))
+            : null;
 
         // The gateway's default agent identity is "Field" (matches the web UI footer),
         // but for the WinUI tray we surface a generic "Assistant" label so the
@@ -326,88 +402,8 @@ public sealed class OpenClawChatRoot : Component
         }
         var showThinking = timeline.TurnActive && !currentTurnHasAssistant;
 
-        // Apply preview-state overrides for the four data-dependent states.
-        // These mutate locals only — real provider data on disk is untouched.
-        // Note: Loading is also handled here (rather than via early return)
-        // so that the OUTER Grid layout (header / divider / body / composer
-        // rows) stays structurally identical across all preview states. A
-        // structurally stable tree keeps FunctionalUI's reconciliation cheap and
-        // avoids tearing down the timeline + composer subtrees, which was
-        // observed to race with subsequent ComboBox SelectionChanged events
-        // in the explorations panel and "lock" the dropdown after the first
-        // pick. Only the body cell content (and composer visibility) swaps.
         var pendingPermissionOverride = timeline.PendingPermission;
         var turnActiveOverride = timeline.TurnActive;
-        Element? bodyOverride = null;
-        var suppressComposer = false;
-        switch (previewState)
-        {
-            case ChatPreviewState.Loading:
-                bodyOverride = BuildLoadingElement();
-                suppressComposer = true;
-                break;
-
-            case ChatPreviewState.Empty:
-                // Unified empty state: synthesize a thread + clear entries so
-                // the new welcome zero-state renders. (Collapses what used to
-                // be EmptyZero + EmptyThread — the user sees the same UI for
-                // both because the distinction is backend-only.)
-                selectedThread ??= SynthesizePreviewThread(snapshot);
-                entries = Array.Empty<ChatTimelineItem>();
-                showThinking = false;
-                pendingPermissionOverride = null;
-                turnActiveOverride = false;
-                break;
-
-            case ChatPreviewState.Thinking:
-                selectedThread ??= SynthesizePreviewThread(snapshot);
-                if (entries.Count == 0
-                    || entries[entries.Count - 1].Kind == ChatTimelineItemKind.Assistant)
-                {
-                    entries = new[]
-                    {
-                        new ChatTimelineItem("preview-u1", ChatTimelineItemKind.User,
-                            "What's the weather like in Seattle today?")
-                    };
-                }
-                showThinking = true;
-                turnActiveOverride = true;
-                pendingPermissionOverride = null;
-                break;
-
-            case ChatPreviewState.PendingPermission:
-                selectedThread ??= SynthesizePreviewThread(snapshot);
-                pendingPermissionOverride = new ChatPermissionRequest(
-                    RequestId: "preview-perm",
-                    PermissionKind: "execute",
-                    ToolName: "shell",
-                    Detail: "Run `git status` in the current repo.");
-                // Approval UI now lives in the timeline (not a composer
-                // banner), so the preview state needs a synthetic
-                // PermissionRequest entry to make the inline bubble visible.
-                entries = new[]
-                {
-                    new ChatTimelineItem(
-                        "preview-perm-entry",
-                        ChatTimelineItemKind.PermissionRequest,
-                        "Run `git status` in the current repo.",
-                        ToolName: "shell",
-                        IntentSummary: "execute",
-                        PermissionRequestId: "preview-perm",
-                        PermissionDecision: ChatPermissionDecision.Pending)
-                };
-                break;
-
-            case ChatPreviewState.Reconnecting:
-                // Force the skeleton-timeline body that the real chat
-                // surface renders when effectiveThread is null or history
-                // hasn't loaded. Use the same body override path so the
-                // rest of the layout (composer suppressed) matches
-                // production.
-                bodyOverride = RenderSkeletonTimeline();
-                suppressComposer = true;
-                break;
-        }
 
         // Production zero-state: triggered when a thread is selected
         // but has no messages yet (true "empty conversation"). We only
@@ -423,9 +419,7 @@ public sealed class OpenClawChatRoot : Component
         // Note: `pendingPermissionOverride is null` is now redundant for
         // live data — the reducer's ApplyPermissionRequest pushes a
         // PermissionRequest timeline entry whenever PendingPermission is
-        // set, so `entries.Count > 0` already covers that case. The guard
-        // remains as a defensive check for preview/explorations paths
-        // that may seed PendingPermission without populating entries.
+        // set, so `entries.Count > 0` already covers that case.
         var isEmptyConversation = entries.Count == 0
             && !showThinking
             && pendingPermissionOverride is null;
@@ -490,8 +484,11 @@ public sealed class OpenClawChatRoot : Component
                     if (cancelled) return;
                     dq?.TryEnqueue(() => { if (!cancelled) welcomeSettledState.Set(true); });
                 }
-                // slopwatch-ignore: SW003 Cleanup is best-effort; failure cannot improve caller state and the original outcome is preserved.
-                catch { }
+                catch (OperationCanceledException)
+                {
+                    // Cancellation is expected when the welcome eligibility signal changes.
+                }
+                catch (Exception ex) { OpenClawTray.Services.Logger.Debug($"ChatRoot: welcome settle race: {ex.Message}"); }
             });
             return () => { cancelled = true; };
         }),
@@ -505,15 +502,7 @@ public sealed class OpenClawChatRoot : Component
 
         Element body;
         var bodyIsSkeleton = false;
-        if (bodyOverride is not null)
-        {
-            body = bodyOverride;
-            // Exploration preview drives bodyOverride for ChatPreviewState.Reconnecting
-            // by passing RenderSkeletonTimeline() in; piggy-back on the suppressed
-            // composer flag so the preview also shows the skeleton composer.
-            if (previewState == ChatPreviewState.Reconnecting) bodyIsSkeleton = true;
-        }
-        else if (effectiveThread is null)
+        if (effectiveThread is null)
         {
             // Pre-connect window: no real session and no compose target
             // ready yet. Skip the welcome zero-state so returning users
@@ -541,7 +530,7 @@ public sealed class OpenClawChatRoot : Component
                     if (effectiveThread is { } t)
                     {
                         firstSendInFlight.Set(true);
-                        OnSend(t.Id, suggestion, null);
+                        ObserveFireAndForget(SendSuggestionAsync(t.Id, t.Title, suggestion));
                     }
                 }, suggestionsDisabled: firstSendInFlight.Value);
         }
@@ -553,58 +542,54 @@ public sealed class OpenClawChatRoot : Component
                 HasMoreHistory: false,
                 OnLoadMoreHistory: null,
                 EntryMetadata: entryMeta,
+                TimelineGeneration: timelineGeneration,
                 UserSenderLabel: "OpenClaw Windows Tray",
                 AssistantSenderLabel: assistantSenderLabel,
                 DefaultModel: effectiveThread.Model,
+                DefaultUsageSummary: usageSummary,
                 ShowThinkingIndicator: showThinking,
-                EnableExplorationControls: _provider is FakeChatDataProvider,
+                ShowToolCalls: showToolCalls.Value,
+                ToolCallsCollapseVersion: toolCallsCollapseVersion.Value,
                 OnReadAloud: _onReadAloud is not null
                     ? (text => _onReadAloud(text))
                     : null,
                 OnStopSpeaking: _onStopSpeaking,
                 ScrollToBottomToken: scrollToBottomToken.Value,
-                OnPermissionResponse: (rid, allow) => OnPermission(effectiveThread.Id!, rid, allow)));
+                OnPermissionResponse: (rid, action) => OnPermission(effectiveThread.Id!, rid, action)));
         }
 
-        // Session list for the composer dropdown — grouped by agent, keyed by
-        // ID so every session gets its own entry regardless of display name.
-        // Exclude cron sessions which are automated/background.
-        var channelGroups = snapshot.Threads
+        // Session list for the composer dropdown — grouped by the Gateway's
+        // agent presentation metadata. Background sessions stay hidden unless
+        // the user explicitly navigated to one, in which case it remains usable.
+        // Exclude ended sessions (completed/failed/killed/timeout) from the picker.
+        var channelGroups = SessionVisibilityFilter.VisibleChatPickerThreads(snapshot.Threads)
             .Where(t => !string.IsNullOrEmpty(t.Title)
-                     && !t.Id.Contains(":cron:", StringComparison.Ordinal))
-            .GroupBy(t =>
-            {
-                // Parse agent ID from key like "agent:{agentId}:{slot}"
-                var parts = (t.Id ?? "").Split(':');
-                return parts.Length >= 3 && parts[0] == "agent" ? parts[1] : "other";
-            })
+                     && t.IsVisibleInSessionPicker(effectiveThread?.Id))
+            .GroupBy(t => string.IsNullOrWhiteSpace(t.AgentId) ? "other" : t.AgentId!)
             // "main" first (sort key 0), then alphabetical
             .OrderBy(g => g.Key.Equals("main", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
             .ThenBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
             .Select(g => new ChannelGroup(
                 AgentLabel: g.Key.Length > 0 ? char.ToUpperInvariant(g.Key[0]) + g.Key[1..] : "Unknown",
-                Sessions: g.Select(t => (Id: t.Id, Title: t.Title!)).ToArray()))
+                Sessions: g.Select(t => (Id: t.Id, Title: t.Title!, Model: t.Model, ModelProvider: t.ModelProvider)).ToArray()))
             .ToArray();
 
         // If the compose-only synthetic thread isn't represented in any group
         // (e.g. fresh install: the gateway has no real sessions yet), inject a
         // single-entry "Main" group so the composer's channel combo isn't blank.
         //
-        // Thread-id format (see OpenClawChatDataProvider): the canonical key
-        // is ``agent:<agentId>:<slot>`` (e.g. ``agent:main:default``). The
-        // first segment is always literal ``agent``; the second is the
-        // agent identifier we use to label the channel group; the third is
-        // the slot/session-instance within that agent. When the key
-        // doesn't match this layout we fall back to a generic "Main"
-        // label rather than mis-parsing some other id shape.
-        if (effectiveThread is not null && !ChannelGroupsContain(channelGroups, effectiveThread.Id))
+        // Keep routing ids opaque here too. The provider carries the Gateway's
+        // agent identity separately, including for compose-only threads.
+        // Don't inject ended sessions into the synthetic group.
+        if (effectiveThread is not null
+            && SessionVisibilityFilter.IsVisibleInChatPicker(effectiveThread)
+            && !ChannelGroupsContain(channelGroups, effectiveThread.Id))
         {
-            var parts = (effectiveThread.Id ?? "").Split(':');
-            var agentId = parts.Length >= 3 && parts[0] == "agent" ? parts[1] : "main";
+            var agentId = string.IsNullOrWhiteSpace(effectiveThread.AgentId) ? "main" : effectiveThread.AgentId!;
             var agentLabel = agentId.Length > 0 ? char.ToUpperInvariant(agentId[0]) + agentId[1..] : "Main";
             var syntheticGroup = new ChannelGroup(
                 AgentLabel: agentLabel,
-                Sessions: new[] { (Id: effectiveThread.Id!, Title: effectiveThread.Title ?? "OpenClaw Windows Tray") });
+                Sessions: new[] { (Id: effectiveThread.Id!, Title: effectiveThread.Title ?? "OpenClaw Windows Tray", Model: effectiveThread.Model, ModelProvider: effectiveThread.ModelProvider) });
 
             var augmented = new ChannelGroup[channelGroups.Length + 1];
             augmented[0] = syntheticGroup;
@@ -612,34 +597,55 @@ public sealed class OpenClawChatRoot : Component
             channelGroups = augmented;
         }
 
-        Element composer = (effectiveThread is not null && !suppressComposer)
+        Element composer = effectiveThread is { } composerThread
             ? Component<OpenClawComposer, OpenClawComposerProps>(new(
                 ConnectionState: connState,
                 TurnActive: turnActiveOverride,
-                ChannelLabel: effectiveThread.Title ?? "OpenClaw Windows Tray",
-                ChannelId: effectiveThread.Id!,
+                ChannelLabel: composerThread.Title ?? "OpenClaw Windows Tray",
+                ChannelId: composerThread.Id!,
                 AvailableChannels: channelGroups,
                 AvailableModels: snapshot.AvailableModels,
-                CurrentModel: effectiveThread.Model,
-                CurrentThinkingLevel: effectiveThread.ThinkingLevel,
-                OnSend: (msg, att) =>
+                CurrentModel: composerThread.Model,
+                CurrentModelProvider: composerThread.ModelProvider,
+                CurrentThinkingLevel: composerThread.ThinkingLevel,
+                MessageOptionsDisabled: turnActiveOverride || hasPendingQueuedSend,
+                ModelChoices: snapshot.ModelChoices,
+                OnSend: async (msg, attachments) =>
                 {
-                    pendingAttachment.Set(null);
-                    OnSend(effectiveThread.Id!, msg, att);
+                    var accepted = await OnSend(
+                        composerThread.Id!,
+                        composerThread.Title,
+                        msg,
+                        attachments);
+                    if (accepted)
+                    {
+                        SetPendingAttachments(ChatComposerSubmissionPolicy.RemoveSubmittedAttachments(
+                            pendingAttachmentsRef.Current,
+                            attachments));
+                    }
+                    return accepted;
                 },
-                OnStop: () => OnStop(effectiveThread.Id!),
+                OnStop: () => OnStop(composerThread.Id!),
                 OnChannelChanged: id =>
                 {
+                    _pendingSelectedThreadId = ChatLifecycleSelectionPolicy.RetainPendingForSelection(
+                        _pendingSelectedThreadId,
+                        id);
                     selectedIdState.Set(id);
                     selectedIdRef.Current = id;
+                    if (_provider is OpenClawChatDataProvider nativeProvider)
+                        nativeProvider.RememberSelectedThread(id);
                 },
-                OnModelChanged: model => RunFireAndForget(ct => _provider.SetModelAsync(effectiveThread.Id!, model, ct)),
-                OnThinkingLevelChanged: level => RunFireAndForget(ct => _provider.SetThinkingLevelAsync(effectiveThread.Id!, level, ct)),
-                OnPermissionsChanged: allowAll => RunFireAndForget(ct => _provider.SetPermissionModeAsync(effectiveThread.Id!, allowAll, ct)),
+                OnModelChanged: model => ObserveFireAndForget(_provider.SetModelAsync(composerThread.Id!, model)),
+                OnModelCleared: () => ObserveFireAndForget(_provider.ClearModelAsync(composerThread.Id!)),
+                OnThinkingLevelChanged: level => RunFireAndForget(ct => _provider.SetThinkingLevelAsync(composerThread.Id!, level, ct)),
+                OnPermissionsChanged: allowAll => RunFireAndForget(ct => _provider.SetPermissionModeAsync(composerThread.Id!, allowAll, ct)),
                 OnVoiceRequest: _onVoiceRequest,
                 OnAttachClick: _onAttachClick,
-                PendingAttachment: pendingAttachment.Value,
-                OnAttachmentRemoved: () => pendingAttachment.Set(null),
+                PendingAttachments: pendingAttachments.Value,
+                QueuedMessages: queuedMessages,
+                OnQueuedMessageCancel: queuedMessageId => RunFireAndForget(ct => _provider.CancelQueuedMessageAsync(composerThread.Id!, queuedMessageId, ct)),
+                OnAttachmentRemoved: attachment => SetPendingAttachments(RemoveAttachment(pendingAttachmentsRef.Current, attachment)),
                 IsSpeakerMuted: speakerMuted.Value,
                 OnSpeakerToggle: () =>
                 {
@@ -651,19 +657,68 @@ public sealed class OpenClawChatRoot : Component
                 VoiceTranscript: voiceTranscript.Value,
                 VoiceAudioLevel: voiceAudioLevel.Value,
                 RegisterVoiceStarter: starter => TriggerVoiceRecording = starter,
-                OnAttachmentPasted: att => pendingAttachment.Set(att),
-                IsCompact: _isCompact))
+                OnAttachmentPasted: att => SetPendingAttachments(pendingAttachmentsRef.Current.Concat(new[] { att }).ToArray()),
+                IsCompact: _isCompact,
+                AvailableCommands: snapshot.AvailableCommands,
+                CommandsSupported: snapshot.CommandsSupported,
+                OnCommandsRequested: () => RunFireAndForget(ct => _provider.EnsureCommandCatalogAsync(ct)),
+                AvailableHeight: chatSurfaceHeight.Value))
             : (bodyIsSkeleton ? RenderSkeletonComposer() : Empty());
 
         var divider = Empty();
+        // Composer absorbs the old StatusBar.
+        void SetChatSurfaceHeight(double height)
+        {
+            if (double.IsNaN(height) || double.IsInfinity(height) || height <= 0)
+                return;
 
-        // Three rows now (composer absorbs the old StatusBar).
+            chatSurfaceHeight.Set(Math.Round(height));
+        }
+
+        // Copilot-style scrim: instead of a hard divider line, the timeline
+        // dissolves into the composer dock via a vertical gradient that runs
+        // from transparent at the top to the solid theme-base fill at the
+        // bottom. The composer dock uses that same base fill, so the fade lands
+        // seamlessly. The color is resolved from the element's ActualTheme (not
+        // Application.Resources, which snapshots the default theme) so it flips
+        // live on a runtime light/dark switch. It never captures pointer input,
+        // so scrolling and the last message stay live.
+        static Brush BuildComposerFadeBrush(ElementTheme theme)
+        {
+            // Resolve the fade as a WHOLE brush per theme rather than reading a
+            // color off a walked brush. Reading .Color out of the visual tree
+            // re-resolves any {ThemeResource} against the ambient (light) app
+            // theme, which is why the fade previously read white on a dark page.
+            // ChatComposerFadeBrush is declared with literal colors per theme in
+            // App.xaml ThemeDictionaries (which the FunctionalUI walk can reach),
+            // so it flips correctly and stays aligned with the composer dock fill.
+            // A not-yet-loaded element can report ElementTheme.Default; coerce it
+            // to Dark so resolution never falls through to a missing app-root key
+            // (Loaded/ActualThemeChanged re-apply with the real theme).
+            var resolved = theme == ElementTheme.Light ? ElementTheme.Light : ElementTheme.Dark;
+            return Theme.ResolveBrush("ChatComposerFadeBrush", resolved);
+        }
+
+        var composerFade = Border(Empty())
+            .Set(f =>
+            {
+                f.Height = 28;
+                f.VerticalAlignment = VerticalAlignment.Bottom;
+                f.IsHitTestVisible = false;
+                Theme.EnsureThemeCallback(f, () => f.Background = BuildComposerFadeBrush(f.ActualTheme));
+            });
+
         return Grid([GridSize.Star()], [GridSize.Auto, GridSize.Auto, GridSize.Star(), GridSize.Auto],
             header.Grid(row: 0, column: 0),
             divider.Grid(row: 1, column: 0),
             body.Grid(row: 2, column: 0),
+            composerFade.Grid(row: 2, column: 0),
             composer.Grid(row: 3, column: 0)
-        );
+        ).OnMount(root =>
+        {
+            SetChatSurfaceHeight(root.ActualHeight);
+            root.SizeChanged += (_, e) => SetChatSurfaceHeight(e.NewSize.Height);
+        });
     }
 
     // Cheap allocation-free probe for "does any group contain a session with
@@ -681,19 +736,6 @@ public sealed class OpenClawChatRoot : Component
         return false;
     }
 
-    private static ChatThread SynthesizePreviewThread(ChatDataSnapshot snapshot)
-    {
-        return new ChatThread
-        {
-            Id = "preview-thread",
-            Title = "Preview thread",
-            Status = ChatThreadStatus.Running,
-            Model = snapshot.AvailableModels is { Length: > 0 } m ? m[0] : null,
-            CreatedAt = DateTimeOffset.Now.AddMinutes(-1),
-            UpdatedAt = DateTimeOffset.Now,
-        };
-    }
-
     /// <summary>
     /// Skeleton timeline shown in place of the welcome zero-state and the
     /// snapshot-null loading screen while the gateway/node handshake is in
@@ -705,9 +747,7 @@ public sealed class OpenClawChatRoot : Component
     /// affordance instead of either the first-launch prompt suggestions or
     /// a centered spinner that has no relationship to the chat structure.
     /// Uses a fixed 8px bubble corner radius so the skeleton matches the
-    /// composer placeholder regardless of the user's <see cref="ChatVisualResolver"/>
-    /// preset (the real bubbles intentionally rebase from their exploration
-    /// preset; this is loading chrome, not the live timeline).
+    /// composer placeholder; this is loading chrome, not the live timeline.
     /// </summary>
     private static Element RenderSkeletonTimeline()
     {
@@ -839,11 +879,9 @@ public sealed class OpenClawChatRoot : Component
                 sb.Children.Add(anim);
                 sb.Begin();
             }
-            // slopwatch-ignore: SW003 Audited non-critical fallback is intentional and the caller preserves safe behavior without this work.
-            catch
+            catch (Exception ex)
             {
-                // Animations are non-essential — never let a storyboard error
-                // disrupt the skeleton surface render.
+                OpenClawTray.Services.Logger.Debug($"ChatRoot: skeleton storyboard animation failed (non-essential): {ex.Message}");
             }
         };
     }
@@ -877,7 +915,10 @@ public sealed class OpenClawChatRoot : Component
                     b.Padding = new Thickness(12, 10, 12, 10);
                     b.CornerRadius = new CornerRadius(8);
                     b.IsEnabled = !suggestionsDisabled;
-                });
+                    b.BorderThickness = new Thickness(0);
+                    b.BorderBrush = null;
+                })
+                .BackgroundResource("SubtleFillColorSecondaryBrush");
 
         return Border(
             VStack(12,
@@ -934,16 +975,70 @@ public sealed class OpenClawChatRoot : Component
         );
     }
 
-    private void OnSend(string threadId, string message, ChatAttachment? attachment)
+    private async Task<bool> OnSend(
+        string threadId,
+        string? displayName,
+        string message,
+        IReadOnlyList<ChatAttachment> attachments)
     {
         _scrollToBottomToken?.Invoke();
-        IReadOnlyList<ChatAttachment>? attachments = attachment is not null
-            ? new[] { attachment }
-            : null;
-        if (attachments is not null)
-            RunFireAndForget(ct => _provider.SendMessageAsync(threadId, message, ct, attachments));
-        else
-            RunFireAndForget(ct => _provider.SendMessageAsync(threadId, message, ct));
+        if (_provider is OpenClawChatDataProvider native &&
+            ChatLifecycleCommandParser.TryParse(message, attachments.Count > 0, out var command))
+        {
+            if (ChatLifecycleCommandExecutionPolicy.ShouldQueue(command))
+                return await native.EnqueueCompactCommandAsync(threadId);
+
+            if (command == ChatLifecycleCommandKind.Reset &&
+                _confirmResetAsync is not null &&
+                !await _confirmResetAsync(threadId, displayName))
+            {
+                return false;
+            }
+
+            var result = await native.ExecuteLifecycleCommandAsync(threadId, command);
+            if (result.Succeeded && result.NewSessionKey is { } newSessionKey)
+                _selectThread?.Invoke(newSessionKey);
+            return result.Succeeded;
+        }
+
+        try
+        {
+            if (attachments.Count > 0)
+                await _provider.SendMessageAsync(threadId, message, CancellationToken.None, attachments.ToArray());
+            else
+                await _provider.SendMessageAsync(threadId, message);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine($"[chat] send failed: {ex}");
+            return false;
+        }
+        return true;
+    }
+
+    private async Task SendSuggestionAsync(string threadId, string? displayName, string suggestion)
+    {
+        await OnSend(threadId, displayName, suggestion, Array.Empty<ChatAttachment>());
+    }
+
+    private static IReadOnlyList<ChatAttachment> RemoveAttachment(
+        IReadOnlyList<ChatAttachment> attachments,
+        ChatAttachment attachment)
+    {
+        var next = new List<ChatAttachment>(attachments.Count);
+        var removed = false;
+        foreach (var current in attachments)
+        {
+            if (!removed && ReferenceEquals(current, attachment))
+            {
+                removed = true;
+                continue;
+            }
+
+            next.Add(current);
+        }
+
+        return removed ? next.ToArray() : attachments;
     }
 
     private void OnStop(string threadId)
@@ -951,9 +1046,9 @@ public sealed class OpenClawChatRoot : Component
         RunFireAndForget(ct => _provider.StopResponseAsync(threadId, ct));
     }
 
-    private void OnPermission(string threadId, string requestId, bool allow)
+    private void OnPermission(string threadId, string requestId, string action)
     {
-        RunFireAndForget(ct => _provider.RespondToPermissionAsync(threadId, requestId, allow, ct));
+        RunFireAndForget(ct => _provider.RespondToPermissionAsync(threadId, requestId, action, ct));
     }
 
     private static void RunFireAndForget(Func<CancellationToken, Task> op)
@@ -965,6 +1060,19 @@ public sealed class OpenClawChatRoot : Component
             catch (OperationCanceledException) { /* expected */ }
             catch (Exception ex) { System.Diagnostics.Trace.WriteLine($"[chat] op failed: {ex}"); }
         });
+    }
+
+    private static void ObserveFireAndForget(Task task)
+    {
+        _ = ObserveAsync(task);
+
+        static async Task ObserveAsync(Task task)
+        {
+            try { await task; }
+            // slopwatch-ignore: SW003 Shutdown cancellation or disposal is expected and the caller already preserves the safe state.
+            catch (OperationCanceledException) { /* expected */ }
+            catch (Exception ex) { System.Diagnostics.Trace.WriteLine($"[chat] op failed: {ex}"); }
+        }
     }
 
     private static async Task LoadAsync(

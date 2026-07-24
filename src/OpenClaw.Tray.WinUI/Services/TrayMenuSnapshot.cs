@@ -1,5 +1,7 @@
+using OpenClaw.Connection;
 using OpenClaw.Shared;
 using OpenClawTray.Services;
+using System;
 
 namespace OpenClawTray.Services;
 
@@ -7,6 +9,7 @@ internal sealed record TrayMenuSnapshot
 {
     // ── Conexión ──
     internal required ConnectionStatus CurrentStatus { get; init; }
+    internal OverallConnectionState? OverallState { get; init; }
     internal required string? AuthFailureMessage { get; init; }
     internal required string? GatewayUrl { get; init; }
     internal required GatewaySelfInfo? GatewaySelf { get; init; }
@@ -33,4 +36,9 @@ internal sealed record TrayMenuSnapshot
     internal required SettingsManager? Settings { get; init; }
     internal required string SetupMenuLabel { get; init; }
     internal required bool ShowSetupMenuEntry { get; init; }
+
+    // ── Dashboard glance ──
+    internal DateTime? LastUpdated { get; init; }
+    internal bool IsMcpRunning { get; init; }
+    internal string? McpStartupError { get; init; }
 }

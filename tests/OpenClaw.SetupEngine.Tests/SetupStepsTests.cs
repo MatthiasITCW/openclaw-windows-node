@@ -1,7 +1,11 @@
 using OpenClaw.Connection;
+using OpenClaw.TestSupport;
+using OpenClaw.Shared;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Text.Json;
+using Xunit.Abstractions;
 
 namespace OpenClaw.SetupEngine.Tests;
 
@@ -12,9 +16,13 @@ public class SetupStepsTests : IDisposable
     private readonly string _localTempDir;
     private readonly string? _prevDataDir;
     private readonly string? _prevLocalDataDir;
+    private readonly ITestOutputHelper _output;
+    private const string DevicePairPluginNotFoundOutput = "plugins.entries.device-pair: plugin not found: device-pair";
+    private const string OtherPluginNotFoundOutput = "plugins.entries.other-plugin: plugin not found: other-plugin";
 
-    public SetupStepsTests()
+    public SetupStepsTests(ITestOutputHelper output)
     {
+        _output = output;
         _tempDir = Path.Combine(Path.GetTempPath(), $"steps-test-{Guid.NewGuid():N}");
         _localTempDir = Path.Combine(Path.GetTempPath(), $"steps-local-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
@@ -41,6 +49,629 @@ public class SetupStepsTests : IDisposable
         var logger = new SetupLogger(filePath: null, LogLevel.Trace);
         var journal = new TransactionJournal(filePath: null);
         return new SetupContext(cfg, logger, journal, commands ?? new CommandRunner(logger), CancellationToken.None);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData("\t")]
+    public void DistroInstallPathPolicy_RejectsMissingNames(string? distroName)
+    {
+        var resolved = DistroInstallPathPolicy.TryGetNewInstallPath(
+            _localTempDir,
+            distroName,
+            out _,
+            out var error);
+
+        Assert.False(resolved);
+        Assert.Equal("WSL distro name is required.", error);
+    }
+
+    [Theory]
+    [InlineData(@"..\..")]
+    [InlineData(@"name\child")]
+    [InlineData(@"name/child")]
+    [InlineData(@"C:\outside")]
+    [InlineData(".")]
+    [InlineData(" name")]
+    [InlineData("name ")]
+    [InlineData("name:stream")]
+    public void DistroInstallPathPolicy_RejectsUnsafeNames(string distroName)
+    {
+        var resolved = DistroInstallPathPolicy.TryGetNewInstallPath(
+            _localTempDir,
+            distroName,
+            out _,
+            out var error);
+
+        Assert.False(resolved);
+        Assert.Contains("Invalid WSL distro name", error);
+    }
+
+    [Fact]
+    public void DistroInstallPathPolicy_ResolvesImmediateChild()
+    {
+        var resolved = DistroInstallPathPolicy.TryGetNewInstallPath(
+            _localTempDir,
+            "OpenClawGateway-Dev",
+            out var installPath,
+            out var error);
+
+        Assert.True(resolved, error);
+        Assert.Equal(
+            Path.GetFullPath(Path.Combine(_localTempDir, "wsl", "OpenClawGateway-Dev")),
+            installPath);
+        Assert.Equal(
+            Path.GetFullPath(Path.Combine(_localTempDir, "wsl")),
+            Path.GetDirectoryName(installPath));
+    }
+
+    [Fact]
+    public void DistroInstallPathPolicy_AcceptsExactly64CharactersForCreation()
+    {
+        var distroName = $"A{new string('a', 63)}";
+
+        var resolved = DistroInstallPathPolicy.TryGetNewInstallPath(
+            _localTempDir,
+            distroName,
+            out var installPath,
+            out var error);
+
+        Assert.True(resolved, error);
+        Assert.Equal(Path.Combine(_localTempDir, "wsl", distroName), installPath);
+    }
+
+    [Fact]
+    public void DistroInstallPathPolicy_Rejects65CharactersForCreation()
+    {
+        var distroName = $"A{new string('a', 64)}";
+
+        var resolved = DistroInstallPathPolicy.TryGetNewInstallPath(
+            _localTempDir,
+            distroName,
+            out _,
+            out var error);
+
+        Assert.False(resolved);
+        Assert.Contains("1-64", error);
+    }
+
+    [Theory]
+    [InlineData("OpenClaw Gateway")]
+    [InlineData("OpenClaw-网关")]
+    public void DistroInstallPathPolicy_AllowsSafeLegacyNamesOnlyForTeardown(string distroName)
+    {
+        Assert.False(DistroInstallPathPolicy.TryGetNewInstallPath(
+            _localTempDir,
+            distroName,
+            out _,
+            out _));
+
+        var resolved = DistroInstallPathPolicy.TryGetManagedInstallPath(
+            _localTempDir,
+            distroName,
+            out var installPath,
+            out var error);
+
+        Assert.True(resolved, error);
+        Assert.Equal(Path.Combine(_localTempDir, "wsl", distroName), installPath);
+    }
+
+    [Fact]
+    public void DistroInstallPathPolicy_AddsRecoveryOnlyForLegacyTeardownNames()
+    {
+        const string error = "path validation failed";
+
+        Assert.Contains(
+            "--uninstall --confirm-destructive",
+            DistroInstallPathPolicy.WithLegacyReplacementGuidance("OpenClaw Gateway", error));
+        Assert.Equal(
+            error,
+            DistroInstallPathPolicy.WithLegacyReplacementGuidance("OpenClawGateway", error));
+        Assert.Equal(
+            error,
+            DistroInstallPathPolicy.WithLegacyReplacementGuidance(@"..\..", error));
+    }
+
+    [Theory]
+    [InlineData(@"..\..")]
+    [InlineData(@"name\child")]
+    [InlineData("name/child")]
+    [InlineData(@"C:\outside")]
+    [InlineData(".")]
+    [InlineData("..")]
+    [InlineData(" name")]
+    [InlineData("name ")]
+    [InlineData("name.")]
+    [InlineData("name:stream")]
+    [InlineData("CON")]
+    [InlineData("NUL.txt")]
+    [InlineData("COM¹")]
+    [InlineData("LPT².log")]
+    [InlineData("CON .txt")]
+    [InlineData("LPT1 .log")]
+    public void DistroInstallPathPolicy_RejectsUnsafeManagedNames(string distroName)
+    {
+        var resolved = DistroInstallPathPolicy.TryGetManagedInstallPath(
+            _localTempDir,
+            distroName,
+            out _,
+            out var error);
+
+        Assert.False(resolved);
+        Assert.Contains("Invalid managed WSL distro name", error);
+    }
+
+    [Fact]
+    public async Task SetupPipeline_RejectsLegacyNameBeforeCleanup()
+    {
+        var legacyPath = Path.Combine(_localTempDir, "wsl", "OpenClaw Gateway");
+        Directory.CreateDirectory(legacyPath);
+        var sentinel = Path.Combine(legacyPath, "keep.txt");
+        File.WriteAllText(sentinel, "keep");
+        var commands = new FakeCommandRunner(_ => Ok("OpenClaw Gateway"));
+        var ctx = CreateContext(
+            new SetupConfig { CleanBeforeRun = true, DistroName = "OpenClaw Gateway" },
+            commands);
+        var pipeline = new SetupPipeline(
+        [
+            new ValidateDistroInstallPathStep(),
+            new CleanupStaleDistroStep(),
+        ]);
+
+        var result = await pipeline.RunAsync(ctx);
+
+        Assert.Equal(PipelineOutcome.Failed, result.Outcome);
+        Assert.Equal("validate-distro-path", result.FailedStepId);
+        Assert.Contains("--uninstall --confirm-destructive", result.Message);
+        Assert.True(File.Exists(sentinel));
+        Assert.Empty(commands.Calls);
+    }
+
+    [Theory]
+    [InlineData("OpenClaw Gateway")]
+    [InlineData("OpenClaw-网关")]
+    public async Task UninstallPipeline_RemovesSafeLegacyDistroBeforeSupportedReplacement(string legacyName)
+    {
+        var legacyPath = Path.Combine(_localTempDir, "wsl", legacyName);
+        Directory.CreateDirectory(legacyPath);
+        File.WriteAllText(Path.Combine(legacyPath, "legacy.vhdx"), "legacy");
+        var outside = Path.Combine(_localTempDir, "outside");
+        Directory.CreateDirectory(outside);
+        var outsideSentinel = Path.Combine(outside, "keep.txt");
+        File.WriteAllText(outsideSentinel, "keep");
+        var commands = new FakeCommandRunner(args =>
+            args.SequenceEqual(["--list", "--quiet"])
+                ? Ok($"{legacyName}\n")
+                : Ok(""));
+        var ctx = CreateContext(
+            new SetupConfig
+            {
+                ConfirmDestructive = true,
+                DistroName = legacyName,
+            },
+            commands);
+        var pipeline = new SetupPipeline([new CreateWslInstanceStep()]);
+
+        var uninstall = await pipeline.UninstallAsync(ctx);
+
+        Assert.Equal(PipelineOutcome.Success, uninstall.Outcome);
+        Assert.False(Directory.Exists(legacyPath));
+        Assert.True(File.Exists(outsideSentinel));
+        Assert.Collection(
+            commands.Calls,
+            call => Assert.Equal(["--list", "--quiet"], call.Arguments),
+            call => Assert.Contains("--terminate", call.Arguments),
+            call => Assert.Contains("--unregister", call.Arguments));
+        Assert.True(DistroInstallPathPolicy.TryGetNewInstallPath(
+            _localTempDir,
+            "OpenClawGateway",
+            out _,
+            out var replacementError),
+            replacementError);
+    }
+
+    [Fact]
+    public async Task CreateWslInstanceRollback_RejectsTraversalBeforeCommandsOrDeletion()
+    {
+        var outside = Path.Combine(_localTempDir, "outside");
+        Directory.CreateDirectory(outside);
+        var sentinel = Path.Combine(outside, "keep.txt");
+        File.WriteAllText(sentinel, "keep");
+        var commands = new FakeCommandRunner(_ => Ok(""));
+        var ctx = CreateContext(
+            new SetupConfig { DistroName = @"..\.." },
+            commands);
+
+        var error = await Assert.ThrowsAsync<IOException>(
+            () => new CreateWslInstanceStep().RollbackAsync(ctx, CancellationToken.None));
+
+        Assert.Contains("Refusing WSL rollback filesystem cleanup", error.Message);
+        Assert.True(File.Exists(sentinel));
+        Assert.Empty(commands.Calls);
+    }
+
+    [Fact]
+    public async Task CreateWslInstanceRollback_PreservesVhdWhenUnregisterFails()
+    {
+        const string legacyName = "OpenClaw Gateway";
+        var legacyPath = Path.Combine(_localTempDir, "wsl", legacyName);
+        Directory.CreateDirectory(legacyPath);
+        var sentinel = Path.Combine(legacyPath, "legacy.vhdx");
+        File.WriteAllText(sentinel, "legacy");
+        var commands = new FakeCommandRunner(args =>
+        {
+            if (args.SequenceEqual(["--list", "--quiet"]))
+                return Ok($"{legacyName}\n");
+            if (args.SequenceEqual(["--terminate", legacyName]))
+                return Ok();
+            if (args.SequenceEqual(["--unregister", legacyName]))
+                return Fail("unregister failed");
+            return Fail($"unexpected args: {string.Join(' ', args)}");
+        });
+        var ctx = CreateContext(
+            new SetupConfig { DistroName = legacyName },
+            commands);
+
+        var error = await Assert.ThrowsAsync<IOException>(
+            () => new CreateWslInstanceStep().RollbackAsync(ctx, CancellationToken.None));
+
+        Assert.Contains("Refusing unsafe WSL rollback cleanup", error.Message);
+        Assert.True(File.Exists(sentinel));
+        Assert.Equal(2, commands.Calls.Count(c => c.Arguments.SequenceEqual(["--unregister", legacyName])));
+    }
+
+    [Fact]
+    public async Task CreateWslInstanceRollback_RemovesEmptyWslRootWhenDistroIsAlreadyAbsent()
+    {
+        var wslRoot = Path.Combine(_localTempDir, "wsl");
+        Directory.CreateDirectory(wslRoot);
+        var commands = new FakeCommandRunner(args =>
+            args.SequenceEqual(["--list", "--quiet"])
+                ? Ok("")
+                : Fail($"unexpected args: {string.Join(' ', args)}"));
+        var ctx = CreateContext(commands: commands);
+
+        await new CreateWslInstanceStep().RollbackAsync(ctx, CancellationToken.None);
+
+        Assert.False(Directory.Exists(wslRoot));
+        Assert.Collection(
+            commands.Calls,
+            call => Assert.Equal(["--list", "--quiet"], call.Arguments));
+    }
+
+    [Fact]
+    public async Task CleanupStaleDistro_RejectsTraversalWithoutDeletingTarget()
+    {
+        var target = Path.Combine(_localTempDir, "sentinel");
+        Directory.CreateDirectory(target);
+        var sentinel = Path.Combine(target, "keep.txt");
+        File.WriteAllText(sentinel, "keep");
+        var commands = new FakeCommandRunner(_ => Ok(""));
+        var ctx = CreateContext(
+            new SetupConfig { CleanBeforeRun = true, DistroName = @"..\.." },
+            commands);
+
+        var result = await new CleanupStaleDistroStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.Equal(StepOutcome.FailedTerminal, result.Outcome);
+        Assert.Contains("Invalid managed WSL distro name", result.Message);
+        Assert.True(File.Exists(sentinel));
+        Assert.Empty(commands.Calls);
+    }
+
+    [Fact]
+    public async Task DeleteDistroDirectory_RejectsPathOutsideExpectedImmediateChild()
+    {
+        var target = Path.Combine(_localTempDir, "sentinel");
+        Directory.CreateDirectory(target);
+        var sentinel = Path.Combine(target, "keep.txt");
+        File.WriteAllText(sentinel, "keep");
+        var ctx = CreateContext();
+
+        var result = await CleanupStaleDistroStep.DeleteDistroDirectoryWithRetries(
+            ctx,
+            "OpenClawGateway",
+            target,
+            CancellationToken.None);
+
+        Assert.Equal(StepOutcome.FailedTerminal, result.Outcome);
+        Assert.Contains("Refusing to delete WSL path", result.Message);
+        Assert.True(File.Exists(sentinel));
+    }
+
+    [Fact]
+    public async Task DeleteDistroDirectory_RevalidatesAncestorsBeforeRetry()
+    {
+        var wslRoot = Path.Combine(_localTempDir, "wsl");
+        var target = Path.Combine(wslRoot, "OpenClawGateway");
+        var lockedPath = Path.Combine(target, "locked.txt");
+        Directory.CreateDirectory(target);
+        File.WriteAllText(lockedPath, "locked");
+
+        var outsideRoot = Path.Combine(Path.GetTempPath(), $"outside-{Guid.NewGuid():N}");
+        var redirectedTarget = Path.Combine(outsideRoot, "OpenClawGateway");
+        Directory.CreateDirectory(redirectedTarget);
+        var sentinel = Path.Combine(redirectedTarget, "keep.txt");
+        File.WriteAllText(sentinel, "keep");
+
+        var ctx = CreateContext();
+        var retryStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        ctx.Logger.LogEmitted += (_, entry) =>
+        {
+            if (entry.Message.Contains("retrying", StringComparison.Ordinal))
+                retryStarted.TrySetResult();
+        };
+
+        try
+        {
+            using var lockedFile = new FileStream(lockedPath, FileMode.Open, FileAccess.Read, FileShare.None);
+            var deleteTask = CleanupStaleDistroStep.DeleteDistroDirectoryWithRetries(
+                ctx,
+                "OpenClawGateway",
+                target,
+                CancellationToken.None);
+
+            await retryStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            lockedFile.Dispose();
+            Directory.Delete(wslRoot, recursive: true);
+            CreateJunction(wslRoot, outsideRoot);
+
+            var result = await deleteTask;
+
+            Assert.Equal(StepOutcome.FailedTerminal, result.Outcome);
+            Assert.Contains("reparse point", result.Message);
+            Assert.True(File.Exists(sentinel));
+        }
+        finally
+        {
+            // slopwatch-ignore: SW003 Test cleanup or fixture teardown is best-effort and must not hide the test outcome.
+            try { Directory.Delete(wslRoot); } catch { }
+            // slopwatch-ignore: SW003 Test cleanup or fixture teardown is best-effort and must not hide the test outcome.
+            try { Directory.Delete(outsideRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task CreateWslInstance_RejectsTraversalBeforeRunningWsl()
+    {
+        var commands = new FakeCommandRunner(_ => Ok(""));
+        var ctx = CreateContext(
+            new SetupConfig { DistroName = @"..\.." },
+            commands);
+
+        var result = await new CreateWslInstanceStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.Equal(StepOutcome.FailedTerminal, result.Outcome);
+        Assert.Contains("Invalid WSL distro name", result.Message);
+        Assert.Empty(commands.Calls);
+    }
+
+    [Fact]
+    public void DistroInstallPathPolicy_RejectsWhenWslRootIsJunction()
+    {
+        var outsideDir = Path.Combine(Path.GetTempPath(), $"outside-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(outsideDir);
+        var sentinel = Path.Combine(outsideDir, "keep.txt");
+        File.WriteAllText(sentinel, "keep");
+        var wslRoot = Path.Combine(_localTempDir, "wsl");
+
+        try
+        {
+            CreateJunction(wslRoot, outsideDir);
+
+            var candidate = Path.Combine(wslRoot, "OpenClawGateway");
+            var allowed = DistroInstallPathPolicy.TryValidateDeleteTarget(
+                _localTempDir,
+                "OpenClawGateway",
+                candidate,
+                out _,
+                out var error);
+
+            Assert.False(allowed);
+            Assert.Contains("reparse point", error);
+            Assert.True(File.Exists(sentinel));
+        }
+        finally
+        {
+            // slopwatch-ignore: SW003 Test cleanup or fixture teardown is best-effort and must not hide the test outcome.
+            try { Directory.Delete(wslRoot); } catch { }
+            // slopwatch-ignore: SW003 Test cleanup or fixture teardown is best-effort and must not hide the test outcome.
+            try { Directory.Delete(outsideDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void DistroInstallPathPolicy_RejectsWhenManagedChildIsJunction()
+    {
+        var outsideDir = Path.Combine(Path.GetTempPath(), $"outside-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(outsideDir);
+        var sentinel = Path.Combine(outsideDir, "keep.txt");
+        File.WriteAllText(sentinel, "keep");
+        var wslRoot = Path.Combine(_localTempDir, "wsl");
+        Directory.CreateDirectory(wslRoot);
+        var managedChild = Path.Combine(wslRoot, "OpenClaw Gateway");
+
+        try
+        {
+            CreateJunction(managedChild, outsideDir);
+
+            var resolved = DistroInstallPathPolicy.TryGetManagedInstallPath(
+                _localTempDir,
+                "OpenClaw Gateway",
+                out _,
+                out var error);
+
+            Assert.False(resolved);
+            Assert.Contains("reparse point", error);
+            Assert.True(File.Exists(sentinel));
+        }
+        finally
+        {
+            // slopwatch-ignore: SW003 Test cleanup or fixture teardown is best-effort and must not hide the test outcome.
+            try { Directory.Delete(managedChild); } catch { }
+            // slopwatch-ignore: SW003 Test cleanup or fixture teardown is best-effort and must not hide the test outcome.
+            try { Directory.Delete(outsideDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void DistroInstallPathPolicy_RejectsUnicodeNormalizationCollision()
+    {
+        var wslRoot = Path.Combine(_localTempDir, "wsl");
+        Directory.CreateDirectory(Path.Combine(wslRoot, "OpenClaw-é"));
+        Directory.CreateDirectory(Path.Combine(wslRoot, "OpenClaw-e\u0301"));
+
+        var resolved = DistroInstallPathPolicy.TryGetManagedInstallPath(
+            _localTempDir,
+            "OpenClaw-é",
+            out _,
+            out var error);
+
+        Assert.False(resolved);
+        Assert.Contains("ambiguous", error);
+    }
+
+    [Fact]
+    public void DistroInstallPathPolicy_RejectsCaseCollision()
+    {
+        var wslRoot = Path.Combine(_localTempDir, "wsl");
+        Directory.CreateDirectory(wslRoot);
+        EnableCaseSensitiveDirectory(wslRoot);
+        Directory.CreateDirectory(Path.Combine(wslRoot, "OpenClaw Gateway"));
+        Directory.CreateDirectory(Path.Combine(wslRoot, "openclaw gateway"));
+
+        var resolved = DistroInstallPathPolicy.TryGetManagedInstallPath(
+            _localTempDir,
+            "OpenClaw Gateway",
+            out _,
+            out var error);
+
+        Assert.False(resolved);
+        Assert.Contains("ambiguous", error);
+    }
+
+    [Fact]
+    public void DistroInstallPathPolicy_RejectsJunctionAncestorForInstall()
+    {
+        var outsideDir = Path.Combine(Path.GetTempPath(), $"outside-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(outsideDir);
+        var wslRoot = Path.Combine(_localTempDir, "wsl");
+
+        try
+        {
+            CreateJunction(wslRoot, outsideDir);
+
+            var resolved = DistroInstallPathPolicy.TryGetNewInstallPath(
+                _localTempDir,
+                "OpenClawGateway",
+                out _,
+                out var error);
+
+            Assert.False(resolved);
+            Assert.Contains("reparse point", error);
+        }
+        finally
+        {
+            // slopwatch-ignore: SW003 Test cleanup or fixture teardown is best-effort and must not hide the test outcome.
+            try { Directory.Delete(wslRoot); } catch { }
+            // slopwatch-ignore: SW003 Test cleanup or fixture teardown is best-effort and must not hide the test outcome.
+            try { Directory.Delete(outsideDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void DistroInstallPathPolicy_RejectsJunctionAtLocalDataDirWithTrailingSeparator()
+    {
+        var outsideDir = Path.Combine(Path.GetTempPath(), $"outside-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(outsideDir);
+        var lddJunction = Path.Combine(Path.GetTempPath(), $"ldd-{Guid.NewGuid():N}");
+
+        try
+        {
+            CreateJunction(lddJunction, outsideDir);
+
+            var resolved = DistroInstallPathPolicy.TryGetNewInstallPath(
+                lddJunction + Path.DirectorySeparatorChar,
+                "OpenClawGateway",
+                out _,
+                out var error);
+
+            Assert.False(resolved);
+            Assert.Contains("reparse point", error);
+        }
+        finally
+        {
+            // slopwatch-ignore: SW003 Test cleanup or fixture teardown is best-effort and must not hide the test outcome.
+            try { Directory.Delete(lddJunction); } catch { }
+            // slopwatch-ignore: SW003 Test cleanup or fixture teardown is best-effort and must not hide the test outcome.
+            try { Directory.Delete(outsideDir, recursive: true); } catch { }
+        }
+    }
+
+    private static void CreateJunction(string link, string target)
+    {
+        // Junction (mklink /J) does not require elevation, unlike symbolic links.
+        using var mklink = System.Diagnostics.Process.Start(
+            new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/c mklink /J \"{link}\" \"{target}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            }) ?? throw new InvalidOperationException("Failed to start mklink.");
+
+        mklink.WaitForExit();
+        Assert.Equal(0, mklink.ExitCode);
+    }
+
+    private static void EnableCaseSensitiveDirectory(string path)
+    {
+        using var fsutil = System.Diagnostics.Process.Start(
+            new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "fsutil.exe",
+                ArgumentList = { "file", "SetCaseSensitiveInfo", path, "enable" },
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            }) ?? throw new InvalidOperationException("Failed to start fsutil.");
+
+        fsutil.WaitForExit();
+        Assert.Equal(0, fsutil.ExitCode);
+    }
+
+    [Fact]
+    public void WriteSettingsJson_AppliesConfiguredCapabilitiesBeforePersisting()
+    {
+        var config = new SetupConfig
+        {
+            Capabilities = new CapabilitiesConfig
+            {
+                System = false,
+                Canvas = true,
+                Screen = true,
+                Camera = false,
+                Location = false,
+                Browser = false,
+                Device = true,
+                Tts = true,
+                Stt = false,
+            },
+        };
+        var ctx = CreateContext(config);
+
+        VerifyEndToEndStep.WriteSettingsJson(ctx);
+
+        using var result = JsonDocument.Parse(File.ReadAllText(Path.Combine(_tempDir, "settings.json")));
+        Assert.False(result.RootElement.GetProperty("NodeSystemRunEnabled").GetBoolean());
+        Assert.True(result.RootElement.GetProperty("NodeCanvasEnabled").GetBoolean());
+        Assert.True(result.RootElement.GetProperty("NodeScreenEnabled").GetBoolean());
+        Assert.False(result.RootElement.GetProperty("NodeCameraEnabled").GetBoolean());
+        Assert.False(result.RootElement.GetProperty("NodeLocationEnabled").GetBoolean());
+        Assert.False(result.RootElement.GetProperty("NodeBrowserProxyEnabled").GetBoolean());
+        Assert.True(result.RootElement.GetProperty("NodeTtsEnabled").GetBoolean());
+        Assert.False(result.RootElement.GetProperty("NodeSttEnabled").GetBoolean());
     }
 
     // ─── CleanupStaleGatewayStep: Preserve non-local records ───
@@ -213,6 +844,60 @@ public class SetupStepsTests : IDisposable
     }
 
     [Fact]
+    public async Task WaitForPortFree_ReturnsImmediately_WhenPortIsAlreadyFree()
+    {
+        var port = GetFreeTcpPort();
+        var logger = new SetupLogger(filePath: null, LogLevel.Trace);
+
+        // Should complete well within 1 second because the port is already free
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await PreflightPortStep.WaitForPortFreeAsync(port, "loopback", logger, cts.Token, maxWaitSeconds: 10);
+        // No assertion needed — completing without cancellation/timeout is the success condition
+    }
+
+    [Fact]
+    public async Task WaitForPortFree_PollsUntilPortReleased()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0) { ExclusiveAddressUse = true };
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var logger = new SetupLogger(filePath: null, LogLevel.Trace);
+
+        // Release the port after a short delay (simulates WSL proxy teardown lag)
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(400);
+            listener.Stop();
+        });
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await PreflightPortStep.WaitForPortFreeAsync(port, "loopback", logger, cts.Token, maxWaitSeconds: 5);
+
+        // Port should now be free
+        Assert.True(PreflightPortStep.CanBind(IPAddress.Loopback, port, out _));
+    }
+
+    [Fact]
+    public async Task PreflightPort_Loopback_SucceedsAfterPortReleasedDuringPoll()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0) { ExclusiveAddressUse = true };
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        // Release after 300ms — simulates a slow WSL proxy shutdown
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(300);
+            listener.Stop();
+        });
+
+        var ctx = CreateContext(new SetupConfig { GatewayPort = port });
+        var result = await new PreflightPortStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+    }
+
+    [Fact]
     public async Task InstallCli_RejectsHttpUrl()
     {
         var ctx = CreateContext(new SetupConfig
@@ -373,9 +1058,6 @@ public class SetupStepsTests : IDisposable
                 return Fail("terminate unavailable");
             if (args.SequenceEqual(["--unregister", "OpenClawGateway"]))
                 return Fail("unregister unavailable");
-            if (args.SequenceEqual(["--shutdown"]))
-                return Ok();
-
             return Fail($"unexpected args: {string.Join(' ', args)}");
         });
         var ctx = CreateContext(commands: commands);
@@ -388,6 +1070,7 @@ public class SetupStepsTests : IDisposable
         Assert.Contains("could not confirm whether distro 'OpenClawGateway' is still registered", result.Message);
         Assert.Contains("skipped deleting app-owned install path", result.Message);
         Assert.True(File.Exists(Path.Combine(installPath, "ext4.vhdx")));
+        Assert.DoesNotContain(commands.Calls, c => c.Arguments.SequenceEqual(["--shutdown"]));
     }
 
     [Fact]
@@ -644,6 +1327,45 @@ public class SetupStepsTests : IDisposable
     }
 
     [Fact]
+    public void WslInstallSupport_TryGetEnvironmentIssue_DetectsUnsupportedMachineConfigurationStatus()
+    {
+        var status = NulSeparated("Default Version: 2\r\n\r\n"
+            + "WSL2 is not supported with your current machine configuration.\r\n\r\n"
+            + "Please enable the \"Virtual Machine Platform\" optional component and ensure virtualization is enabled in the BIOS.\r\n\r\n"
+            + "Enable \"Virtual Machine Platform\" by running: wsl.exe --install --no-distribution\r\n\r\n"
+            + "For information please visit https://aka.ms/enablevirtualization\r\n");
+
+        Assert.True(WslInstallSupport.TryGetEnvironmentIssue(status, Architecture.X64, out var message));
+        Assert.Contains("Virtual Machine Platform", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("virtualization", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("wsl --install --no-distribution", message);
+        Assert.Contains("VT-x", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("BIOS/UEFI", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("reboot", message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void WslInstallSupport_TryGetEnvironmentIssue_UsesArm64WordingForUnsupportedMachineConfiguration()
+    {
+        var status = NulSeparated("Default Version: 2\r\n\r\n"
+            + "WSL2 is not supported with your current machine configuration.\r\n\r\n"
+            + "Please enable the \"Virtual Machine Platform\" optional component and ensure virtualization is enabled in the BIOS.\r\n\r\n"
+            + "Enable \"Virtual Machine Platform\" by running: wsl.exe --install --no-distribution\r\n\r\n"
+            + "For information please visit https://aka.ms/enablevirtualization\r\n");
+
+        Assert.True(WslInstallSupport.TryGetEnvironmentIssue(status, Architecture.Arm64, out var message));
+        Assert.Contains("Virtual Machine Platform", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("ARM64", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Surface", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("device-management policy", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("wsl --install --no-distribution", message);
+        Assert.DoesNotContain("BIOS", message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("VT-x", message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("AMD-V", message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("SVM", message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void WslInstallSupport_TryGetEnvironmentIssue_ReturnsFalseForHealthyStatus()
     {
         Assert.False(WslInstallSupport.TryGetEnvironmentIssue(
@@ -697,6 +1419,33 @@ public class SetupStepsTests : IDisposable
         Assert.Equal(StepOutcome.FailedTerminal, result.Outcome);
         Assert.Contains("Virtual Machine Platform", result.Message);
         Assert.Contains("wsl --install --no-distribution", result.Message);
+    }
+
+    [Fact]
+    public async Task PreflightWsl_FailsTerminalWhenStatusReportsUnsupportedMachineConfiguration()
+    {
+        var commands = new FakeCommandRunner(args =>
+        {
+            if (args is ["--version"])
+                return Ok("WSL version: 2.5.9.0\n");
+            if (args is ["--status"])
+                return Ok(NulSeparated(
+                    "Default Version: 2\r\n\r\n"
+                    + "WSL2 is not supported with your current machine configuration.\r\n\r\n"
+                    + "Please enable the \"Virtual Machine Platform\" optional component and ensure virtualization is enabled in the BIOS.\r\n\r\n"
+                    + "Enable \"Virtual Machine Platform\" by running: wsl.exe --install --no-distribution\r\n\r\n"
+                    + "For information please visit https://aka.ms/enablevirtualization\r\n"));
+            return Fail($"unexpected args: {string.Join(' ', args)}");
+        });
+        var ctx = CreateContext(commands: commands);
+
+        var result = await new PreflightWslStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.Equal(StepOutcome.FailedTerminal, result.Outcome);
+        Assert.Contains("Virtual Machine Platform", result.Message);
+        Assert.Contains("virtualization", result.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("wsl --install --no-distribution", result.Message);
+        Assert.DoesNotContain(commands.Calls, c => c.Arguments.Contains("--install"));
     }
 
     [Fact]
@@ -845,6 +1594,139 @@ public class SetupStepsTests : IDisposable
     }
 
     [Fact]
+    public void ConfigureGateway_TailscaleServeIsRootOwnedAndKeepsTailscaleAuthOptIn()
+    {
+        var commands = ConfigureGatewayStep.BuildConfigCommands(
+            new GatewayConfig { Bind = "loopback" },
+            18789,
+            "'[]'",
+            new TailscaleConfig { Enabled = true });
+
+        Assert.Contains("openclaw config set gateway.tailscale.mode off", commands);
+        Assert.DoesNotContain("gateway.tailscale.mode serve", commands);
+        Assert.DoesNotContain("gateway.tailscale.resetOnExit", commands);
+        Assert.Contains("openclaw config set gateway.auth.allowTailscale false", commands);
+        Assert.DoesNotContain("http://127.0.0.1:18789", commands);
+    }
+
+    [Fact]
+    public void ConfigureGateway_EnablesTailscaleIdentityAuthOnlyWhenRequested()
+    {
+        var commands = ConfigureGatewayStep.BuildConfigCommands(
+            new GatewayConfig { Bind = "loopback" },
+            18789,
+            "'[]'",
+            new TailscaleConfig { Enabled = true, TrustTailscaleAuth = true });
+
+        Assert.Contains("openclaw config set gateway.auth.allowTailscale true", commands);
+    }
+
+    [Fact]
+    public async Task TailscaleTransportWithoutIdentityTrust_PreservesTokenAndDeviceCredentialsForPairing()
+    {
+        var config = new SetupConfig
+        {
+            GatewayPort = GetFreeTcpPort(),
+            Tailscale = new TailscaleConfig { Enabled = true, TrustTailscaleAuth = false }
+        };
+        var ctx = CreateContext(config);
+        ctx.SharedGatewayToken = "shared-token";
+        ctx.BootstrapToken = "bootstrap-token";
+
+        var gatewayConfig = ConfigureGatewayStep.BuildConfigCommands(
+            config.Gateway,
+            config.GatewayPort,
+            "'[]'",
+            config.Tailscale);
+        Assert.Equal("shared-token", SetupPairingCredentialPolicy.ResolveInitialPairingToken(ctx));
+        ctx.SharedGatewayToken = null;
+        Assert.Equal("bootstrap-token", SetupPairingCredentialPolicy.ResolveInitialPairingToken(ctx));
+        ctx.SharedGatewayToken = "shared-token";
+        var pairResult = await new PairOperatorStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.False(pairResult.IsSuccess);
+        Assert.Contains("gateway.auth.allowTailscale false", gatewayConfig);
+        Assert.NotNull(ctx.GatewayRecordId);
+
+        var registry = new GatewayRegistry(_tempDir);
+        registry.Load();
+        var record = Assert.IsType<GatewayRecord>(registry.GetById(ctx.GatewayRecordId!));
+        Assert.Equal("Tailscale (OpenClawGateway)", record.FriendlyName);
+        Assert.Equal("shared-token", record.SharedGatewayToken);
+        Assert.Equal("bootstrap-token", record.BootstrapToken);
+
+        var identityPath = registry.GetIdentityDirectory(record.Id);
+        var identity = new DeviceIdentity(identityPath);
+        identity.Initialize();
+        identity.StoreDeviceTokenForRole("operator", "operator-device-token");
+        identity.StoreDeviceTokenForRole("node", "node-device-token");
+
+        var credentials = new CredentialResolver(DeviceIdentityFileReader.Instance);
+        Assert.Equal("operator-device-token", credentials.ResolveOperator(record, identityPath)!.Token);
+        Assert.Equal("node-device-token", credentials.ResolveNode(record, identityPath)!.Token);
+    }
+
+    [Fact]
+    public void TailscalePolicy_ParsesAuthorizationUrlsAndOnlyAcceptsGatewayServeProxy()
+    {
+        var url = TailscaleSetupPolicy.TryReadAuthorizationUrl("To authenticate, visit https://login.tailscale.com/a/abc_123-now");
+        const string expectedServeStatus = """
+            {
+              "TCP": { "443": { "HTTPS": true } },
+              "Web": {
+                "openclaw.example.ts.net:443": {
+                  "Handlers": {
+                    "/": { "Proxy": "http://127.0.0.1:18789" }
+                  }
+                }
+              }
+            }
+            """;
+        const string wrongBackendStatus = """
+            {
+              "Web": {
+                "openclaw.example.ts.net:443": {
+                  "Handlers": {
+                    "/": { "Proxy": "http://127.0.0.1:9999" }
+                  }
+                }
+              }
+            }
+            """;
+        const string unrelatedPortStatus = """
+            {
+              "TCP": { "18789": { "HTTPS": true } },
+              "Web": {
+                "openclaw.example.ts.net:443": {
+                  "Handlers": {
+                    "/": { "Proxy": "http://127.0.0.1:9999" }
+                  }
+                }
+              }
+            }
+            """;
+        const string funnelStatus = """
+            {
+              "AllowFunnel": { "openclaw.example.ts.net:443": true },
+              "Web": {
+                "openclaw.example.ts.net:443": {
+                  "Handlers": {
+                    "/": { "Proxy": "http://127.0.0.1:18789" }
+                  }
+                }
+              }
+            }
+            """;
+
+        Assert.Equal("https://login.tailscale.com/a/abc_123-now", url!.AbsoluteUri);
+        Assert.True(TailscaleSetupPolicy.ServeStatusRoutesToPort(expectedServeStatus, 18789));
+        Assert.False(TailscaleSetupPolicy.ServeStatusRoutesToPort(wrongBackendStatus, 18789));
+        Assert.False(TailscaleSetupPolicy.ServeStatusRoutesToPort(unrelatedPortStatus, 18789));
+        Assert.False(TailscaleSetupPolicy.ServeStatusEnablesFunnel(expectedServeStatus, 18789));
+        Assert.True(TailscaleSetupPolicy.ServeStatusEnablesFunnel(funnelStatus, 18789));
+    }
+
+    [Fact]
     public void ConfigureGateway_EnablesDevicePairPluginWhenPublicUrlOverridden()
     {
         var commands = ConfigureGatewayStep.BuildConfigCommands(
@@ -922,6 +1804,29 @@ public class SetupStepsTests : IDisposable
         Assert.DoesNotContain("'http://127.0.0.1:18789'", commands);
         Assert.Contains(
             "openclaw config set plugins.entries.device-pair.config.publicUrl 'https://gateway.example.test'",
+            commands);
+    }
+
+    // Characterization (PR 3 WslShellQuoting migration): the ExtraConfig value is emitted
+    // as a fully-wrapped POSIX token, so an embedded single quote must close-escape-reopen
+    // ('\'') and remain single-quoted. Pins the generated command byte-for-byte.
+    [Fact]
+    public void ConfigureGateway_QuotesExtraConfigValueWithEmbeddedSingleQuote()
+    {
+        var commands = ConfigureGatewayStep.BuildConfigCommands(
+            new GatewayConfig
+            {
+                Bind = "lan",
+                ExtraConfig = new Dictionary<string, string>
+                {
+                    ["gateway.custom.note"] = "a'b",
+                },
+            },
+            18789,
+            "'[]'");
+
+        Assert.Contains(
+            "openclaw config set gateway.custom.note 'a'\\''b'",
             commands);
     }
 
@@ -1178,6 +2083,81 @@ public class SetupStepsTests : IDisposable
         Assert.False(StartKeepaliveStep.IsKeepaliveCommandLine(
             @"C:\Windows\System32\wsl.exe -d OtherGateway -- sleep infinity",
             "OpenClawGateway"));
+        Assert.False(StartKeepaliveStep.IsKeepaliveCommandLine(
+            @"C:\Windows\System32\wsl.exe -d OpenClawGateway-Dev -- sleep infinity",
+            "OpenClawGateway"));
+        Assert.True(StartKeepaliveStep.IsKeepaliveCommandLine(
+            "wsl.exe --distribution \"OpenClawGateway-Dev\" -- sleep infinity",
+            "OpenClawGateway-Dev"));
+    }
+
+    [Fact]
+    public async Task AutoApprovePairing_ReturnsTerminalForDevicePairPluginNotFound()
+    {
+        var ctx = CreatePairingContext(DevicePairPluginNotFoundOutput);
+
+        var result = await PairOperatorStep.AutoApprovePairing(ctx, "device-req-1", CancellationToken.None);
+
+        Assert.Equal(StepOutcome.FailedTerminal, result.Outcome);
+        Assert.Equal(ApprovalRequestHelper.PluginNotFoundMessage, result.Message);
+    }
+
+    [Fact]
+    public async Task AutoApprovePairing_KeepsOtherMissingPluginRetriable()
+    {
+        var ctx = CreatePairingContext(OtherPluginNotFoundOutput);
+
+        var result = await PairOperatorStep.AutoApprovePairing(ctx, "device-req-1", CancellationToken.None);
+
+        Assert.Equal(StepOutcome.Failed, result.Outcome);
+        Assert.Contains("Device approval failed", result.Message);
+        Assert.DoesNotContain(ApprovalRequestHelper.PluginNotFoundMessage, result.Message);
+    }
+
+    [Fact]
+    public async Task AutoApproveNodePairing_ReturnsTerminalWhenPendingListReportsDevicePairPluginNotFound()
+    {
+        var ctx = CreatePairingContext(DevicePairPluginNotFoundOutput);
+
+        var result = await PairNodeStep.AutoApproveNodePairing(ctx, requestId: null, CancellationToken.None);
+
+        Assert.Equal(StepOutcome.FailedTerminal, result.Outcome);
+        Assert.Equal(ApprovalRequestHelper.PluginNotFoundMessage, result.Message);
+    }
+
+    [Fact]
+    public async Task AutoApproveNodePairing_KeepsOtherPendingListMissingPluginRetriable()
+    {
+        var ctx = CreatePairingContext(OtherPluginNotFoundOutput);
+
+        var result = await PairNodeStep.AutoApproveNodePairing(ctx, requestId: null, CancellationToken.None);
+
+        Assert.Equal(StepOutcome.Failed, result.Outcome);
+        Assert.Contains("Could not list pending node pairing requests", result.Message);
+        Assert.DoesNotContain(ApprovalRequestHelper.PluginNotFoundMessage, result.Message);
+    }
+
+    [Fact]
+    public async Task AutoApproveNodePairing_ReturnsTerminalWhenApproveReportsDevicePairPluginNotFound()
+    {
+        var ctx = CreatePairingContext(DevicePairPluginNotFoundOutput);
+
+        var result = await PairNodeStep.AutoApproveNodePairing(ctx, "node-req-1", CancellationToken.None);
+
+        Assert.Equal(StepOutcome.FailedTerminal, result.Outcome);
+        Assert.Equal(ApprovalRequestHelper.PluginNotFoundMessage, result.Message);
+    }
+
+    [Fact]
+    public async Task AutoApproveNodePairing_KeepsOtherApproveMissingPluginRetriable()
+    {
+        var ctx = CreatePairingContext(OtherPluginNotFoundOutput);
+
+        var result = await PairNodeStep.AutoApproveNodePairing(ctx, "node-req-1", CancellationToken.None);
+
+        Assert.Equal(StepOutcome.Failed, result.Outcome);
+        Assert.Contains("Node approval failed", result.Message);
+        Assert.DoesNotContain(ApprovalRequestHelper.PluginNotFoundMessage, result.Message);
     }
 
     // ─── Bind validation ───
@@ -1230,18 +2210,1239 @@ public class SetupStepsTests : IDisposable
         Assert.Empty(scopeProps);
     }
 
+    [Fact]
+    public async Task ValidateWslLockdown_RetriesWslConfReadAfterStartupTimeout()
+    {
+        var catAttempts = 0;
+        var ctx = CreateContext(commands: new FakeCommandRunner(
+            _ => Ok(),
+            (_, command, _) =>
+            {
+                if (command == "cat /etc/wsl.conf")
+                {
+                    catAttempts++;
+                    return catAttempts == 1
+                        ? TimedOut()
+                        : Ok("""
+                            [boot]
+                            systemd=true
+
+                            [automount]
+                            enabled=false
+                            mountFsTab=false
+
+                            [interop]
+                            enabled=false
+                            appendWindowsPath=false
+
+                            [user]
+                            default=openclaw
+                            """);
+                }
+
+                if (command.Contains("LOCKDOWN_VALID", StringComparison.Ordinal))
+                    return Ok("LOCKDOWN_VALID\n");
+
+                return Fail("unexpected WSL command");
+            }));
+        ctx.DistroName = "test-distro";
+
+        var result = await new ValidateWslLockdownStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(2, catAttempts);
+    }
+
+    // ─── PairOperatorStep: Windows-side gateway health check ───
+
+    [Fact]
+    public async Task PairOperatorStep_FailsWhenGatewayNotReachableFromWindows()
+    {
+        // Allocate a port and immediately release it so nothing is listening on it.
+        var port = GetFreeTcpPort();
+
+        var config = new SetupConfig { GatewayPort = port };
+        var ctx = CreateContext(config);
+        ctx.SharedGatewayToken = "test-shared-token";
+
+        var step = new PairOperatorStep();
+        var result = await step.ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.Equal(StepOutcome.Failed, result.Outcome);
+        Assert.Contains("not reachable", result.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void WindowsNodeContext_CanSkipWhenDisabled()
+    {
+        var ctx = CreateContext(new SetupConfig
+        {
+            WindowsNodeContext = new WindowsNodeContextConfig { Enabled = false }
+        });
+
+        Assert.True(new WindowsNodeBootstrapContextStep().CanSkip(ctx));
+    }
+
+    [Fact]
+    public void WindowsNodeContext_BuildApplyScript_UsesAbsolutePathAndMinimalShape()
+    {
+        var script = WindowsNodeBootstrapContextStep.BuildApplyScript("/home/openclaw/.openclaw/workspace");
+
+        Assert.Contains("set -o pipefail", script);
+        Assert.Contains("workspace='/home/openclaw/.openclaw/workspace'", script);
+        Assert.Contains("AGENTS_SYMLINK:$agents", script);
+        Assert.Contains("mkdir -p \"$workspace\"", script);
+        Assert.Contains(": > \"$agents\"", script);
+        Assert.Contains("WINDOWS_NODE_CONTEXT_BOOTSTRAP_FALLBACK", script);
+        Assert.Contains("awk -v BEGIN_M=\"$begin_marker\" -v END_M=\"$end_marker\"", script);
+        Assert.Contains("printf '%s' \"$block_b64\" | base64 -d >> \"$tmp\"", script);
+        Assert.Contains("mktemp \"$workspace/.AGENTS.md.openclaw.XXXXXX\"", script);
+        Assert.Contains("chmod --reference=\"$agents\" \"$tmp\"", script);
+        Assert.Contains("sub(/\\r$/, \"\", marker_line)", script);
+        Assert.Contains("WINDOWS_NODE_CONTEXT_MARKERS_MALFORMED", script);
+        Assert.Contains("WINDOWS_NODE_CONTEXT_READY", script);
+        // Must not depend on node or carry an embedded JS payload.
+        Assert.DoesNotContain(" node ", script);
+        Assert.DoesNotContain(" node -", script);
+        Assert.DoesNotContain("apply_js_b64", script);
+        Assert.DoesNotContain("openclaw setup", script);
+        Assert.DoesNotContain("openclaw config get", script);
+        Assert.DoesNotContain("AGENTS_MISSING_AFTER_SETUP", script);
+        Assert.DoesNotContain("$HOME", script);
+        Assert.DoesNotContain("case \"$candidate\"", script);
+        Assert.DoesNotContain("<<'NODE'", script);
+        Assert.DoesNotContain("OPENCLAW_GATEWAY_TOKEN", script);
+    }
+
+    [Fact]
+    public void WindowsNodeContext_BuildRollbackScript_UsesAbsolutePathAndMinimalShape()
+    {
+        var script = WindowsNodeBootstrapContextStep.BuildRollbackScript("/home/openclaw/.openclaw/workspace");
+
+        Assert.Contains("set -o pipefail", script);
+        Assert.Contains("workspace='/home/openclaw/.openclaw/workspace'", script);
+        Assert.Contains("awk -v BEGIN_M=\"$begin_marker\" -v END_M=\"$end_marker\"", script);
+        Assert.Contains("mktemp \"$workspace/.AGENTS.md.openclaw.XXXXXX\"", script);
+        Assert.Contains("chmod --reference=\"$agents\" \"$tmp\"", script);
+        Assert.Contains("sub(/\\r$/, \"\", marker_line)", script);
+        Assert.Contains("WINDOWS_NODE_CONTEXT_ABSENT", script);
+        Assert.Contains("WINDOWS_NODE_CONTEXT_REMOVED", script);
+        Assert.Contains("AGENTS_SYMLINK_ROLLBACK_SKIPPED:$agents", script);
+        Assert.Contains("exit 5", script);
+        // Must not depend on node or carry an embedded JS payload.
+        Assert.DoesNotContain(" node ", script);
+        Assert.DoesNotContain(" node -", script);
+        Assert.DoesNotContain("rollback_js_b64", script);
+        Assert.DoesNotContain("openclaw setup", script);
+        Assert.DoesNotContain("openclaw config get", script);
+        Assert.DoesNotContain("rm -f \"$agents\"", script);
+        Assert.DoesNotContain("$HOME", script);
+        Assert.DoesNotContain("case \"$candidate\"", script);
+        Assert.DoesNotContain("<<'NODE'", script);
+    }
+
+    // Characterization (PR 3 WslShellQuoting migration): the workspace path is emitted as a
+    // fully-wrapped POSIX token, so an embedded single quote must close-escape-reopen ('\'')
+    // and remain single-quoted. Pins the generated script byte-for-byte.
+    [Fact]
+    public void WindowsNodeContext_BuildApplyScript_QuotesWorkspacePathWithEmbeddedSingleQuote()
+    {
+        var script = WindowsNodeBootstrapContextStep.BuildApplyScript("/home/o'brien/.openclaw/workspace");
+
+        Assert.Contains("workspace='/home/o'\\''brien/.openclaw/workspace'", script);
+    }
+
+    [Fact]
+    public void WindowsNodeContext_BuildRollbackScript_QuotesWorkspacePathWithEmbeddedSingleQuote()
+    {
+        var script = WindowsNodeBootstrapContextStep.BuildRollbackScript("/home/o'brien/.openclaw/workspace");
+
+        Assert.Contains("workspace='/home/o'\\''brien/.openclaw/workspace'", script);
+    }
+
+    [Theory]
+    [InlineData("/home/openclaw/.openclaw/workspace", "/home/openclaw", "/home/openclaw/.openclaw/workspace")]
+    [InlineData("~", "/home/openclaw", "/home/openclaw")]
+    [InlineData("~/.openclaw/custom workspace", "/home/openclaw", "/home/openclaw/.openclaw/custom workspace")]
+    [InlineData("relative/path", "/home/openclaw", "/home/openclaw/relative/path")]
+    [InlineData("", "/home/openclaw", "/home/openclaw/.openclaw/workspace")]
+    [InlineData("null", "/home/openclaw", "/home/openclaw/.openclaw/workspace")]
+    [InlineData("undefined", "/home/openclaw", "/home/openclaw/.openclaw/workspace")]
+    [InlineData("/abs/path", "/home/openclaw/", "/abs/path")]
+    [InlineData("~/x", "/home/openclaw/", "/home/openclaw/x")]
+    public void WindowsNodeContext_ExpandLinuxPath_ResolvesCorrectly(string input, string home, string expected)
+    {
+        Assert.Equal(expected, WindowsNodeBootstrapContextStep.ExpandLinuxPath(input, home));
+    }
+
+    [Theory]
+    [InlineData("\"/home/openclaw/.openclaw/workspace\"\n", "/home/openclaw/.openclaw/workspace")]
+    [InlineData("Config warnings:\n- plugins.entries.device-pair\n\"/home/openclaw/.openclaw/workspace\"\n", "/home/openclaw/.openclaw/workspace")]
+    [InlineData("\"~/.openclaw/workspace\"\n", "~/.openclaw/workspace")]
+    [InlineData("/home/openclaw/.openclaw/workspace\n", "/home/openclaw/.openclaw/workspace")]
+    [InlineData("null\n", null)]
+    [InlineData("", null)]
+    public void WindowsNodeContext_ExtractWorkspaceFromConfigOutput_ParsesValues(string stdout, string? expected)
+    {
+        Assert.Equal(expected, WindowsNodeBootstrapContextStep.ExtractWorkspaceFromConfigOutput(stdout));
+    }
+
+    [Theory]
+    [InlineData("[{\"id\":\"main\",\"workspace\":\"/home/openclaw/main\",\"isDefault\":true}]", "/home/openclaw/main")]
+    [InlineData("Warning\n[\n  {\"id\":\"other\",\"workspace\":\"/home/openclaw/other\",\"isDefault\":false},\n  {\"id\":\"primary\",\"workspace\":\"/home/openclaw/primary\",\"isDefault\":true}\n]\n", "/home/openclaw/primary")]
+    [InlineData("[{\"id\":\"main\",\"workspace\":\"~/main\"}]", "~/main")]
+    [InlineData("not json", null)]
+    public void WindowsNodeContext_ExtractDefaultAgentWorkspace_ParsesCanonicalAgentsList(string stdout, string? expected)
+    {
+        Assert.Equal(expected, WindowsNodeBootstrapContextStep.ExtractDefaultAgentWorkspaceFromAgentsOutput(stdout));
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Execute_RunsInWslAsConfiguredUserAndResolvesWorkspace()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return Ok("/home/openclaw\n");
+                if (command.Contains("openclaw agents list --json"))
+                    return Ok(AgentsListJson("/home/openclaw/.openclaw/workspace"));
+                if (command.Contains("openclaw setup"))
+                    return Ok("");
+                if (command.Contains("openclaw config get agents.defaults.workspace"))
+                    return Ok("\"~/.openclaw/workspace\"\n");
+                if (command.Contains("WINDOWS_NODE_CONTEXT_READY"))
+                    return Ok(string.Join("\n",
+                        "WINDOWS_NODE_CONTEXT_BOOTSTRAP_FALLBACK:/home/openclaw/.openclaw/workspace/AGENTS.md",
+                        "WINDOWS_NODE_CONTEXT_WORKSPACE:/home/openclaw/.openclaw/workspace",
+                        "WINDOWS_NODE_CONTEXT_READY",
+                        ""));
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var ctx = CreateContext(commands: commands);
+
+        var result = await new WindowsNodeBootstrapContextStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal(5, commands.WslCalls.Count);
+        Assert.All(commands.WslCalls, c =>
+        {
+            Assert.Equal("OpenClawGateway", c.DistroName);
+            Assert.Equal("openclaw", c.User);
+        });
+        Assert.Contains("getent passwd", commands.WslCalls[0].Command);
+        Assert.Contains("openclaw agents list --json", commands.WslCalls[1].Command);
+        Assert.Contains("openclaw config get agents.defaults.workspace", commands.WslCalls[2].Command);
+        Assert.Contains("openclaw setup --help", commands.WslCalls[3].Command);
+        Assert.Contains("openclaw setup --baseline --workspace '/home/openclaw/.openclaw/workspace'", commands.WslCalls[3].Command);
+        Assert.Contains("openclaw setup --workspace '/home/openclaw/.openclaw/workspace'", commands.WslCalls[3].Command);
+        Assert.Contains("workspace='/home/openclaw/.openclaw/workspace'", commands.WslCalls[4].Command);
+        // getent uses $(id -un) command-substitution and no $vars, so argv path is safe.
+        Assert.False(commands.WslCalls[0].InputViaStdin);
+        // agents list + config get + openclaw setup scripts reference $PATH via WslPathPrefix,
+        // which wsl.exe would rewrite on the argv path — see docs/WSL_EXE_ARGV_PITFALL.md.
+        Assert.True(commands.WslCalls[1].InputViaStdin);
+        Assert.True(commands.WslCalls[2].InputViaStdin);
+        Assert.True(commands.WslCalls[3].InputViaStdin);
+        // Apply script uses $workspace etc., must use stdin.
+        Assert.True(commands.WslCalls[4].InputViaStdin);
+        var state = await WindowsNodeBootstrapContextStep.ReadInstallStateAsync(ctx, CancellationToken.None);
+        Assert.Contains(state.Targets, target =>
+            target.DistroName == "OpenClawGateway" &&
+            target.User == "openclaw" &&
+            target.WorkspacePath == "/home/openclaw/.openclaw/workspace");
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Execute_ResolvesRelativeConfiguredWorkspaceFromGatewayUserHome()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return Ok("/home/openclaw\n");
+                if (command.Contains("openclaw agents list --json"))
+                    return Ok(AgentsListJson("/home/openclaw/relative/workspace"));
+                if (command.Contains("openclaw setup"))
+                    return Ok("");
+                if (command.Contains("openclaw config get agents.defaults.workspace"))
+                    return Ok("\"relative/workspace\"\n");
+                if (command.Contains("workspace='/home/openclaw/relative/workspace'"))
+                    return Ok("WINDOWS_NODE_CONTEXT_READY\n");
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var ctx = CreateContext(commands: commands);
+
+        var result = await new WindowsNodeBootstrapContextStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Contains(commands.WslCalls,
+            c => c.Command.Contains("openclaw setup --workspace '/home/openclaw/relative/workspace'"));
+        Assert.Contains(commands.WslCalls,
+            c => c.Command.Contains("workspace='/home/openclaw/relative/workspace'"));
+        Assert.DoesNotContain(commands.WslCalls, c => c.Command == "pwd -P");
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Execute_UsesDefaultOnlyWhenWorkspaceKeyIsAbsent()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return Ok("/home/openclaw\n");
+                if (command.Contains("openclaw agents list --json"))
+                    return Ok(AgentsListJson("/home/openclaw/.openclaw/workspace"));
+                if (command.Contains("openclaw config get agents.defaults.workspace"))
+                    return new CommandResult(
+                        1,
+                        "",
+                        "Config path not found: agents.defaults.workspace. Run openclaw config validate to inspect config shape.",
+                        TimeSpan.Zero,
+                        TimedOut: false);
+                if (command.Contains("openclaw setup --workspace '/home/openclaw/.openclaw/workspace'"))
+                    return Ok();
+                if (command.Contains("workspace='/home/openclaw/.openclaw/workspace'"))
+                    return Ok("WINDOWS_NODE_CONTEXT_READY\n");
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var ctx = CreateContext(commands: commands);
+
+        var result = await new WindowsNodeBootstrapContextStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Contains(commands.WslCalls,
+            c => c.Command.Contains("openclaw setup --workspace '/home/openclaw/.openclaw/workspace'"));
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Execute_DoesNotPersistDefaultWhenWorkspaceLookupFails()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return Ok("/home/openclaw\n");
+                if (command.Contains("openclaw agents list --json"))
+                    return Ok(AgentsListJson("/home/openclaw/.openclaw/workspace"));
+                if (command.Contains("openclaw config get agents.defaults.workspace"))
+                    return Fail("gateway config is temporarily unavailable");
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var ctx = CreateContext(commands: commands);
+
+        var result = await new WindowsNodeBootstrapContextStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.Equal(StepOutcome.Failed, result.Outcome);
+        Assert.Contains("Could not resolve OpenClaw default workspace path", result.Message);
+        Assert.DoesNotContain(commands.WslCalls, c => c.Command.Contains("openclaw setup"));
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Execute_DoesNotPersistDefaultForMalformedWorkspaceOutput()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return Ok("/home/openclaw\n");
+                if (command.Contains("openclaw agents list --json"))
+                    return Ok(AgentsListJson("/home/openclaw/.openclaw/workspace"));
+                if (command.Contains("openclaw config get agents.defaults.workspace"))
+                    return Ok("Config warning without a value\n");
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var ctx = CreateContext(commands: commands);
+
+        var result = await new WindowsNodeBootstrapContextStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.Equal(StepOutcome.Failed, result.Outcome);
+        Assert.DoesNotContain(commands.WslCalls, c => c.Command.Contains("openclaw setup"));
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Execute_UsesEffectiveDefaultAgentWorkspaceWithoutRewritingDefaults()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return Ok("/home/openclaw\n");
+                if (command.Contains("openclaw agents list --json"))
+                    return Ok(AgentsListJson("/home/openclaw/main-agent"));
+                if (command.Contains("openclaw config get agents.defaults.workspace"))
+                    return Ok("\"~/.openclaw/workspace\"\n");
+                if (command.Contains("workspace='/home/openclaw/main-agent'"))
+                    return Ok("WINDOWS_NODE_CONTEXT_READY\n");
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var ctx = CreateContext(commands: commands);
+
+        var result = await new WindowsNodeBootstrapContextStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.DoesNotContain(commands.WslCalls, c => c.Command.Contains("openclaw setup"));
+        Assert.Contains(commands.WslCalls, c => c.Command.Contains("workspace='/home/openclaw/main-agent'"));
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Execute_FailsWhenEffectiveAgentWorkspaceLookupFails()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return Ok("/home/openclaw\n");
+                if (command.Contains("openclaw agents list --json"))
+                    return Fail("agents unavailable");
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var ctx = CreateContext(commands: commands);
+        var priorTarget = new WindowsNodeContextTarget("prior-distro", "openclaw", "/prior/workspace");
+        await WindowsNodeBootstrapContextStep.RecordAppliedTargetAsync(
+            ctx,
+            priorTarget,
+            CancellationToken.None);
+
+        var step = new WindowsNodeBootstrapContextStep();
+        var result = await step.ExecuteAsync(ctx, CancellationToken.None);
+        var callsAfterExecute = commands.WslCalls.Count;
+        await step.RollbackAsync(ctx, CancellationToken.None);
+
+        Assert.Equal(StepOutcome.Failed, result.Outcome);
+        Assert.Contains("Could not resolve OpenClaw agent workspace path", result.Message);
+        Assert.DoesNotContain(commands.WslCalls, c => c.Command.Contains("openclaw config get"));
+        Assert.DoesNotContain(commands.WslCalls, c => c.Command.Contains("openclaw setup"));
+        Assert.Equal(callsAfterExecute, commands.WslCalls.Count);
+        var state = await WindowsNodeBootstrapContextStep.ReadInstallStateAsync(ctx, CancellationToken.None);
+        Assert.Equal([priorTarget], state.Targets);
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Execute_RemovesNewStateWhenSymlinkCheckMakesNoChange()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return Ok("/home/openclaw\n");
+                if (command.Contains("openclaw agents list --json"))
+                    return Ok(AgentsListJson("/home/openclaw/.openclaw/workspace"));
+                if (command.Contains("openclaw config get agents.defaults.workspace"))
+                    return Ok("\"~/.openclaw/workspace\"\n");
+                if (command.Contains("openclaw setup"))
+                    return Ok();
+                if (command.Contains("AGENTS_SYMLINK:$agents"))
+                    return new CommandResult(2, "", "AGENTS_SYMLINK", TimeSpan.Zero, TimedOut: false);
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var ctx = CreateContext(commands: commands);
+
+        var step = new WindowsNodeBootstrapContextStep();
+        var result = await step.ExecuteAsync(ctx, CancellationToken.None);
+        var callsAfterExecute = commands.WslCalls.Count;
+        await step.RollbackAsync(ctx, CancellationToken.None);
+
+        Assert.Equal(StepOutcome.Failed, result.Outcome);
+        Assert.False(File.Exists(WindowsNodeBootstrapContextStep.InstallStatePath(ctx)));
+        Assert.Equal(callsAfterExecute, commands.WslCalls.Count);
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Execute_UsesExplicitWorkspaceOverride()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return Ok("/home/openclaw\n");
+                if (command.Contains("openclaw setup --workspace"))
+                    return Ok("");
+                if (command.Contains("workspace='/custom/abs/path'"))
+                    return Ok("WINDOWS_NODE_CONTEXT_READY\n");
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var ctx = CreateContext(new SetupConfig
+        {
+            WindowsNodeContext = new WindowsNodeContextConfig { WorkspacePath = "/custom/abs/path" }
+        }, commands);
+
+        var result = await new WindowsNodeBootstrapContextStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess, result.Message);
+        // No config-get call when override is set.
+        Assert.DoesNotContain(commands.WslCalls, c => c.Command.Contains("openclaw config get"));
+        // Absolute path threads through to BOTH the setup command and the apply script
+        // (verified by the apply script asserting workspace='/custom/abs/path').
+        Assert.Contains(commands.WslCalls, c => c.Command.Contains("openclaw setup --workspace '/custom/abs/path'"));
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Execute_OverrideWithTilde_ExpandsBeforePassingToSetup()
+    {
+        // Regression: a ~/foo override must be expanded once so that the same
+        // absolute path goes to `openclaw setup --workspace` and the apply script.
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return Ok("/home/openclaw\n");
+                if (command.Contains("openclaw setup --workspace"))
+                    return Ok("");
+                if (command.Contains("workspace='/home/openclaw/custom-ws'"))
+                    return Ok("WINDOWS_NODE_CONTEXT_READY\n");
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var ctx = CreateContext(new SetupConfig
+        {
+            WindowsNodeContext = new WindowsNodeContextConfig { WorkspacePath = "~/custom-ws" }
+        }, commands);
+
+        var result = await new WindowsNodeBootstrapContextStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Contains(commands.WslCalls,
+            c => c.Command.Contains("openclaw setup --workspace '/home/openclaw/custom-ws'"));
+        Assert.DoesNotContain(commands.WslCalls,
+            c => c.Command.Contains("--workspace '~/custom-ws'"));
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Rollback_RunsRollbackScriptViaStdin()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return Ok("/home/openclaw\n");
+                if (command.Contains("openclaw agents list --json"))
+                    return Ok(AgentsListJson("/home/openclaw/.openclaw/workspace"));
+                if (command.Contains("WINDOWS_NODE_CONTEXT_REMOVED"))
+                    return Ok("WINDOWS_NODE_CONTEXT_REMOVED\n");
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var ctx = CreateContext(commands: commands);
+        await WindowsNodeBootstrapContextStep.RecordAppliedTargetAsync(
+            ctx,
+            new WindowsNodeContextTarget("recorded-distro", "recorded-user", "/recorded/workspace"),
+            CancellationToken.None);
+
+        await new WindowsNodeBootstrapContextStep().RollbackAsync(ctx, CancellationToken.None);
+
+        Assert.NotEmpty(commands.WslCalls);
+        // Last call is the rollback script and must use stdin.
+        Assert.Contains("WINDOWS_NODE_CONTEXT_REMOVED", commands.WslCalls[^1].Command);
+        Assert.True(commands.WslCalls[^1].InputViaStdin);
+        var rollback = Assert.Single(commands.WslCalls);
+        Assert.Equal("recorded-distro", rollback.DistroName);
+        Assert.Equal("recorded-user", rollback.User);
+        Assert.Contains("workspace='/recorded/workspace'", rollback.Command);
+        Assert.False(File.Exists(WindowsNodeBootstrapContextStep.InstallStatePath(ctx)));
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Rollback_PropagatesCleanupFailureAndKeepsStateForRetry()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) => command.Contains("WINDOWS_NODE_CONTEXT_REMOVED")
+                ? Fail("cannot update AGENTS.md")
+                : Fail($"unexpected wsl command: {command}"));
+        var ctx = CreateContext(commands: commands);
+        await WindowsNodeBootstrapContextStep.RecordAppliedTargetAsync(
+            ctx,
+            new WindowsNodeContextTarget("recorded-distro", "recorded-user", "/recorded/workspace"),
+            CancellationToken.None);
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new WindowsNodeBootstrapContextStep().RollbackAsync(ctx, CancellationToken.None));
+
+        Assert.Contains("cannot update AGENTS.md", error.Message);
+        Assert.True(File.Exists(WindowsNodeBootstrapContextStep.InstallStatePath(ctx)));
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Rollback_RemovesExistingTargetStateAfterCleanup()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return Ok("/home/openclaw\n");
+                if (command.Contains("openclaw agents list --json"))
+                    return Ok(AgentsListJson("/home/openclaw/.openclaw/workspace"));
+                if (command.Contains("openclaw config get agents.defaults.workspace"))
+                    return Ok("\"~/.openclaw/workspace\"\n");
+                if (command.Contains("openclaw setup"))
+                    return Ok();
+                if (command.Contains("WINDOWS_NODE_CONTEXT_READY"))
+                    return Ok("WINDOWS_NODE_CONTEXT_READY\n");
+                if (command.Contains("WINDOWS_NODE_CONTEXT_REMOVED"))
+                    return Ok("WINDOWS_NODE_CONTEXT_REMOVED\n");
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var ctx = CreateContext(commands: commands);
+        var target = new WindowsNodeContextTarget(
+            "OpenClawGateway",
+            "openclaw",
+            "/home/openclaw/.openclaw/workspace");
+        await WindowsNodeBootstrapContextStep.RecordAppliedTargetAsync(ctx, target, CancellationToken.None);
+        var step = new WindowsNodeBootstrapContextStep();
+        Assert.True((await step.ExecuteAsync(ctx, CancellationToken.None)).IsSuccess);
+
+        await step.RollbackAsync(ctx, CancellationToken.None);
+
+        Assert.False(File.Exists(WindowsNodeBootstrapContextStep.InstallStatePath(ctx)));
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Rollback_TreatsMissingRecordedDistroAsCleaned()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) => command.Contains("WINDOWS_NODE_CONTEXT_REMOVED")
+                ? new CommandResult(1, "", "WSL_E_DISTRO_NOT_FOUND", TimeSpan.Zero, TimedOut: false)
+                : Fail($"unexpected wsl command: {command}"));
+        var ctx = CreateContext(commands: commands);
+        await WindowsNodeBootstrapContextStep.RecordAppliedTargetAsync(
+            ctx,
+            new WindowsNodeContextTarget("missing-distro", "openclaw", "/recorded/workspace"),
+            CancellationToken.None);
+
+        await new WindowsNodeBootstrapContextStep().RollbackAsync(ctx, CancellationToken.None);
+
+        Assert.False(File.Exists(WindowsNodeBootstrapContextStep.InstallStatePath(ctx)));
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Rollback_CleansLegacyEffectiveWorkspaceWithoutStateFile()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return Ok("/home/openclaw\n");
+                if (command.Contains("openclaw agents list --json"))
+                    return Ok(AgentsListJson("/home/openclaw/legacy-main"));
+                if (command.Contains("WINDOWS_NODE_CONTEXT_REMOVED"))
+                    return Ok("WINDOWS_NODE_CONTEXT_REMOVED\n");
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var ctx = CreateContext(commands: commands);
+
+        await new WindowsNodeBootstrapContextStep().RollbackAsync(ctx, CancellationToken.None);
+
+        Assert.Contains(commands.WslCalls, call => call.Command.Contains("getent passwd"));
+        Assert.Contains(commands.WslCalls, call => call.Command.Contains("openclaw agents list --json"));
+        Assert.Contains(commands.WslCalls, call => call.Command.Contains("workspace='/home/openclaw/legacy-main'"));
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Execute_FailsWhenHomeUnresolvable()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return new CommandResult(1, "", "", TimeSpan.Zero, TimedOut: false);
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var ctx = CreateContext(commands: commands);
+
+        var result = await new WindowsNodeBootstrapContextStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.Equal(StepOutcome.Failed, result.Outcome);
+        Assert.Contains("Could not resolve Linux home directory", result.Message);
+    }
+
+    [Fact]
+    public async Task WindowsNodeContext_Execute_FailsWithoutReadyMarker()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("unexpected RunAsync"),
+            (_, command, _) =>
+            {
+                if (command.Contains("getent passwd"))
+                    return Ok("/home/openclaw\n");
+                if (command.Contains("openclaw agents list --json"))
+                    return Ok(AgentsListJson("/home/openclaw/.openclaw/workspace"));
+                if (command.Contains("openclaw setup"))
+                    return Ok("");
+                if (command.Contains("openclaw config get agents.defaults.workspace"))
+                    return Ok("\"~/.openclaw/workspace\"\n");
+                return Fail("apply script failed");
+            });
+        var ctx = CreateContext(commands: commands);
+
+        var result = await new WindowsNodeBootstrapContextStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.Equal(StepOutcome.Failed, result.Outcome);
+        Assert.Contains("Windows node context injection failed", result.Message);
+    }
+
     private static CommandResult Ok(string stdout = "", string stderr = "")
         => new(0, stdout, stderr, TimeSpan.Zero, TimedOut: false);
 
     private static CommandResult Fail(string stderr = "")
         => new(1, "", stderr, TimeSpan.Zero, TimedOut: false);
 
+    private static CommandResult FailWithStdout(string stdout)
+        => new(1, stdout, "", TimeSpan.Zero, TimedOut: false);
+
+    private static CommandResult TimedOut()
+        => new(-1, "", "", TimeSpan.FromSeconds(30), TimedOut: true);
+
+    private static string AgentsListJson(string workspace, string id = "main", bool isDefault = true)
+        => JsonSerializer.Serialize(new[] { new { id, workspace, isDefault } });
+
+    private static string NulSeparated(string value)
+        => string.Join("\0", value.ToCharArray()) + "\0";
+
+    private SetupContext CreatePairingContext(string failureStdout)
+    {
+        var commands = new FakeCommandRunner(
+            _ => Ok(),
+            (_, _, _) => FailWithStdout(failureStdout));
+        var ctx = CreateContext(commands: commands);
+        ctx.DistroName = "test-distro";
+        ctx.SharedGatewayToken = "shared-token";
+        return ctx;
+    }
+
+    // Shared scenario for the node-pairing cancellation tests: a reachable gateway HTTP endpoint (so
+    // WindowsGatewayReachability.VerifyAsync passes), a silent WebSocket the node client parks against,
+    // a fake WSL runner whose approval drain is empty, and a seeded gateway registry record — enough to
+    // drive the REAL PairNodeStep to its node-connection wait. `ctxToken` becomes the SetupContext's
+    // CancellationToken (used by the pipeline); pass CancellationToken.None when cancelling the step call
+    // directly. The caller disposes the returned `ws`/`http`.
+    private (SetupContext ctx, SilentWebSocketServer ws, HttpListener http, SetupLogger logger)
+        BuildNodePairingScenario(CancellationToken ctxToken)
+    {
+        var httpPort = GetFreeTcpPort();
+        var http = new HttpListener();
+        http.Prefixes.Add($"http://localhost:{httpPort}/");
+        http.Start();
+        _ = Task.Run(async () =>
+        {
+            while (http.IsListening)
+            {
+                HttpListenerContext c;
+                try { c = await http.GetContextAsync(); }
+                catch { return; }
+                c.Response.StatusCode = 200;
+                c.Response.Close();
+            }
+        });
+
+        var ws = new SilentWebSocketServer();
+        var commands = new FakeCommandRunner(_ => Ok(), (_, _, _) => Ok(stdout: "No pending device approvals"));
+        var logger = new SetupLogger(filePath: null, LogLevel.Trace);
+        var ctx = new SetupContext(
+            new SetupConfig { GatewayPort = httpPort }, logger,
+            new TransactionJournal(filePath: null), commands, ctxToken);
+        ctx.DistroName = "test-distro";
+        ctx.SharedGatewayToken = "test-token-placeholder";
+        ctx.GatewayUrl = $"ws://127.0.0.1:{ws.Port}";
+        ctx.GatewayRecordId = "test-gw";
+
+        var registry = new GatewayRegistry(_tempDir);
+        registry.Load();
+        registry.AddOrUpdate(new GatewayRecord
+        {
+            Id = "test-gw",
+            Url = ctx.GatewayUrl,
+            IsLocal = true,
+            SetupManagedDistroName = ctx.DistroName,
+            SshTunnel = null,
+        });
+        registry.Save();
+        return (ctx, ws, http, logger);
+    }
+
+    // The step itself must rethrow a caller cancel rather than swallow it into StepResult.Fail.
+    [Fact]
+    public async Task PairNodeStep_CallerCancellation_PropagatesInsteadOfFailing()
+    {
+        var (ctx, ws, http, _) = BuildNodePairingScenario(CancellationToken.None);
+        using (ws)
+        using (http)
+        {
+            using var callerCts = new CancellationTokenSource();
+            var task = new PairNodeStep().ExecuteAsync(ctx, callerCts.Token);
+            await ws.UpgradeCompleted;   // deterministic barrier: the client is in its node-connection wait
+            callerCts.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task);
+        }
+    }
+
+    // Durable end-to-end contract (the user-visible behavior the PR promises): driving the REAL
+    // SetupPipeline with the real PairNodeStep and a caller cancel, the pipeline reports Cancelled/exit 3,
+    // emits NO "connection failed"/retry warning, and journals the abort as a cancellation — not a
+    // failed-step narrative. On base the step's retry masks the *outcome* to Cancelled too, so the
+    // log/journal assertions are what actually pin this fix.
+    [Fact]
+    public async Task SetupPipeline_CallerCancel_CancelsCleanlyWithoutFailureNarrative()
+    {
+        using var callerCts = new CancellationTokenSource();
+        var (ctx, ws, http, logger) = BuildNodePairingScenario(callerCts.Token);
+        using (ws)
+        using (http)
+        {
+            var logs = new List<LogEntry>();
+            logger.LogEmitted += (_, e) => { lock (logs) { logs.Add(e); } };
+
+            var pipeline = new SetupPipeline(new SetupStep[] { new PairNodeStep() }, rollbackOnFailureOverride: false);
+            var run = pipeline.RunAsync(ctx);
+            await ws.UpgradeCompleted;
+            callerCts.Cancel();
+            var result = await run;
+
+            _output.WriteLine($"SetupPipeline on caller-cancel → Outcome={result.Outcome}, ExitCode={result.ExitCode}");
+
+            // 1. user-observable outcome
+            Assert.Equal(PipelineOutcome.Cancelled, result.Outcome);
+            Assert.Equal(3, result.ExitCode);
+
+            // 2. no misleading connection-failure / retry warning for a user abort
+            List<LogEntry> snapshot;
+            lock (logs) { snapshot = logs.ToList(); }
+            Assert.DoesNotContain(snapshot, e => e.Message.Contains("Node connection failed", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(snapshot, e => e.Level == LogLevel.Warn && e.Message.Contains("retrying", StringComparison.OrdinalIgnoreCase));
+
+            // 3. journal records the cancellation, not a failed-step narrative
+            Assert.Contains(ctx.Journal.Entries, en => en.Event == "pipeline_cancelled");
+            Assert.DoesNotContain(ctx.Journal.Entries, en => en.Event == "pipeline_failed");
+        }
+    }
+
+    [Fact]
+    public async Task PreflightWindowsTailscale_RequiresRunningMagicDnsClientBeforeCleanup()
+    {
+        var config = new SetupConfig { Tailscale = new TailscaleConfig { Enabled = true } };
+        var commands = new FakeCommandRunner(_ => Ok("""{"BackendState":"Running","Self":{"DNSName":"windows.tailnet.ts.net"}}"""));
+        var ctx = CreateContext(config, commands);
+
+        var result = await new PreflightWindowsTailscaleStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("tailnet.ts.net", ctx.WindowsTailnetDnsSuffix);
+        Assert.Equal("tailnet.ts.net", config.Tailscale.TailnetDnsSuffix);
+        Assert.Contains(commands.Calls, call => call.Arguments.SequenceEqual(["status", "--json"]));
+    }
+
+    [Fact]
+    public async Task InstallTailscale_UsesSignedUbuntuNoblePackageRepository()
+    {
+        var config = new SetupConfig { Tailscale = new TailscaleConfig { Enabled = true } };
+        var commands = new FakeCommandRunner(
+            _ => Fail("Windows commands are not expected"),
+            (_, _, _) => Ok("tailscale 1.98.8"));
+        var ctx = CreateContext(config, commands);
+        ctx.DistroName = "test-distro";
+
+        var result = await new InstallTailscaleStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess, result.Message);
+        var install = Assert.Single(commands.WslCalls);
+        Assert.Equal("root", install.User);
+        Assert.True(install.InputViaStdin);
+        Assert.Contains("VERSION_ID\" != \"24.04", install.Command);
+        Assert.Contains("noble.noarmor.gpg", install.Command);
+        Assert.Contains("signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg", install.Command);
+        Assert.Contains("apt-get install -y tailscale", install.Command);
+        Assert.DoesNotContain("tailscale.com/install.sh", install.Command);
+        Assert.DoesNotContain("gpg --show-keys", install.Command);
+        Assert.DoesNotContain("dpkg-statoverride", install.Command);
+    }
+
+    [Fact]
+    public async Task PreflightWindowsTailscale_RejectsUnsupportedBaseDistroBeforeRunningCommands()
+    {
+        var config = new SetupConfig
+        {
+            BaseDistro = "Debian",
+            Tailscale = new TailscaleConfig { Enabled = true }
+        };
+        var commands = new FakeCommandRunner(_ => Fail("Windows commands are not expected"));
+        var ctx = CreateContext(config, commands);
+
+        var result = await new PreflightWindowsTailscaleStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.Equal(StepOutcome.FailedTerminal, result.Outcome);
+        Assert.Contains("Ubuntu-24.04", result.Message);
+        Assert.Empty(commands.Calls);
+    }
+
+    [Fact]
+    public async Task AuthorizeTailscale_AuthKeyUsesTransientEnvironmentAndDerivesMagicDnsName()
+    {
+        var config = new SetupConfig
+        {
+            Tailscale = new TailscaleConfig
+            {
+                Enabled = true,
+                AuthMode = TailscaleAuthMode.AuthKey,
+                AuthKey = "tskey-auth-only-in-memory",
+                AuthTimeoutSeconds = 30,
+            }
+        };
+        var commands = new FakeCommandRunner(
+            _ => Ok(),
+            (_, command, _) => command.Contains("tailscale status --json")
+                ? Ok("""{"BackendState":"Running","Self":{"DNSName":"openclaw.tailnet.ts.net"}}""")
+                : Ok());
+        var ctx = CreateContext(config, commands);
+        ctx.WindowsTailnetDnsSuffix = "tailnet.ts.net";
+
+        var result = await new AuthorizeTailscaleStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("openclaw.tailnet.ts.net", ctx.TailscaleDnsName);
+        Assert.Null(config.Tailscale.AuthKey);
+        Assert.Contains(commands.WslCalls, call => call.Command.Contains("--auth-key=\"$TS_AUTHKEY\""));
+        Assert.Contains(commands.WslEnvironments, environment => environment?["TS_AUTHKEY"] == "tskey-auth-only-in-memory");
+        Assert.DoesNotContain(commands.WslCalls, call => call.Command.Contains("--operator=", StringComparison.Ordinal));
+        Assert.Contains(commands.WslCalls, call => call.Command.Contains("tailscale up", StringComparison.Ordinal) && call.User == "root");
+    }
+
+    [Fact]
+    public void AuthorizeTailscale_DoesNotUsePipelineRetriesForOneShotAuthorization()
+    {
+        var step = new AuthorizeTailscaleStep();
+
+        Assert.False(step.CanRetry);
+        Assert.Equal(1, step.Retry.MaxAttempts);
+    }
+
+    [Fact]
+    public async Task AuthorizeTailscale_BrowserPresentsUrlWithoutWritingItToSetupState()
+    {
+        var config = new SetupConfig
+        {
+            Tailscale = new TailscaleConfig { Enabled = true, AuthTimeoutSeconds = 30 }
+        };
+        var commands = new FakeCommandRunner(
+            _ => Ok(),
+            (_, command, _) => command.Contains("tailscale up")
+                ? FailWithStdout("https://login.tailscale.com/a/browser-only-token")
+                : command.Contains("tailscale status --json")
+                    ? Ok("""{"BackendState":"Running","Self":{"DNSName":"openclaw.tailnet.ts.net"}}""")
+                    : Ok());
+        var presenter = new RecordingAuthorizationPresenter();
+        var ctx = CreateContext(config, commands);
+        ctx.WindowsTailnetDnsSuffix = "tailnet.ts.net";
+        ctx.ExternalAuthorizationPresenter = presenter;
+
+        var result = await new AuthorizeTailscaleStep().ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("Tailscale", presenter.Request!.Provider);
+        Assert.Equal("https://login.tailscale.com/a/browser-only-token", presenter.Request.AuthorizationUri.AbsoluteUri);
+    }
+
+    [Fact]
+    public async Task AuthorizeTailscale_BrowserReissuesOneStaleAuthorizationPath()
+    {
+        var config = new SetupConfig
+        {
+            Tailscale = new TailscaleConfig { Enabled = true, AuthTimeoutSeconds = 30 }
+        };
+        var upCalls = 0;
+        var statusCalls = 0;
+        var commands = new FakeCommandRunner(
+            _ => Fail("Windows commands are not expected"),
+            (_, command, _) => command.Contains("tailscale up", StringComparison.Ordinal)
+                ? ++upCalls == 1
+                    ? FailWithStdout("https://login.tailscale.com/a/first-token")
+                    : FailWithStdout("https://login.tailscale.com/a/second-token")
+                : command.Contains("tailscale status --json", StringComparison.Ordinal)
+                    ? ++statusCalls == 1
+                        ? Ok("""{"BackendState":"NeedsLogin","Health":["register request: http 410: auth path not found"]}""")
+                        : Ok("""{"BackendState":"Running","Self":{"DNSName":"openclaw.tailnet.ts.net"}}""")
+                    : Ok());
+        var presenter = new RecordingAuthorizationPresenter();
+        var ctx = CreateContext(config, commands);
+        ctx.DistroName = "test-distro";
+        ctx.WindowsTailnetDnsSuffix = "tailnet.ts.net";
+        ctx.ExternalAuthorizationPresenter = presenter;
+
+        var result = await new AuthorizeTailscaleStep(new AdvancingTailscaleClock()).ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal(2, presenter.Requests.Count);
+        Assert.Equal("https://login.tailscale.com/a/second-token", presenter.Request!.AuthorizationUri.AbsoluteUri);
+        Assert.Equal(2, upCalls);
+        Assert.Contains(commands.WslCalls, call => call.Command.Contains("tailscale up", StringComparison.Ordinal) && call.Command.Contains("--force-reauth", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task AuthorizeTailscale_BrowserPresentsOneReplacementStatusUrlWithoutReissuingUp()
+    {
+        var config = new SetupConfig
+        {
+            Tailscale = new TailscaleConfig { Enabled = true, AuthTimeoutSeconds = 30 }
+        };
+        var upCalls = 0;
+        var statusCalls = 0;
+        var commands = new FakeCommandRunner(
+            _ => Fail("Windows commands are not expected"),
+            (_, command, _) => command.Contains("tailscale up", StringComparison.Ordinal)
+                ? ++upCalls == 1
+                    ? FailWithStdout("https://login.tailscale.com/a/first-token")
+                    : Fail("a replacement status URL must not rerun tailscale up")
+                : command.Contains("tailscale status --json", StringComparison.Ordinal)
+                    ? ++statusCalls == 1
+                        ? Ok("""{"BackendState":"NeedsLogin","AuthURL":"https://login.tailscale.com/a/replacement-token"}""")
+                        : Ok("""{"BackendState":"Running","Self":{"DNSName":"openclaw.tailnet.ts.net"}}""")
+                    : Ok());
+        var presenter = new RecordingAuthorizationPresenter();
+        var ctx = CreateContext(config, commands);
+        ctx.DistroName = "test-distro";
+        ctx.WindowsTailnetDnsSuffix = "tailnet.ts.net";
+        ctx.ExternalAuthorizationPresenter = presenter;
+
+        var result = await new AuthorizeTailscaleStep(new AdvancingTailscaleClock()).ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal(1, upCalls);
+        Assert.Equal(2, presenter.Requests.Count);
+        Assert.Equal("https://login.tailscale.com/a/replacement-token", presenter.Request!.AuthorizationUri.AbsoluteUri);
+    }
+
+    [Fact]
+    public async Task AuthorizeTailscale_BrowserReadsAuthorizationUrlFromStatusWhenUpDoesNotPrintIt()
+    {
+        var config = new SetupConfig
+        {
+            Tailscale = new TailscaleConfig { Enabled = true, AuthTimeoutSeconds = 30 }
+        };
+        var statusCalls = 0;
+        var commands = new FakeCommandRunner(
+            _ => Fail("Windows commands are not expected"),
+            (_, command, _) => command.Contains("tailscale up", StringComparison.Ordinal)
+                ? Fail()
+                : command.Contains("tailscale status --json", StringComparison.Ordinal)
+                    ? ++statusCalls == 1
+                        ? Ok("""{"BackendState":"NeedsLogin","AuthURL":"https://login.tailscale.com/a/status-only-token"}""")
+                        : Ok("""{"BackendState":"Running","Self":{"DNSName":"openclaw.tailnet.ts.net"}}""")
+                    : Ok());
+        var presenter = new RecordingAuthorizationPresenter();
+        var ctx = CreateContext(config, commands);
+        ctx.DistroName = "test-distro";
+        ctx.WindowsTailnetDnsSuffix = "tailnet.ts.net";
+        ctx.ExternalAuthorizationPresenter = presenter;
+
+        var result = await new AuthorizeTailscaleStep(new AdvancingTailscaleClock()).ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal("https://login.tailscale.com/a/status-only-token", presenter.Request!.AuthorizationUri.AbsoluteUri);
+        Assert.Equal(2, statusCalls);
+    }
+
+    [Fact]
+    public async Task FinalizeTailscaleServe_RootOwnsServeAndPublishesOnlyWssAfterHealthCheck()
+    {
+        const string expectedStatus = """
+            { "Web": { "openclaw.tailnet.ts.net:443": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:18789" } } } } }
+            """;
+        var routeConfigured = false;
+        var commands = new FakeCommandRunner(
+            _ => Fail("Windows commands are not expected"),
+            (_, command, _) =>
+            {
+                if (command.Contains("tailscale serve status --json", StringComparison.Ordinal))
+                    return routeConfigured ? Ok(expectedStatus) : Ok("{}");
+                if (command.Contains("tailscale serve --bg --yes", StringComparison.Ordinal))
+                {
+                    routeConfigured = true;
+                    return Ok();
+                }
+                if (command.Contains("plugins.entries.device-pair.config.publicUrl", StringComparison.Ordinal))
+                    return Ok();
+                return Fail($"unexpected wsl command: {command}");
+            });
+        var config = new SetupConfig
+        {
+            Tailscale = new TailscaleConfig { Enabled = true, ServeApprovalTimeoutSeconds = 30 }
+        };
+        var ctx = CreateContext(config, commands);
+        ctx.DistroName = "test-distro";
+        ctx.TailscaleDnsName = "openclaw.tailnet.ts.net";
+        var probe = new FakeTailscaleEndpointProbe(TailscaleEndpointProbeResult.Reachable(401));
+
+        var result = await new FinalizeTailscaleServeStep(new AdvancingTailscaleClock(), probe)
+            .ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal("wss://openclaw.tailnet.ts.net", ctx.GatewayUrl);
+        Assert.Equal("https://openclaw.tailnet.ts.net", probe.Endpoint!.AbsoluteUri.TrimEnd('/'));
+        Assert.Contains(commands.WslCalls, call => call.Command.Contains("tailscale serve --bg --yes", StringComparison.Ordinal) && call.User == "root");
+        Assert.Contains(commands.WslCalls, call => call.Command.Contains("device-pair.config.publicUrl", StringComparison.Ordinal));
+        Assert.DoesNotContain(commands.WslCalls, call => call.Command.Contains("tailscale serve", StringComparison.Ordinal) && call.User == "openclaw");
+    }
+
+    [Fact]
+    public async Task FinalizeTailscaleServe_PollsUntilBrowserApprovalConfiguresRoute()
+    {
+        const string expectedStatus = """
+            { "Web": { "openclaw.tailnet.ts.net:443": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:18789" } } } } }
+            """;
+        var statusCalls = 0;
+        var commands = new FakeCommandRunner(
+            _ => Fail("Windows commands are not expected"),
+            (_, command, _) => command.Contains("tailscale serve status --json", StringComparison.Ordinal)
+                ? ++statusCalls == 1 ? Ok("{}") : Ok(expectedStatus)
+                : command.Contains("tailscale serve --bg --yes", StringComparison.Ordinal)
+                    ? RequestBrowserApproval()
+                    : command.Contains("plugins.entries.device-pair.config.publicUrl", StringComparison.Ordinal)
+                        ? Ok()
+                        : Fail($"unexpected wsl command: {command}"));
+        var config = new SetupConfig
+        {
+            Tailscale = new TailscaleConfig { Enabled = true, ServeApprovalTimeoutSeconds = 30 }
+        };
+        var ctx = CreateContext(config, commands);
+        ctx.DistroName = "test-distro";
+        ctx.TailscaleDnsName = "openclaw.tailnet.ts.net";
+        var presenter = new RecordingAuthorizationPresenter();
+        ctx.ExternalAuthorizationPresenter = presenter;
+
+        var result = await new FinalizeTailscaleServeStep(
+                new AdvancingTailscaleClock(),
+                new FakeTailscaleEndpointProbe(TailscaleEndpointProbeResult.Reachable(401)))
+            .ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal(2, statusCalls);
+        Assert.Equal("https://login.tailscale.com/a/serve-approval", presenter.Request!.AuthorizationUri.AbsoluteUri);
+        Assert.Equal("wss://openclaw.tailnet.ts.net", ctx.GatewayUrl);
+
+        CommandResult RequestBrowserApproval()
+        {
+            return FailWithStdout("https://login.tailscale.com/a/serve-approval");
+        }
+    }
+
+    [Fact]
+    public async Task TailscaleHealthFailure_RollsBackServeAndDaemonBeforePairing()
+    {
+        const string expectedStatus = """
+            { "Web": { "openclaw.tailnet.ts.net:443": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:18789" } } } } }
+            """;
+        var commands = new FakeCommandRunner(
+            _ => Fail("Windows commands are not expected"),
+            (_, command, _) => command.Contains("tailscale serve status --json", StringComparison.Ordinal)
+                ? Ok(expectedStatus)
+                : Ok());
+        var config = new SetupConfig
+        {
+            RollbackOnFailure = true,
+            Tailscale = new TailscaleConfig { Enabled = true }
+        };
+        var ctx = CreateContext(config, commands);
+        ctx.DistroName = "test-distro";
+        ctx.TailscaleDnsName = "openclaw.tailnet.ts.net";
+        var pipeline = new SetupPipeline([
+            new InstallTailscaleStep(),
+            new FinalizeTailscaleServeStep(
+                new AdvancingTailscaleClock(),
+                new FakeTailscaleEndpointProbe(TailscaleEndpointProbeResult.Unreachable("connection refused")))
+        ]);
+
+        var result = await pipeline.RunAsync(ctx);
+
+        Assert.Equal(PipelineOutcome.Failed, result.Outcome);
+        Assert.Equal("finalize-tailscale-serve", result.FailedStepId);
+        Assert.Contains("could not reach", result.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.NotEqual("wss://openclaw.tailnet.ts.net", ctx.GatewayUrl);
+        Assert.Contains(commands.WslCalls, call => call.Command.Contains("tailscale funnel reset", StringComparison.Ordinal) && call.User == "root");
+        Assert.Contains(commands.WslCalls, call => call.Command.Contains("tailscale serve reset", StringComparison.Ordinal) && call.User == "root");
+        Assert.Contains(commands.WslCalls, call => call.Command.Contains("tailscale logout", StringComparison.Ordinal) && call.Command.Contains("disable --now tailscaled", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task FinalizeTailscaleServe_PollsBrowserApprovalWithoutFixedDelayAndTimesOutBoundedly()
+    {
+        var commands = new FakeCommandRunner(
+            _ => Fail("Windows commands are not expected"),
+            (_, command, _) => command.Contains("tailscale serve status --json", StringComparison.Ordinal)
+                ? Ok("{}")
+                : command.Contains("tailscale serve --bg --yes", StringComparison.Ordinal)
+                    ? FailWithStdout("https://login.tailscale.com/a/serve-approval")
+                    : Fail($"unexpected wsl command: {command}"));
+        var config = new SetupConfig
+        {
+            Tailscale = new TailscaleConfig { Enabled = true, ServeApprovalTimeoutSeconds = 30 }
+        };
+        var ctx = CreateContext(config, commands);
+        ctx.DistroName = "test-distro";
+        ctx.TailscaleDnsName = "openclaw.tailnet.ts.net";
+        var presenter = new RecordingAuthorizationPresenter();
+        ctx.ExternalAuthorizationPresenter = presenter;
+
+        var result = await new FinalizeTailscaleServeStep(new AdvancingTailscaleClock(), new FakeTailscaleEndpointProbe(TailscaleEndpointProbeResult.Reachable(200)))
+            .ExecuteAsync(ctx, CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Contains("within 30 seconds", result.Message);
+        Assert.NotNull(presenter.Request);
+        Assert.Equal("https://login.tailscale.com/a/serve-approval", presenter.Request!.AuthorizationUri.AbsoluteUri);
+        Assert.True(commands.WslCalls.Count(call => call.Command.Contains("tailscale serve --bg --yes", StringComparison.Ordinal)) > 1);
+    }
+
+    [Fact]
+    public async Task FinalizeTailscaleServe_RejectsFunnelAndRollbackResetsServeBeforeDistroCleanup()
+    {
+        const string funnelStatus = """
+            {
+              "AllowFunnel": { "openclaw.tailnet.ts.net:443": true },
+              "Web": { "openclaw.tailnet.ts.net:443": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:18789" } } } }
+            }
+            """;
+        var commands = new FakeCommandRunner(
+            _ => Fail("Windows commands are not expected"),
+            (_, command, _) => command.Contains("tailscale serve status --json", StringComparison.Ordinal)
+                ? Ok(funnelStatus)
+                : Ok());
+        var config = new SetupConfig { Tailscale = new TailscaleConfig { Enabled = true } };
+        var ctx = CreateContext(config, commands);
+        ctx.DistroName = "test-distro";
+        ctx.TailscaleDnsName = "openclaw.tailnet.ts.net";
+        var step = new FinalizeTailscaleServeStep(new AdvancingTailscaleClock(), new FakeTailscaleEndpointProbe(TailscaleEndpointProbeResult.Reachable(200)));
+
+        var result = await step.ExecuteAsync(ctx, CancellationToken.None);
+        await step.RollbackAsync(ctx, CancellationToken.None);
+        await new InstallTailscaleStep().RollbackAsync(ctx, CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Contains("Funnel is configured", result.Message);
+        Assert.Contains(commands.WslCalls, call => call.Command.Contains("tailscale funnel reset", StringComparison.Ordinal) && call.User == "root");
+        Assert.Contains(commands.WslCalls, call => call.Command.Contains("tailscale serve reset", StringComparison.Ordinal) && call.User == "root");
+        Assert.Contains(commands.WslCalls, call => call.Command.Contains("tailscale logout", StringComparison.Ordinal) && call.Command.Contains("disable --now tailscaled", StringComparison.Ordinal));
+    }
+
     private sealed class FakeCommandRunner(
         Func<string[], CommandResult> run,
         Func<string, string, TimeSpan, CommandResult>? runInWsl = null) : ICommandRunner
     {
         public List<(string Executable, string[] Arguments)> Calls { get; } = [];
-        public List<(string DistroName, string Command, TimeSpan Timeout)> WslCalls { get; } = [];
+        public List<(string Executable, string[] Arguments, string? StdinInput)> DetailedCalls { get; } = [];
+        public List<(string DistroName, string Command, TimeSpan Timeout, string? User, bool InputViaStdin)> WslCalls { get; } = [];
+        public List<IReadOnlyDictionary<string, string>?> WslEnvironments { get; } = [];
 
         public Task<CommandResult> RunAsync(
             string executable,
@@ -1253,6 +3454,7 @@ public class SetupStepsTests : IDisposable
             CancellationToken ct = default)
         {
             Calls.Add((executable, arguments));
+            DetailedCalls.Add((executable, arguments, stdinInput));
             return Task.FromResult(run(arguments));
         }
 
@@ -1262,13 +3464,51 @@ public class SetupStepsTests : IDisposable
             TimeSpan timeout,
             IReadOnlyDictionary<string, string>? environment = null,
             CancellationToken ct = default,
-            string? user = null)
+            string? user = null,
+            bool inputViaStdin = false)
         {
+            WslCalls.Add((distroName, command, timeout, user, inputViaStdin));
+            WslEnvironments.Add(environment);
             if (runInWsl == null)
                 throw new NotSupportedException("RunInWslAsync is not expected in these tests.");
 
-            WslCalls.Add((distroName, command, timeout));
             return Task.FromResult(runInWsl(distroName, command, timeout));
+        }
+    }
+
+    private sealed class RecordingAuthorizationPresenter : IExternalAuthorizationPresenter
+    {
+        public ExternalAuthorizationRequest? Request { get; private set; }
+        public List<ExternalAuthorizationRequest> Requests { get; } = [];
+
+        public Task PresentAsync(ExternalAuthorizationRequest request, CancellationToken cancellationToken)
+        {
+            Request = request;
+            Requests.Add(request);
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class AdvancingTailscaleClock : ITailscalePollingClock
+    {
+        public DateTimeOffset UtcNow { get; private set; } = DateTimeOffset.UnixEpoch;
+
+        public Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            UtcNow = UtcNow.Add(delay);
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class FakeTailscaleEndpointProbe(TailscaleEndpointProbeResult result) : ITailscaleEndpointProbe
+    {
+        public Uri? Endpoint { get; private set; }
+
+        public Task<TailscaleEndpointProbeResult> ProbeAsync(Uri endpoint, CancellationToken cancellationToken)
+        {
+            Endpoint = endpoint;
+            return Task.FromResult(result);
         }
     }
 }

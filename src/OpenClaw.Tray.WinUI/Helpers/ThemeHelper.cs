@@ -1,5 +1,6 @@
 using Microsoft.UI.Xaml;
 using Microsoft.Win32;
+using OpenClawTray.Services;
 using Windows.UI;
 
 namespace OpenClawTray.Helpers;
@@ -17,8 +18,9 @@ public static class ThemeHelper
             var value = key?.GetValue("AppsUseLightTheme");
             return value is int i && i == 0;
         }
-        catch
+        catch (Exception ex)
         {
+            Logger.Debug($"ThemeHelper: Failed to read Windows dark-mode setting: {ex.Message}");
             return false;
         }
     }
@@ -28,12 +30,25 @@ public static class ThemeHelper
         return IsDarkMode() ? ElementTheme.Dark : ElementTheme.Light;
     }
 
+    public static ElementTheme GetRequestedTheme(string? preference) =>
+        SettingsManager.NormalizeAppTheme(preference) switch
+        {
+            SettingsManager.AppThemeLight => ElementTheme.Light,
+            SettingsManager.AppThemeDark => ElementTheme.Dark,
+            _ => ElementTheme.Default
+        };
+
+    public static void ApplyTheme(Window? window, string? preference)
+    {
+        if (window?.Content is FrameworkElement rootElement)
+            rootElement.RequestedTheme = GetRequestedTheme(preference);
+    }
+
     public static Color GetAccentColor()
     {
-        // Returns the user's Windows accent color (previously hard-coded to
-        // lobster red). Reads HKCU\Software\Microsoft\Windows\DWM\AccentColor
-        // which is stored as ABGR DWORD, falls back to the WinUI default
-        // blue if the registry key is missing.
+        // Returns the user's Windows accent color. Reads
+        // HKCU\Software\Microsoft\Windows\DWM\AccentColor, which is stored as
+        // ABGR DWORD, and falls back to the WinUI default blue if missing.
         try
         {
             using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\DWM");
@@ -46,8 +61,10 @@ public static class ThemeHelper
                 return Color.FromArgb(255, r, g, b);
             }
         }
-        // slopwatch-ignore: SW003 Audited non-critical fallback is intentional and the caller preserves safe behavior without this work.
-        catch { }
+        catch (Exception ex)
+        {
+            Logger.Debug($"ThemeHelper: Failed to read Windows accent color: {ex.Message}");
+        }
         return Color.FromArgb(255, 0, 120, 212); // #0078D4 — WinUI default accent
     }
 

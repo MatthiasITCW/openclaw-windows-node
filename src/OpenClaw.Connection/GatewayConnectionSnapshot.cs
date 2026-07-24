@@ -14,6 +14,11 @@ public sealed record GatewayConnectionSnapshot
     public string? OperatorError { get; init; }
     public bool OperatorPairingRequired { get; init; }
     public string? OperatorDeviceId { get; init; }
+    public string? OperatorCredentialSource { get; init; }
+    public GatewayCredentialResolutionStatus? OperatorCredentialStatus { get; init; }
+    public bool OperatorCredentialFallbackUsed { get; init; }
+    public bool OperatorCredentialBootstrapRequired { get; init; }
+    public string? OperatorCredentialDetail { get; init; }
     /// <summary>
     /// The requestId returned by the gateway when operator pairing is required.
     /// Used by setup flows to approve the specific pairing request via CLI.
@@ -21,15 +26,22 @@ public sealed record GatewayConnectionSnapshot
     public string? OperatorPairingRequestId { get; init; }
 
     // ─── Node ───
+    public bool NodeConnectionIntended { get; init; }
     public RoleConnectionState NodeState { get; init; }
     public string? NodeError { get; init; }
     public OpenClaw.Shared.PairingStatus NodePairingStatus { get; init; }
     public string? NodeDeviceId { get; init; }
+    public string? NodeCredentialSource { get; init; }
+    public GatewayCredentialResolutionStatus? NodeCredentialStatus { get; init; }
+    public bool NodeCredentialFallbackUsed { get; init; }
+    public bool NodeCredentialBootstrapRequired { get; init; }
+    public string? NodeCredentialDetail { get; init; }
     /// <summary>
     /// The requestId returned by the gateway when node pairing is required.
     /// Used by the connection page to show the correct approval command.
     /// </summary>
     public string? NodePairingRequestId { get; init; }
+    public OpenClaw.Shared.PairingApprovalKind NodePairingApprovalKind { get; init; }
 
     // ─── Gateway ───
     public string? GatewayId { get; init; }
@@ -64,10 +76,26 @@ public sealed record GatewayConnectionSnapshot
         if (op == RoleConnectionState.Connecting)
             return OverallConnectionState.Connecting;
 
+        if (op != RoleConnectionState.Connected && nodeEnabled)
+        {
+            if (node == RoleConnectionState.PairingRequired)
+                return OverallConnectionState.PairingRequired;
+
+            if (node == RoleConnectionState.Connecting)
+                return OverallConnectionState.Connecting;
+
+            if (node == RoleConnectionState.Connected)
+                return OverallConnectionState.Connected;
+
+            if (node is RoleConnectionState.Error or RoleConnectionState.PairingRejected or RoleConnectionState.RateLimited)
+                return OverallConnectionState.Error;
+        }
+
         // From here, operator is Connected.
 
         if (op == RoleConnectionState.Connected && nodeEnabled &&
             (node == RoleConnectionState.Error ||
+             node == RoleConnectionState.Idle ||
              node == RoleConnectionState.PairingRejected ||
              node == RoleConnectionState.RateLimited))
             return OverallConnectionState.Degraded;

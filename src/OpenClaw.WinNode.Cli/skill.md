@@ -23,8 +23,8 @@ argument shape, and the A2UI v0.8 JSONL grammar. It is shipped alongside
 ## Invocation shape
 
 ```
-winnode --command <name> [--params '<json-object>'] [--invoke-timeout <ms>]
-winnode --list-tools [--mcp-url <url>|--mcp-port <port>]
+winnode --command <name> [--params '<json-object>'] [--invoke-timeout <ms>] [--identity release|dev]
+winnode --list-tools [--mcp-url <url>|--mcp-port <port>] [--identity release|dev]
 ```
 
 - `--command` (required) — node command (e.g. `system.which`, `canvas.a2ui.push`).
@@ -50,9 +50,14 @@ winnode --list-tools [--mcp-url <url>|--mcp-port <port>]
   listing** (`Get-CimInstance Win32_Process | Select CommandLine`,
   Process Explorer, etc.). The CLI emits a stderr warning when this flag is
   used. **Prefer `OPENCLAW_MCP_TOKEN` (env var) or the on-disk
-  `%APPDATA%\OpenClawTray\mcp-token.txt`** which the tray writes when MCP is
-  enabled. Both `OPENCLAW_MCP_TOKEN` and the on-disk file should themselves be
-  treated as sensitive operational secrets.
+  `%APPDATA%\OpenClawTray\mcp-token.txt`** which the release tray writes when
+  MCP is enabled. Both `OPENCLAW_MCP_TOKEN` and the on-disk file should
+  themselves be treated as sensitive operational secrets.
+- `--identity release|dev` — selects which tray profile supplies the default
+  on-disk MCP token. Defaults to `OPENCLAW_APP_IDENTITY`, then `release`.
+  Use `--identity dev` for a side-by-side dev tray; its default token path is
+  `%APPDATA%\OpenClawTray-Dev\mcp-token.txt`. `OPENCLAW_TRAY_DATA_DIR` still
+  wins for isolated runs and points directly at the data folder.
 - `--verbose` — log endpoint + ignored flags to stderr. Without `--verbose`,
   HTTP error bodies are emitted only as the first line; with `--verbose`, the
   full body is shown (after sanitization + token-shape redaction).
@@ -272,13 +277,27 @@ Speak text aloud on the Windows node.
 ```
 {
   "text": "string",           // required
-  "provider": "piper|windows|elevenlabs",  // optional, falls back to TtsProvider setting
+  "provider": "piper|windows|elevenlabs",  // optional; omit to use TtsProvider setting
   "voiceId": "string",        // optional, overrides the per-provider configured voice
   "model": "string",          // optional, ElevenLabs only
   "interrupt": false          // default false; true cuts off any in-progress playback
 }
 ```
-Returns `{ spoken, provider, contentType, durationMs }`.
+When `provider` is omitted and the configured provider isn't usable (no
+ElevenLabs key, Piper voice not downloaded), the node falls back to Windows
+TTS so playback still happens. Explicit `provider` requests stay strict and
+do not silently reroute. Returns `{ spoken, provider, requestedProvider, fellBack, contentType, durationMs }`
+where `provider` is the provider that actually spoke.
+
+### tts.status
+TTS provider readiness. No params. Carries no PII (no voice ids, no key
+fragments, no device names).
+Returns `{ configuredProvider, effectiveProvider, willFallBack, providers[{ provider, readiness, isReady }] }`
+where `effectiveProvider` is what would run now after fallback and `readiness`
+∈ `"ready" | "needs-api-key" | "needs-voice" | "voice-not-downloaded" | "unavailable"`.
+The configured/effective view reflects configured defaults only; explicit
+`tts.speak` provider requests stay strict and may not match the default
+snapshot.
 
 ## App control (app.*)
 
@@ -294,7 +313,8 @@ Returns `{ navigated, page }`.
 
 ### app.status
 Current connection / node state.
-No params. Returns `{ connectionStatus, nodeConnected, nodePaired, nodePendingApproval, gatewayVersion, sessionCount, nodeCount }`.
+No params. Returns `{ connectionStatus, overallState, operatorState, nodeState, nodeConnected, nodePaired, nodePendingApproval, nodeError, gatewayVersion, sessionCount, nodeCount }`.
+For agent-facing connection troubleshooting, prefer `app.connection.status`.
 
 ### app.sessions
 Active sessions, optionally filtered by agent.
@@ -326,15 +346,15 @@ Read a local app setting by name.
 Returns the setting value (type depends on the setting).
 
 ### app.settings.set
-Set a local app setting.
+Set a local app setting, persist it, and apply the same reconnect/reload behavior as saving settings in the app UI.
 ```
 {"name": "string", "value": "string"}  // both required
 ```
-Returns `{ name, value }`.
+Returns `{ name, value }`; runtime apply failures surface as tool errors.
 
 ### app.menu
 Get tray menu state (status, session count, node count). No params.
-Returns array of menu items.
+Returns array of menu items; the status item includes `status`, `overallState`, `nodeState`, and `nodeError`.
 
 ### app.search
 Search the command palette and return matching commands.
@@ -349,6 +369,153 @@ Build the same gateway dashboard URL the tray opens.
 {"path": "string"}           // optional
 ```
 Returns `{ url, credentialSource, usesSharedGatewayToken, hasTokenQuery }`.
+
+## App connection diagnostics and setup (app.connection.*)
+
+Local MCP-only tools for connection diagnostics, setup, pairing approvals, and
+targeted reconnects. These tools are not advertised to the remote gateway node
+transport. Read-only diagnostics redact token values and expose credential
+presence/outcome only.
+
+### app.connection.status
+Read-only connection diagnostics for agents and CLIs. No params. Returns:
+`{ schemaVersion, connectionState, effectiveMode, legacyConnectionStatus, gateway, operator, node, mcp, browserProxy, pendingActions, retry, diagnostics }`.
+
+The payload includes the active gateway id/name/url, operator and node role
+states, credential sources/statuses, MCP enabled/running/error state, browser
+proxy shared-token caveat, pending approval commands, retry hints inferred from
+recent diagnostics, and recent connection diagnostic events. `effectiveMode`
+reflects Settings mode (`EnableNodeMode` / `EnableMcpServer`); `node.intended`
+reflects the manager snapshot plus current Node mode setting.
+
+### app.connection.gateways
+Read-only saved gateway diagnostics. No params. Returns:
+`{ activeGatewayId, count, gateways[] }`.
+
+Each gateway includes id/name/url, active flag, local/v2 flags, lastConnected,
+credential presence booleans (`hasSharedGatewayToken`, `hasBootstrapToken`),
+browser-control port/caveat, and SSH tunnel metadata. Token values are never
+returned.
+
+### app.connection.applySetupCode
+Apply a setup or QR code and connect the tray to that gateway.
+```
+{"setupCode": "string"}      // required
+```
+Returns `{ outcome, error, gatewayUrl, connected }`. Side effects: creates or
+updates a gateway record, sets it active, persists credentials from the setup
+code, and asks `GatewayConnectionManager` to connect.
+
+### app.connection.connectSharedToken
+Connect with a shared gateway token.
+```
+{
+  "gatewayUrl": "string",    // required
+  "token": "string"          // required
+}
+```
+Returns `{ outcome, error, gatewayUrl, connected }`. Side effects: creates or
+updates a gateway record, stores the shared token on that record, sets it active,
+and asks `GatewayConnectionManager` to connect.
+
+### app.connection.pendingApprovals
+Read pending device/node pairing approvals from the connected gateway. No params.
+Returns `{ connected, error, totalPending, devicePending[], nodePending[] }`.
+
+### app.connection.approveDevicePairing
+Approve a pending device pairing request.
+```
+{"requestId": "string"}      // required; "id" alias accepted
+```
+Returns the refreshed pending approvals payload plus `{ decision }`. Side effect:
+calls the connected operator client's device-pair approval RPC.
+
+### app.connection.rejectDevicePairing
+Reject a pending device pairing request.
+```
+{"requestId": "string"}      // required; "id" alias accepted
+```
+Returns the refreshed pending approvals payload plus `{ decision }`. Side effect:
+calls the connected operator client's device-pair rejection RPC.
+
+### app.connection.approveNodePairing
+Approve a pending Windows node pairing or command-trust request.
+```
+{"requestId": "string"}      // required; "id" alias accepted
+```
+Returns the refreshed pending approvals payload plus `{ decision }`. Side effect:
+calls the connected operator client's node-pair approval RPC.
+
+### app.connection.rejectNodePairing
+Reject a pending Windows node pairing or command-trust request.
+```
+{"requestId": "string"}      // required; "id" alias accepted
+```
+Returns the refreshed pending approvals payload plus `{ decision }`. Side effect:
+calls the connected operator client's node-pair rejection RPC.
+
+### app.connection.reconnect
+Reconnect the active gateway through `GatewayConnectionManager`. No params.
+Returns `{ reconnected, error? }`. Side effect: disconnects and reconnects the
+operator/node lifecycle for the active gateway.
+
+### app.connection.reconnectNode
+Reconnect only the Windows node role for the active gateway through
+`GatewayConnectionManager`. No params. Returns `{ reconnected, error? }`.
+Side effect: restarts node connection intent without changing the active gateway.
+
+### app.chat.snapshot
+Read the current native chat snapshot for local automation and diagnostics.
+**READ-ALL:** returns recent chat text from the selected timeline and outgoing
+queue text.
+```
+{"threadId": "string"}       // optional; "sessionKey" alias also accepted
+```
+Returns `{ connectionStatus, defaultThreadId, composeTarget, threads, queue, selectedTimeline }`.
+
+### app.chat.send
+Send a message through the same native chat provider used by the Chat UI.
+```
+{
+  "message": "string",       // required
+  "threadId": "string"       // optional; defaults to compose/default thread
+}
+```
+Returns `{ sent, threadId, entryCount, turnActive, error? }`.
+
+### app.chat.reset
+Reset the target chat session through the gateway `sessions.reset` path.
+```
+{"threadId": "string"}       // optional; "sessionKey" alias also accepted
+```
+When `threadId`/`sessionKey` is omitted this resets the current compose/default
+thread, which usually means the active chat session. Returns `{ reset, threadId,
+error? }`.
+
+### app.chat.queue.list
+List native chat outgoing queue entries.
+**READ-ALL:** returns queued message text.
+```
+{"threadId": "string"}       // optional; "sessionKey" alias also accepted
+```
+When `threadId`/`sessionKey` is omitted this returns all queued threads. Returns:
+`{ defaultThreadId, requestedThreadId, totalCount, selectedThread, threads }`
+where each thread has `{ threadId, count, messages }`, and each message has
+`{ id, text, createdAt, sendState, errorText, canCancel }`. Queue message IDs
+are ephemeral UI/provider IDs; read them from the current `app.chat.queue.list`
+or `app.chat.snapshot` response and do not cache them across app lifetimes.
+
+### app.chat.queue.cancel
+Cancel/remove one native chat outgoing queue entry before it is sent.
+```
+{
+  "queuedMessageId": "string", // required; from the current app.chat.queue.list or app.chat.snapshot queue
+  "threadId": "string"         // required; "sessionKey" alias also accepted
+}
+```
+Only `Queued` and `Failed` entries can be removed. `Sending` entries may already
+have reached the gateway and are not canceled. Returns
+`{ canceled, threadId, queuedMessageId, remainingCount, error? }`.
 
 ## Location (location.*)
 

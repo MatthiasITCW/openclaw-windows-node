@@ -1,8 +1,11 @@
 ﻿using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
+using Microsoft.UI.Xaml.Automation.Peers;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
+using OpenClaw.Chat;
 using OpenClaw.Shared;
+using OpenClawTray.Chat;
 using OpenClawTray.Helpers;
 using OpenClawTray.Windows;
 using System;
@@ -41,8 +44,10 @@ internal sealed class TrayMenuStateBuilder
         // ToggleAction delegates; recreate the lookup each rebuild.
         _permToggleActions.Clear();
 
-        var isConnected = _snapshot.CurrentStatus == ConnectionStatus.Connected;
-        var statusText = LocalizationHelper.GetConnectionStatusText(_snapshot.CurrentStatus);
+        var overallState = _snapshot.OverallState;
+        var isConnected = ConnectionStatusPresenter.IsHealthy(overallState, _snapshot.CurrentStatus);
+        var isLiveOrPending = ConnectionStatusPresenter.IsLiveOrPending(overallState, _snapshot.CurrentStatus);
+        var statusText = ConnectionStatusPresenter.PlainText(overallState, _snapshot.CurrentStatus);
 
         // Cache theme brushes once per build so cells don't each do a
         // resource lookup. The previous implementation looked up
@@ -94,13 +99,19 @@ internal sealed class TrayMenuStateBuilder
         Grid.SetColumn(brandRow, 0);
         brandGrid.Children.Add(brandRow);
 
-        var canToggleConnection = _snapshot.CurrentStatus == ConnectionStatus.Connected
-            || _snapshot.CurrentStatus == ConnectionStatus.Disconnected
-            || _snapshot.CurrentStatus == ConnectionStatus.Error;
-        var connectionToggle = menu.CreateMenuToggleSwitch(isConnected, "Gateway connection", canToggleConnection);
+        var canToggleConnection = overallState switch
+        {
+            null => _snapshot.CurrentStatus == ConnectionStatus.Connected
+                || _snapshot.CurrentStatus == ConnectionStatus.Disconnected
+                || _snapshot.CurrentStatus == ConnectionStatus.Error,
+            OpenClaw.Connection.OverallConnectionState.Connecting or
+            OpenClaw.Connection.OverallConnectionState.Disconnecting => false,
+            _ => true
+        };
+        var connectionToggle = menu.CreateMenuToggleSwitch(isLiveOrPending, "Gateway connection", canToggleConnection);
         connectionToggle.Margin = new Thickness(0);
         ToolTipService.SetToolTip(connectionToggle,
-            isConnected ? "Connected - toggle off to disconnect" : "Disconnected - toggle on to connect");
+            isLiveOrPending ? $"{statusText} - toggle off to disconnect" : $"{statusText} - toggle on to connect");
         connectionToggle.Toggled += (s, ev) =>
         {
             if (_callbacks.IsConnectionToggleSuspended())
@@ -113,6 +124,13 @@ internal sealed class TrayMenuStateBuilder
         brandGrid.Children.Add(connectionToggle);
 
         menu.AddCustomElement(brandGrid);
+
+        // ── Dashboard glance (live status header) ──
+        var dashboard = new TrayDashboardSummaryBuilder(_snapshot).Build();
+        var glance = BuildDashboardGlance(
+            dashboard, successBrush, cautionBrush, neutralBrush, criticalBrush,
+            secondaryText, captionStyle);
+        menu.AddCustomElement(glance);
 
         // ── Pairing approval pending (high-priority action above Gateway) ──
         var nodePendingCount = _snapshot.NodePairList?.Pending.Count ?? 0;
@@ -152,7 +170,12 @@ internal sealed class TrayMenuStateBuilder
             Width = 8, Height = 8,
             VerticalAlignment = VerticalAlignment.Center,
             Fill = isConnected ? successBrush
-                : _snapshot.CurrentStatus == ConnectionStatus.Connecting ? cautionBrush
+                : (overallState is OpenClaw.Connection.OverallConnectionState.Error ||
+                   (overallState is null && _snapshot.CurrentStatus == ConnectionStatus.Error)) ? criticalBrush
+                : ((overallState is OpenClaw.Connection.OverallConnectionState.Connecting
+                    or OpenClaw.Connection.OverallConnectionState.Degraded
+                    or OpenClaw.Connection.OverallConnectionState.PairingRequired) ||
+                   (overallState is null && _snapshot.CurrentStatus == ConnectionStatus.Connecting)) ? cautionBrush
                 : neutralBrush
         });
         gwNameRow.Children.Add(new TextBlock
@@ -264,17 +287,20 @@ internal sealed class TrayMenuStateBuilder
         }
 
         // ── Sessions (now below Devices) ──
-        if (_snapshot.Sessions.Length > 0)
+        var foregroundSessions = _snapshot.Sessions
+            .Where(session => !SessionPresentationResolver.IsBackground(session))
+            .ToArray();
+        if (foregroundSessions.Length > 0)
         {
             menu.AddSeparator();
 
-            var sessionCount = _snapshot.Sessions.Length;
-            var activeCount = _snapshot.Sessions.Count(s => string.Equals(s.Status, "active", StringComparison.OrdinalIgnoreCase));
-            var totalTokensAll = _snapshot.Sessions.Sum(s => s.InputTokens + s.OutputTokens);
+            var sessionCount = foregroundSessions.Length;
+            var activeCount = foregroundSessions.Count(s => string.Equals(s.Status, "active", StringComparison.OrdinalIgnoreCase));
+            var totalTokensAll = foregroundSessions.Sum(TrayDashboardSummaryBuilder.SessionUsedTokens);
 
             // Single collapsed entry whose hover flyout reveals the session list.
             var sessionsRow = BuildSessionsListRow(sessionCount, activeCount, totalTokensAll, secondaryText);
-            var sessionsFlyout = BuildSessionsListFlyoutItems(secondaryText, successBrush, cautionBrush, neutralBrush);
+            var sessionsFlyout = BuildSessionsListFlyoutItems(foregroundSessions, secondaryText, successBrush, cautionBrush, neutralBrush);
             menu.AddFlyoutCustomItem(sessionsRow, sessionsFlyout, action: "sessions");
         }
 
@@ -299,6 +325,7 @@ internal sealed class TrayMenuStateBuilder
         menu.AddMenuItem("Dashboard", FluentIconCatalog.Build(FluentIconCatalog.Dashboard), "dashboard");
         menu.AddMenuItem("Chat", FluentIconCatalog.Build(FluentIconCatalog.Chat), "openchat");
         menu.AddMenuItem("Canvas", FluentIconCatalog.Build(FluentIconCatalog.CanvasAct), "canvas");
+        menu.AddMenuItem("Diagnostics", FluentIconCatalog.Build(FluentIconCatalog.Bug), "diagnostics");
         // Voice overlay disabled — inline chat voice mode is used instead.
         // menu.AddMenuItem("Voice", FluentIconCatalog.Build(FluentIconCatalog.VoiceAct), "voice");
 
@@ -324,9 +351,176 @@ internal sealed class TrayMenuStateBuilder
 
     private static string FormatTokenCount(long n)
     {
-        if (n >= 1_000_000) return $"{n / 1_000_000.0:F1}M";
-        if (n >= 1_000) return $"{n / 1_000.0:F1}K";
+        if (n >= 1_000_000) return $"{(n / 1_000_000.0).ToString("F1", CultureInfo.InvariantCulture)}M";
+        if (n >= 1_000) return $"{(n / 1_000.0).ToString("F1", CultureInfo.InvariantCulture)}K";
         return n.ToString();
+    }
+
+    private static UIElement BuildDashboardGlance(
+        TrayDashboardSummary summary,
+        Microsoft.UI.Xaml.Media.Brush successBrush,
+        Microsoft.UI.Xaml.Media.Brush cautionBrush,
+        Microsoft.UI.Xaml.Media.Brush neutralBrush,
+        Microsoft.UI.Xaml.Media.Brush criticalBrush,
+        Microsoft.UI.Xaml.Media.Brush secondaryText,
+        Style captionStyle)
+    {
+        var dotBrush = summary.Severity switch
+        {
+            TrayHealthSeverity.Ok => successBrush,
+            TrayHealthSeverity.Caution => cautionBrush,
+            TrayHealthSeverity.Critical => criticalBrush,
+            _ => neutralBrush,
+        };
+
+        var outer = new StackPanel
+        {
+            Padding = new Thickness(12, 4, 12, 8),
+            Spacing = 4,
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+
+        // 3-column grid so the headline trims within 320px instead of pushing
+        // the heartbeat off-screen (a horizontal StackPanel measures unbounded).
+        var line1 = new Grid { ColumnSpacing = 6, HorizontalAlignment = HorizontalAlignment.Stretch };
+        line1.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        line1.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        line1.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var dot = new Microsoft.UI.Xaml.Shapes.Ellipse
+        {
+            Width = 8, Height = 8,
+            VerticalAlignment = VerticalAlignment.Center,
+            Fill = dotBrush
+        };
+        Grid.SetColumn(dot, 0);
+        line1.Children.Add(dot);
+
+        var headlineText = summary.Endpoint != null
+            ? $"{summary.Headline} · {summary.Endpoint}"
+            : summary.Headline;
+        var headline = new TextBlock
+        {
+            Text = headlineText,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            FontSize = 13,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            IsTextSelectionEnabled = false
+        };
+        Grid.SetColumn(headline, 1);
+        line1.Children.Add(headline);
+
+        if (summary.Heartbeat != null)
+        {
+            var hb = new TextBlock
+            {
+                Text = summary.Heartbeat,
+                Style = captionStyle,
+                FontSize = 11,
+                Foreground = secondaryText,
+                VerticalAlignment = VerticalAlignment.Center,
+                IsTextSelectionEnabled = false
+            };
+            Grid.SetColumn(hb, 2);
+            line1.Children.Add(hb);
+        }
+        outer.Children.Add(line1);
+
+        if (!string.IsNullOrEmpty(summary.MetricsLine))
+        {
+            outer.Children.Add(new TextBlock
+            {
+                Text = summary.MetricsLine,
+                Style = captionStyle,
+                FontSize = 11,
+                Foreground = secondaryText,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                IsTextSelectionEnabled = false
+            });
+        }
+
+        if (summary.ActiveSession is { } active)
+        {
+            var sessionLine = new Grid { ColumnSpacing = 6, Margin = new Thickness(0, 2, 0, 0), HorizontalAlignment = HorizontalAlignment.Stretch };
+            sessionLine.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            sessionLine.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            sessionLine.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            var labelText = new TextBlock
+            {
+                Text = active.Label,
+                Style = captionStyle,
+                FontSize = 11,
+                Foreground = secondaryText,
+                VerticalAlignment = VerticalAlignment.Center,
+                IsTextSelectionEnabled = false
+            };
+            Grid.SetColumn(labelText, 0);
+            sessionLine.Children.Add(labelText);
+
+            var titleText = new TextBlock
+            {
+                Text = active.Title,
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                FontSize = 12,
+                VerticalAlignment = VerticalAlignment.Center,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                IsTextSelectionEnabled = false
+            };
+            Grid.SetColumn(titleText, 1);
+            sessionLine.Children.Add(titleText);
+
+            if (active.ContextPercent > 0)
+            {
+                var ctx = new TextBlock
+                {
+                    Text = $"{active.ContextPercent}% ctx",
+                    Style = captionStyle,
+                    FontSize = 11,
+                    Foreground = secondaryText,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    IsTextSelectionEnabled = false
+                };
+                Grid.SetColumn(ctx, 2);
+                sessionLine.Children.Add(ctx);
+            }
+            outer.Children.Add(sessionLine);
+
+            if (!string.IsNullOrEmpty(active.Detail))
+            {
+                outer.Children.Add(new TextBlock
+                {
+                    Text = active.Detail,
+                    Style = captionStyle,
+                    FontSize = 11,
+                    Foreground = secondaryText,
+                    TextTrimming = TextTrimming.CharacterEllipsis,
+                    IsTextSelectionEnabled = false
+                });
+            }
+
+        }
+
+        AutomationProperties.SetName(outer, BuildGlanceAutomationName(summary));
+        AutomationProperties.SetAccessibilityView(outer, AccessibilityView.Content);
+        return outer;
+    }
+
+    private static string BuildGlanceAutomationName(TrayDashboardSummary summary)
+    {
+        var parts = new List<string> { summary.Headline };
+        if (summary.Endpoint != null) parts.Add(summary.Endpoint);
+        if (summary.Heartbeat != null) parts.Add(summary.Heartbeat);
+        if (!string.IsNullOrEmpty(summary.MetricsLine)) parts.Add(summary.MetricsLine!);
+        if (summary.ActiveSession is { } a)
+        {
+            var sess = a.Label == "Session" ? $"Session {a.Title}" : $"{a.Label} session {a.Title}";
+            if (!string.IsNullOrEmpty(a.Detail)) sess += $", {a.Detail}";
+            if (a.ContextPercent > 0) sess += $", {a.ContextPercent}% context";
+            parts.Add(sess);
+        }
+        return string.Join(". ", parts) + ".";
     }
 
     /// <summary>
@@ -345,8 +539,8 @@ internal sealed class TrayMenuStateBuilder
                                    : "SystemFillColorSuccessBrush";
         var accent = (Microsoft.UI.Xaml.Media.Brush)resources[accentKey];
         var track = (Microsoft.UI.Xaml.Media.Brush)resources["ControlAltFillColorTertiaryBrush"];
-        // Subtle hairline stroke — macOS-style — gives the bar a defined edge
-        // even when the fill is at 0% or matches the surrounding chrome.
+        // Subtle hairline stroke gives the bar a defined edge even when the
+        // fill is at 0% or matches the surrounding chrome.
         var stroke = (Microsoft.UI.Xaml.Media.Brush)resources["ControlStrokeColorDefaultBrush"];
 
         // Outer wrapper carries the rounded corners + track color and clips
@@ -374,6 +568,7 @@ internal sealed class TrayMenuStateBuilder
         var filled = new Microsoft.UI.Xaml.Controls.Border
         {
             Background = accent,
+            CornerRadius = new CornerRadius(3),
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Stretch,
             Opacity = p <= 0 ? 0 : 1,
@@ -659,7 +854,16 @@ internal sealed class TrayMenuStateBuilder
         // 2-row card:
         //   Row 0: {name}                                    {age}
         //   Row 1: {model}              [████░░░░] {used}/{ctx} ({pct}%)
-        var usedTokens = session.InputTokens + session.OutputTokens;
+        var usageText = ChatUsageFormatter.Format(new ChatThread
+        {
+            Id = session.Key,
+            Title = SessionTitleFormatter.Format(session),
+            InputTokens = session.InputTokens,
+            OutputTokens = session.OutputTokens,
+            TotalTokens = session.TotalTokens,
+            ContextTokens = session.ContextTokens,
+        }) ?? "";
+        var usedTokens = TrayDashboardSummaryBuilder.SessionUsedTokens(session);
         var contextTokens = session.ContextTokens > 0 ? session.ContextTokens : 200_000;
         var pct = usedTokens > 0 ? Math.Min(100.0, (double)usedTokens / contextTokens * 100.0) : 0.0;
 
@@ -683,7 +887,7 @@ internal sealed class TrayMenuStateBuilder
         var nameRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
         nameRow.Children.Add(new TextBlock
         {
-            Text = session.DisplayName ?? session.Key,
+            Text = SessionTitleFormatter.Format(session),
             FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
             FontSize = 13,
             TextTrimming = TextTrimming.CharacterEllipsis,
@@ -726,7 +930,7 @@ internal sealed class TrayMenuStateBuilder
 
         var ratio = new TextBlock
         {
-            Text = $"{FormatTokenCount(usedTokens)}/{FormatTokenCount(contextTokens)} ({(int)pct}%)",
+            Text = usageText,
             Style = captionStyle, FontSize = 11, Foreground = secondaryText,
             VerticalAlignment = VerticalAlignment.Center,
             IsTextSelectionEnabled = false
@@ -991,6 +1195,7 @@ internal sealed class TrayMenuStateBuilder
     // ── Instance helpers (Grupo B) ────────────────────────────────────────
 
     private List<TrayMenuFlyoutItem> BuildSessionsListFlyoutItems(
+        IReadOnlyList<SessionInfo> sessions,
         Microsoft.UI.Xaml.Media.Brush secondaryText,
         Microsoft.UI.Xaml.Media.Brush successBrush,
         Microsoft.UI.Xaml.Media.Brush cautionBrush,
@@ -998,16 +1203,16 @@ internal sealed class TrayMenuStateBuilder
     {
         var items = new List<TrayMenuFlyoutItem>
         {
-            new() { Text = $"Sessions ({_snapshot.Sessions.Length})", IsHeader = true }
+            new() { Text = $"Sessions ({sessions.Count})", IsHeader = true }
         };
 
-        if (_snapshot.Sessions.Length == 0)
+        if (sessions.Count == 0)
         {
             items.Add(new() { Text = "No active sessions" });
             return items;
         }
 
-        foreach (var session in _snapshot.Sessions.Take(8))
+        foreach (var session in sessions.Take(8))
         {
             var card = BuildSessionListCard(session, secondaryText);
             items.Add(new() { CustomContent = card });
@@ -1042,11 +1247,15 @@ internal sealed class TrayMenuStateBuilder
         grid.Children.Add(title);
 
         // Right-side summary: $X.XX · Y tokens (always include both when any data present)
-        var totalTokens = _snapshot.Usage?.TotalTokens
-            ?? _snapshot.Sessions.Sum(s => s.InputTokens + s.OutputTokens);
-        var cost = _snapshot.Usage?.CostUsd
-            ?? _snapshot.UsageCost?.Totals.TotalCost
-            ?? 0.0;
+        // Use the shared positive-fallback helpers so this row can't contradict
+        // the dashboard glance (a present-but-zero Usage must not hide UsageCost).
+        var totalTokens = TrayDashboardSummaryBuilder.FirstPositiveTokens(
+            _snapshot.Usage?.TotalTokens,
+            _snapshot.UsageCost?.Totals.TotalTokens,
+            _snapshot.Sessions.Sum(TrayDashboardSummaryBuilder.SessionUsedTokens));
+        var cost = TrayDashboardSummaryBuilder.FirstPositiveCost(
+            _snapshot.Usage?.CostUsd,
+            _snapshot.UsageCost?.Totals.TotalCost);
         string summaryText;
         if (cost <= 0 && totalTokens <= 0)
         {
@@ -1085,15 +1294,17 @@ internal sealed class TrayMenuStateBuilder
             new() { Text = "Usage", IsHeader = true }
         };
 
-        var totalTokens = _snapshot.Usage?.TotalTokens
-            ?? _snapshot.Sessions.Sum(s => s.InputTokens + s.OutputTokens);
+        var totalTokens = TrayDashboardSummaryBuilder.FirstPositiveTokens(
+            _snapshot.Usage?.TotalTokens,
+            _snapshot.UsageCost?.Totals.TotalTokens,
+            _snapshot.Sessions.Sum(TrayDashboardSummaryBuilder.SessionUsedTokens));
         var inputTokens = _snapshot.Usage?.InputTokens
             ?? _snapshot.Sessions.Sum(s => s.InputTokens);
         var outputTokens = _snapshot.Usage?.OutputTokens
             ?? _snapshot.Sessions.Sum(s => s.OutputTokens);
-        var cost = _snapshot.Usage?.CostUsd
-            ?? _snapshot.UsageCost?.Totals.TotalCost
-            ?? 0.0;
+        var cost = TrayDashboardSummaryBuilder.FirstPositiveCost(
+            _snapshot.Usage?.CostUsd,
+            _snapshot.UsageCost?.Totals.TotalCost);
         var requests = _snapshot.Usage?.RequestCount ?? 0;
 
         // Totals card
@@ -1220,7 +1431,7 @@ internal sealed class TrayMenuStateBuilder
         var byModel = _snapshot.Sessions
             .Where(s => !string.IsNullOrEmpty(s.Model))
             .GroupBy(s => s.Model!, StringComparer.OrdinalIgnoreCase)
-            .Select(g => new { Model = g.Key, Tokens = g.Sum(s => s.InputTokens + s.OutputTokens) })
+            .Select(g => new { Model = g.Key, Tokens = g.Sum(TrayDashboardSummaryBuilder.SessionUsedTokens) })
             .Where(x => x.Tokens > 0)
             .OrderByDescending(x => x.Tokens)
             .Take(3)

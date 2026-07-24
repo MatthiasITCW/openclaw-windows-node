@@ -1,10 +1,13 @@
 using OpenClaw.Chat;
 using OpenClaw.Shared;
+using OpenClaw.Shared.Sessions;
+using OpenClawTray.Helpers;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using OpenClawTray.FunctionalUI.Hosting;
 using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 
 namespace OpenClawTray.Chat;
@@ -26,12 +29,14 @@ public static class FunctionalChatHostExtensions
     public static Action<Action> AsPost(this DispatcherQueue dispatcher) =>
         action =>
         {
-            if (dispatcher.HasThreadAccess)
-            {
-                action();
-                return;
-            }
-
+            // Always queue rather than invoking inline when we already hold
+            // the dispatcher thread. The synchronous shortcut would let a
+            // UI-thread Publish jump ahead of background-thread Publishes
+            // that were already enqueued, so an older snapshot built before
+            // ours could fire LAST and overwrite the latest state in the
+            // subscribers (observed with the local exec-approval deny card
+            // being clobbered by a stale 135-entry snapshot one ms later).
+            // FIFO dispatch order keeps "newest build wins" for free.
             if (!dispatcher.TryEnqueue(() => action()))
                 System.Diagnostics.Debug.WriteLine("Dropped chat UI update because DispatcherQueue rejected the work item.");
         };
@@ -60,7 +65,45 @@ public static class FunctionalChatHostExtensions
         ArgumentNullException.ThrowIfNull(target);
         ArgumentNullException.ThrowIfNull(provider);
 
-        var root = new OpenClawChatRoot(provider, initialThreadId, onReadAloud, onStopSpeaking, onVoiceRequest, onAttachClick, onSettingsClick, onSpeakerMuteChanged, initialMuted, isCompact);
+        async Task<bool> ConfirmResetAsync(string sessionKey, string? displayName)
+        {
+            if (target.XamlRoot is null)
+                return false;
+
+            var prompt = SessionActionPlanner.BuildPrompt(
+                SessionActionKind.Reset,
+                sessionKey,
+                displayName,
+                SessionActionPlanner.IsMainSessionKeyShape(sessionKey));
+            if (prompt is null)
+                return true;
+
+            var localized = SessionActionPromptLocalizer.Localize(prompt);
+            var dialog = new ContentDialog
+            {
+                Title = localized.Title,
+                Content = localized.Body,
+                PrimaryButtonText = localized.ConfirmLabel,
+                CloseButtonText = LocalizationHelper.GetString("SessionActionPrompt_CancelLabel"),
+                DefaultButton = ContentDialogButton.None,
+                XamlRoot = target.XamlRoot,
+            };
+            dialog.PrimaryButtonStyle = (Style)Application.Current.Resources["AccentButtonStyle"];
+            return await dialog.ShowAsync() == ContentDialogResult.Primary;
+        }
+
+        var root = new OpenClawChatRoot(
+            provider,
+            initialThreadId,
+            onReadAloud,
+            onStopSpeaking,
+            onVoiceRequest,
+            onAttachClick,
+            onSettingsClick,
+            onSpeakerMuteChanged,
+            ConfirmResetAsync,
+            initialMuted,
+            isCompact);
         var host = new FunctionalHostControl();
         host.SuppressAutoDispose = suppressAutoDispose;
         host.Mount(root);
@@ -79,7 +122,10 @@ public sealed class MountedFunctionalChat(Border target, FunctionalHostControl h
     public OpenClawChatRoot ChatRoot => root;
 
     /// <summary>Push a picked file into the composer as a pending attachment.</summary>
-    public void AttachFile(ChatAttachment attachment) => root.OnFileAttached?.Invoke(attachment);
+    public void AttachFile(ChatAttachment attachment) => AttachFiles(new[] { attachment });
+
+    /// <summary>Push picked files into the composer as pending attachments.</summary>
+    public void AttachFiles(IReadOnlyList<ChatAttachment> attachments) => root.OnFilesAttached?.Invoke(attachments);
 
     /// <summary>Push streaming voice transcript text into the composer.</summary>
     public void SetVoiceTranscript(string? text) => root.SetVoiceTranscript?.Invoke(text);

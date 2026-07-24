@@ -6,13 +6,10 @@ using System.Threading.Tasks;
 namespace OpenClawTray.Services;
 
 /// <summary>
-/// Handles openclaw:// deep link URI scheme registration and processing.
+/// Handles this build variant's deep link URI scheme registration and processing.
 /// </summary>
 public static class DeepLinkHandler
 {
-    private const string UriScheme = "openclaw";
-    private const string UriSchemeKey = @"SOFTWARE\Classes\openclaw";
-
     [SupportedOSPlatform("windows")]
     public static void RegisterUriScheme()
     {
@@ -27,7 +24,8 @@ public static class DeepLinkHandler
         {
             var exePath = Environment.ProcessPath ?? System.Reflection.Assembly.GetExecutingAssembly().Location;
 
-            using var key = Registry.CurrentUser.CreateSubKey(UriSchemeKey);
+            var uriSchemeKey = $@"SOFTWARE\Classes\{AppIdentity.ProtocolScheme}";
+            using var key = Registry.CurrentUser.CreateSubKey(uriSchemeKey);
             key?.SetValue("", "URL:OpenClaw Protocol");
             key?.SetValue("URL Protocol", "");
 
@@ -37,7 +35,7 @@ public static class DeepLinkHandler
             using var commandKey = key?.CreateSubKey(@"shell\open\command");
             commandKey?.SetValue("", $"\"{exePath}\" \"%1\"");
 
-            Logger.Info("URI scheme registered: openclaw://");
+            Logger.Info($"URI scheme registered: {AppIdentity.ProtocolScheme}://");
         }
         catch (Exception ex)
         {
@@ -53,7 +51,7 @@ public static class DeepLinkHandler
 
     public static void Handle(string uri, DeepLinkActions actions)
     {
-        var result = OpenClaw.Shared.DeepLinkParser.ParseDeepLink(uri);
+        var result = OpenClaw.Shared.DeepLinkParser.ParseDeepLink(uri, AppIdentity.ProtocolScheme);
         if (result == null)
             return;
 
@@ -105,7 +103,7 @@ public static class DeepLinkHandler
             case "health-check":
                 if (actions.RunHealthCheck != null)
                 {
-                    _ = Task.Run(actions.RunHealthCheck);
+                    _ = RunDeepLinkActionAsync("health check", () => Task.Run(actions.RunHealthCheck));
                 }
                 break;
 
@@ -115,7 +113,7 @@ public static class DeepLinkHandler
             case "update-check":
                 if (actions.CheckForUpdates != null)
                 {
-                    _ = actions.CheckForUpdates();
+                    _ = RunDeepLinkActionAsync("update check", actions.CheckForUpdates);
                 }
                 break;
 
@@ -229,17 +227,10 @@ public static class DeepLinkHandler
                 var agentMessage = result.Parameters.GetValueOrDefault("message");
                 if (!string.IsNullOrEmpty(agentMessage) && actions.SendMessage != null)
                 {
-                    _ = Task.Run(async () =>
+                    _ = RunDeepLinkActionAsync("agent message", async () =>
                     {
-                        try
-                        {
-                            await actions.SendMessage(agentMessage);
-                            Logger.Info("Sent message via deep link");
-                        }
-                        catch (Exception ex)
-                        {
-                            Logger.Error($"Failed to send message: {ex.Message}");
-                        }
+                        await actions.SendMessage(agentMessage);
+                        Logger.Info("DeepLinkHandler: Sent message via deep link");
                     });
                 }
                 else if (!string.IsNullOrEmpty(agentMessage))
@@ -268,6 +259,18 @@ public static class DeepLinkHandler
                     Logger.Warn($"Unknown deep link path: {path}");
                 }
                 break;
+        }
+    }
+
+    private static async Task RunDeepLinkActionAsync(string actionName, Func<Task> action)
+    {
+        try
+        {
+            await action().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"DeepLinkHandler: Deep link {actionName} failed: {ex.Message}");
         }
     }
 }

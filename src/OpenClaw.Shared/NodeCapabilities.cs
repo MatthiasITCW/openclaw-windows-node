@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using OpenClaw.Shared.Telemetry;
 
 namespace OpenClaw.Shared;
 
@@ -24,6 +26,13 @@ public class NodeInvokeRequest
     public string Id { get; set; } = "";
     public string Command { get; set; } = "";
     public JsonElement Args { get; set; }
+    public string? SessionKey { get; set; }
+
+    [JsonIgnore]
+    public NodeToolInvocation? Telemetry { get; set; }
+
+    [JsonIgnore]
+    internal System.Diagnostics.ActivityContext TelemetryParentContext { get; set; }
 }
 
 public class NodeInvokeCompletedEventArgs : EventArgs
@@ -45,6 +54,9 @@ public class NodeInvokeResponse
     public bool Ok { get; set; }
     public object? Payload { get; set; }
     public string? Error { get; set; }
+
+    [JsonIgnore]
+    public NodeToolDiagnostic? Diagnostic { get; set; }
 }
 
 /// <summary>
