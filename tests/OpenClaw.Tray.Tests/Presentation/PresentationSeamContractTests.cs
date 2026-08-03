@@ -79,6 +79,18 @@ public sealed class PresentationSeamContractTests
     }
 
     [Fact]
+    public void App_AppliesToolCallVisibilityFromPersistedSettings()
+    {
+        var source = ReadAppSources();
+
+        var settingsSavedIdx = source.IndexOf("private void OnSettingsSaved", StringComparison.Ordinal);
+        Assert.True(settingsSavedIdx >= 0, "Expected App to handle persisted settings saves.");
+        var settingsSavedBlock = source.Substring(settingsSavedIdx, Math.Min(500, source.Length - settingsSavedIdx));
+        Assert.Contains("SetToolCallsVisible", settingsSavedBlock);
+        Assert.Contains("_settings.ShowChatToolCalls", settingsSavedBlock);
+    }
+
+    [Fact]
     public void HubWindow_InvokesPageActivator_OnNavigation()
     {
         var source = ReadHubWindowSource();

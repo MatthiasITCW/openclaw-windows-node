@@ -136,12 +136,19 @@ Local MCP clients also see MCP-only `app.*` commands such as `app.navigate`, `ap
 ### Node doesn't connect
 - Check the active gateway in Connection settings. Gateway records live in `%APPDATA%\OpenClawTray\gateways.json`; post-pairing device tokens live under `%APPDATA%\OpenClawTray\gateways\<gateway-id>\device-key-ed25519.json`.
 - Check logs for connection errors
+- If logs report that the saved device identity could not be loaded, fix access to the existing identity file or use an explicit reset/re-pair action. The tray preserves an unreadable or corrupt identity instead of replacing it automatically.
 - Verify gateway is running and accessible
 - If only a bootstrap token exists, finish pairing or approve the device; paired device tokens take precedence on future connects.
 
 ### No "Node Mode Active" notification
 - Ensure Windows notifications are enabled for the app
 - Check if notification settings in the app are enabled
+
+### Browser control stays enabled but never declares `browser`
+- Setup-code / QR pairing can connect with a device token and leave `GatewayRecord.SharedGatewayToken` empty. Browser control will not declare `browser` / `browser.proxy` until a shared gateway token is saved for that gateway.
+- Expect Connection capability pills to say **Needs gateway shared token** (not "Enabled, not active yet") only while the node WebSocket session is live and the shared token is missing. Disconnected or attached-but-disconnected states should ask for reconnect, not a token paste. The pill keeps that short label; its tooltip matches Command Center remediation detail.
+- Command Center, Connection pill tooltips, and `app.connection.status` / `app.connection.gateways` use the same live-session rule for the shared-token caveat. For a remote (non-loopback) gateway without an explicit `BrowserControlPort` or SSH browser-proxy forward — including SSH tunnels whose effective URL is `127.0.0.1` — that caveat also mentions the endpoint/forward requirement; the shared token alone is not enough for usable remote browser.proxy.
+- Enter the gateway shared token in Settings, save, and reconnect node mode. Bootstrap tokens are not the shared gateway token.
 
 ### `browser.proxy` reports no browser-control host
 - Confirm the Browser proxy bridge toggle is enabled in Settings, then save and reconnect or re-pair if the gateway keeps an older command snapshot.

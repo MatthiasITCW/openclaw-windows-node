@@ -18,5 +18,6 @@ internal interface IAppCommands
     void ShowGatewayWizard();
     void ShowConnectionStatus();
     void NotifySettingsSaved();
+    Task<bool> ApplyAutoStart(bool autoStart);
     Task<bool> ResendOpenTelemetryProbeAsync();
 }

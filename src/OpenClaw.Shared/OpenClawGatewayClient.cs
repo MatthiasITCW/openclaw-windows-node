@@ -18,8 +18,6 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
     private const string OperatorClientDisplayName = "OpenClaw Windows Tray";
     private const string OperatorClientMode = "cli";
     private const string OperatorRole = "operator";
-    private const string OperatorPlatform = "windows";
-    private const string OperatorDeviceFamily = "desktop";
     private static readonly Regex s_pairingRequestIdRegex = new("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", RegexOptions.Compiled);
     private static readonly string[] s_operatorScopes =
     [
@@ -244,10 +242,29 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
     public event EventHandler<string?>? PairingRequired;
     /// <summary>Raised when v3 signature was rejected and client fell back to v2.</summary>
     public event EventHandler? V2SignatureFallback;
+    /// <summary>
+    /// Raised with the typed reason for an operator connection failure. Consumers should use this
+    /// kind for policy/UI decisions and keep the accompanying text only for sanitized detail.
+    /// </summary>
+    public event EventHandler<GatewayErrorKind>? ConnectionFailure;
 
     public string? OperatorDeviceId => _operatorDeviceId;
     public IReadOnlyList<string> GrantedOperatorScopes => _grantedOperatorScopes;
     public virtual bool IsConnectedToGateway => IsConnected;
+
+    protected override void OnConnectionException(Exception exception)
+    {
+        RaiseConnectionFailure(GatewayErrorClassifier.Classify(exception.ToString()));
+    }
+
+    protected override void OnReconnectAuthorizationDenied(
+        ReconnectAuthorizationResult authorization)
+    {
+        RaiseConnectionFailure(authorization.FailureKind);
+    }
+
+    protected void RaiseConnectionFailure(GatewayErrorKind kind) =>
+        ConnectionFailure?.Invoke(this, kind);
 
     public OpenClawGatewayClient(string gatewayUrl, string token, IOpenClawLogger? logger = null, bool tokenIsBootstrapToken = false, bool bootstrapPairAsNode = false, string? identityPath = null, bool ignoreStoredDeviceToken = false)
         : base(gatewayUrl, token, logger)
@@ -1028,7 +1045,47 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
     public async Task RequestModelsListAsync()
     {
         if (_modelsListUnsupported) return;
-        await SendTrackedRequestAsync("models.list", new { view = "configured" });
+
+        ModelsListInfo configured;
+        try
+        {
+            var configuredPayload = await SendWizardRequestAsync(
+                "models.list",
+                new { view = "configured" },
+                timeoutMs: 10000);
+            configured = ParseModelsListPayload(configuredPayload);
+        }
+        catch (Exception ex)
+        {
+            // Preserve the legacy fire-and-forget path for older gateways and
+            // transient response-aware request failures.
+            _logger.Warn($"Configured models.list request failed; using legacy request path: {ex.Message}");
+            await SendTrackedRequestAsync("models.list", new { view = "configured" });
+            return;
+        }
+
+        // Populate the existing safe choices immediately, then enhance the picker
+        // when the broader catalog response arrives.
+        ModelsListUpdated?.Invoke(this, configured);
+
+        ModelsListInfo catalog;
+        try
+        {
+            var catalogPayload = await SendWizardRequestAsync(
+                "models.list",
+                new { view = "all" },
+                timeoutMs: 10000);
+            catalog = ParseModelsListPayload(catalogPayload);
+        }
+        catch (Exception ex)
+        {
+            // A full catalog is an enhancement. The configured list remains a
+            // safe, selectable fallback when discovery is unsupported or slow.
+            _logger.Warn($"Full models.list catalog request failed; keeping configured models only: {ex.Message}");
+            return;
+        }
+
+        ModelsListUpdated?.Invoke(this, MergeModelCatalog(configured, catalog));
     }
 
     // Node/Device pairing
@@ -1390,7 +1447,7 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         var role = GetConnectRole();
         var requestedScopes = GetRequestedScopes(role);
 
-        var signedAt = _challengeTimestampMs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var signedAt = ConnectAuthTimestamp.ResolveSignedAt(_challengeTimestampMs);
         var connectNonce = nonce ?? string.Empty;
         var signatureToken = GetSignatureToken();
         var authPayload = BuildAuthPayload();
@@ -1404,11 +1461,11 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         _logger.Info($"  nonce={(!string.IsNullOrEmpty(connectNonce) ? connectNonce[..Math.Min(12, connectNonce.Length)] + "..." : "(empty)")}");
         _logger.Info($"  signedAt={signedAt}");
         _logger.Info($"  sigToken(len)={signatureToken.Length}, preview=[REDACTED]");
-        _logger.Info($"  signature format={(_useV2Signature ? "v2" : "v3")}, platform={OperatorPlatform}, family={OperatorDeviceFamily}");
+        _logger.Info($"  signature format={(_useV2Signature ? "v2" : "v3")}, platform={WindowsClientMetadata.Platform}, family={WindowsClientMetadata.DeviceFamily}");
 
         var signedPayload = _useV2Signature
             ? _deviceIdentity.BuildConnectPayloadV2(connectNonce, signedAt, OperatorClientId, OperatorClientMode, role, requestedScopes, signatureToken)
-            : _deviceIdentity.BuildConnectPayloadV3(connectNonce, signedAt, OperatorClientId, OperatorClientMode, role, requestedScopes, signatureToken, OperatorPlatform, OperatorDeviceFamily);
+            : _deviceIdentity.BuildConnectPayloadV3(connectNonce, signedAt, OperatorClientId, OperatorClientMode, role, requestedScopes, signatureToken, WindowsClientMetadata.Platform, WindowsClientMetadata.DeviceFamily);
         _logger.Info($"[HANDSHAKE] signed: {TokenSanitizer.Sanitize(signedPayload)}");
 
         // Also log what auth field we're sending
@@ -1424,7 +1481,7 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
             : _deviceIdentity.SignConnectPayloadV3(
                 connectNonce, signedAt, OperatorClientId, OperatorClientMode,
                 role, requestedScopes, signatureToken,
-                OperatorPlatform, OperatorDeviceFamily);
+                WindowsClientMetadata.Platform, WindowsClientMetadata.DeviceFamily);
 
         var appVersion = AppVersionInfo.Version;
 
@@ -1442,7 +1499,8 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
                 {
                     id = OperatorClientId,  // Native client ID
                     version = appVersion,
-                    platform = OperatorPlatform,
+                    platform = WindowsClientMetadata.Platform,
+                    deviceFamily = WindowsClientMetadata.DeviceFamily,
                     mode = OperatorClientMode,
                     displayName = OperatorClientDisplayName
                 },
@@ -1843,11 +1901,11 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
             var persistedRoleTokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var roleToken in EnumerateHandshakeDeviceTokens(payload))
             {
-                _deviceIdentity.StoreDeviceTokenForRole(roleToken.Role, roleToken.Token, roleToken.Scopes);
+                var stored = TryStoreHandshakeDeviceToken(roleToken.Role, roleToken.Token, roleToken.Scopes);
                 persistedRoleTokens.Add(roleToken.Role);
-                if (roleToken.Role.Equals("node", StringComparison.OrdinalIgnoreCase))
+                if (stored && roleToken.Role.Equals("node", StringComparison.OrdinalIgnoreCase))
                     _logger.Info("Node device token stored for Windows tray node reconnect");
-                else
+                else if (stored)
                     _logger.Info($"{roleToken.Role} device token stored for reconnect");
                 DeviceTokenReceived?.Invoke(this, new DeviceTokenReceivedEventArgs(roleToken.Token, roleToken.Scopes, roleToken.Role));
             }
@@ -1858,9 +1916,10 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
                 if (!string.IsNullOrWhiteSpace(nodeDeviceToken))
                 {
                     var nodeDeviceTokenScopes = TryGetHandshakeDeviceTokenScopesCore(payload, "node", allowDirectDeviceTokenFallback: true);
-                    _deviceIdentity.StoreDeviceTokenForRole("node", nodeDeviceToken, nodeDeviceTokenScopes);
+                    var stored = TryStoreHandshakeDeviceToken("node", nodeDeviceToken, nodeDeviceTokenScopes);
                     persistedRoleTokens.Add("node");
-                    _logger.Info("Node device token stored for Windows tray node reconnect");
+                    if (stored)
+                        _logger.Info("Node device token stored for Windows tray node reconnect");
                     DeviceTokenReceived?.Invoke(this, new DeviceTokenReceivedEventArgs(nodeDeviceToken, nodeDeviceTokenScopes, "node"));
                 }
             }
@@ -1873,9 +1932,10 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
                 var deviceTokenScopes = _bootstrapPairAsNode
                     ? TryGetHandshakeDeviceTokenScopesCore(payload, OperatorRole, allowDirectDeviceTokenFallback: false)
                     : TryGetHandshakeDeviceTokenScopesCore(payload, preferredRole: null);
-                _deviceIdentity.StoreDeviceTokenWithScopes(newDeviceToken, deviceTokenScopes);
+                var stored = TryStoreHandshakeDeviceToken(OperatorRole, newDeviceToken, deviceTokenScopes);
                 _connectAuthToken = newDeviceToken;
-                _logger.Info("Operator device token stored for reconnect");
+                if (stored)
+                    _logger.Info("Operator device token stored for reconnect");
                 DeviceTokenReceived?.Invoke(this, new DeviceTokenReceivedEventArgs(newDeviceToken, deviceTokenScopes, "operator"));
             }
 
@@ -1931,6 +1991,21 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         if (payload.TryGetProperty("nodes", out var nodes))
         {
             ParseNodeList(nodes);
+        }
+    }
+
+    private bool TryStoreHandshakeDeviceToken(string role, string token, string[]? scopes)
+    {
+        try
+        {
+            _deviceIdentity.StoreDeviceTokenForRole(role, token, scopes);
+            return true;
+        }
+        catch (DeviceIdentityLoadException ex)
+        {
+            _logger.Error(
+                $"Failed to persist {role} device token during handshake; connection remains active: {ex.InnerException?.Message}");
+            return false;
         }
     }
 
@@ -2090,6 +2165,7 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
     private void HandleRequestError(string? method, JsonElement root)
     {
         var message = TryGetErrorMessage(root) ?? "request failed";
+        var detailCode = method == "connect" ? TryGetErrorDetailCode(root) : null;
 
         if (string.IsNullOrEmpty(method))
         {
@@ -2099,7 +2175,6 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
 
         if (method == "connect")
         {
-            var detailCode = TryGetErrorDetailCode(root);
             _logger.Warn($"[HANDSHAKE] Connect error from gateway: message=\"{message}\", detailCode={detailCode ?? "none"}");
             // Log raw JSON for debugging (truncated)
             var rawJson = root.ToString() ?? "";
@@ -2107,9 +2182,17 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
             _logger.Info($"[HANDSHAKE] Raw error response: {rawJson}");
         }
 
+        if (method == "connect" && detailCode == "DEVICE_AUTH_SIGNATURE_EXPIRED")
+        {
+            _authFailed = true;
+            RaiseAuthenticationFailed($"{detailCode}: {message}");
+            RaiseStatusChanged(ConnectionStatus.Error);
+            return;
+        }
+
         if (method == "connect" &&
             (message.Contains("device signature invalid", StringComparison.OrdinalIgnoreCase) ||
-             TryGetErrorDetailCode(root) == "DEVICE_AUTH_SIGNATURE_INVALID"))
+             detailCode == "DEVICE_AUTH_SIGNATURE_INVALID"))
         {
             if (!_useV2Signature)
             {
@@ -2124,6 +2207,7 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
             // v2 also rejected — real auth error
             _logger.Warn($"[HANDSHAKE] v2 signature also rejected — wrong key or token. Raw: {message}");
             _authFailed = true;
+            RaiseConnectionFailure(GatewayErrorKind.Auth);
             RaiseAuthenticationFailed($"device signature rejected — {message}");
             RaiseStatusChanged(ConnectionStatus.Error);
             return;
@@ -2140,12 +2224,28 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
             return;
         }
 
-        // Permanent auth failures — stop retrying and notify the app
-        var detailCode2 = TryGetErrorDetailCode(root);
-        if (method == "connect" && (IsTerminalAuthError(message) || IsTerminalAuthDetailCode(detailCode2)))
+        // Permanent auth failures — stop retrying and notify the app. Check BOTH the top-level
+        // error.code and the structured error.details.code so a device-token mismatch delivered in
+        // either place is recognized (the gateway may send the reason only as a code with a generic
+        // message).
+        var topLevelCode = TryGetErrorTopLevelCode(root);
+        if (method == "connect" &&
+            (IsTerminalAuthError(message) || IsTerminalAuthDetailCode(detailCode) || IsTerminalAuthDetailCode(topLevelCode)))
         {
             _authFailed = true;
-            RaiseAuthenticationFailed(message);
+            var failureKind = GatewayErrorClassifier.ClassifyWithCode(message, topLevelCode, detailCode);
+            RaiseConnectionFailure(failureKind);
+            // Preserve a structured device-token mismatch in the raised string so the connection
+            // manager can distinguish it (auto-recoverable) from a wrong shared token and other
+            // terminal auth failures. Only the device-token code is enriched; other codes pass
+            // through unchanged so they are never mistaken for a recoverable device-token drift.
+            var isDeviceMismatch =
+                string.Equals(detailCode, GatewayErrorClassifier.DeviceTokenMismatchCode, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(topLevelCode, GatewayErrorClassifier.DeviceTokenMismatchCode, StringComparison.OrdinalIgnoreCase);
+            var authMessage = isDeviceMismatch
+                ? $"{GatewayErrorClassifier.DeviceTokenMismatchCode}: {message}"
+                : message;
+            RaiseAuthenticationFailed(authMessage);
             RaiseStatusChanged(ConnectionStatus.Error);
             return;
         }
@@ -2288,10 +2388,16 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
     {
         if (!root.TryGetProperty("error", out var error) || error.ValueKind != JsonValueKind.Object)
             return null;
-        if (TryGetPairingDetailsElement(error, out var details) &&
-            details.ValueKind == JsonValueKind.Object &&
-            details.TryGetProperty("code", out var code) &&
-            code.ValueKind == JsonValueKind.String)
+        return TryGetErrorDetailString(error, "code");
+    }
+
+    // Top-level error.code (distinct from the nested error.details.code). A gateway may deliver a
+    // terminal-auth reason (e.g. AUTH_DEVICE_TOKEN_MISMATCH) here with a generic message.
+    private static string? TryGetErrorTopLevelCode(JsonElement root)
+    {
+        if (!root.TryGetProperty("error", out var error) || error.ValueKind != JsonValueKind.Object)
+            return null;
+        if (error.TryGetProperty("code", out var code) && code.ValueKind == JsonValueKind.String)
             return code.GetString();
         return null;
     }
@@ -2301,30 +2407,58 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         if (!root.TryGetProperty("error", out var error) || error.ValueKind != JsonValueKind.Object)
             return default;
 
-        if (!TryGetPairingDetailsElement(error, out var details) || details.ValueKind != JsonValueKind.Object)
-            return default;
-
-        var isPairingRequired = details.TryGetProperty("code", out var code)
-            && code.ValueKind == JsonValueKind.String
-            && string.Equals(code.GetString(), "PAIRING_REQUIRED", StringComparison.Ordinal);
-        var requestId = GetSafeRequestId(details, "requestId");
+        var isPairingRequired = string.Equals(
+            TryGetErrorDetailString(error, "code"),
+            "PAIRING_REQUIRED",
+            StringComparison.Ordinal);
+        var requestId = TryGetSafeErrorDetailRequestId(error);
         return new PairingConnectErrorDetails(isPairingRequired, requestId);
     }
 
-    private static bool TryGetPairingDetailsElement(JsonElement error, out JsonElement details)
+    private static string? TryGetErrorDetailString(JsonElement error, string property)
     {
-        if (error.TryGetProperty("details", out details))
-            return true;
+        if (error.TryGetProperty("details", out var details) &&
+            details.ValueKind == JsonValueKind.Object &&
+            details.TryGetProperty(property, out var value) &&
+            value.ValueKind == JsonValueKind.String &&
+            !string.IsNullOrWhiteSpace(value.GetString()))
+        {
+            return value.GetString();
+        }
 
         if (error.TryGetProperty("data", out var data)
             && data.ValueKind == JsonValueKind.Object
-            && data.TryGetProperty("details", out details))
+            && data.TryGetProperty("details", out details)
+            && details.ValueKind == JsonValueKind.Object
+            && details.TryGetProperty(property, out value)
+            && value.ValueKind == JsonValueKind.String
+            && !string.IsNullOrWhiteSpace(value.GetString()))
         {
-            return true;
+            return value.GetString();
         }
 
-        details = default;
-        return false;
+        return null;
+    }
+
+    private static string? TryGetSafeErrorDetailRequestId(JsonElement error)
+    {
+        if (error.TryGetProperty("details", out var details) &&
+            details.ValueKind == JsonValueKind.Object)
+        {
+            var requestId = GetSafeRequestId(details, "requestId");
+            if (requestId is not null)
+                return requestId;
+        }
+
+        if (error.TryGetProperty("data", out var data) &&
+            data.ValueKind == JsonValueKind.Object &&
+            data.TryGetProperty("details", out details) &&
+            details.ValueKind == JsonValueKind.Object)
+        {
+            return GetSafeRequestId(details, "requestId");
+        }
+
+        return null;
     }
 
     private static string? GetSafeRequestId(JsonElement parent, string property)
@@ -2354,7 +2488,7 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
     private static bool IsTerminalAuthDetailCode(string? code) => code is
         "AUTH_TOKEN_MISMATCH" or "AUTH_BOOTSTRAP_TOKEN_INVALID" or
         "AUTH_DEVICE_TOKEN_MISMATCH" or "AUTH_RATE_LIMITED" or
-        "AUTH_TOKEN_NOT_CONFIGURED";
+        "AUTH_TOKEN_NOT_CONFIGURED" or "DEVICE_AUTH_SIGNATURE_EXPIRED";
 
     private static bool IsMissingScopeError(string errorMessage, string scope)
     {
@@ -2898,15 +3032,13 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
     {
         string? nonce = null;
         long? ts = null;
-        if (root.TryGetProperty("payload", out var payload) &&
-            payload.TryGetProperty("nonce", out var nonceProp))
+        if (root.TryGetProperty("payload", out var payload))
         {
-            nonce = nonceProp.GetString();
-
-            if (payload.TryGetProperty("ts", out var tsProp) && tsProp.ValueKind == JsonValueKind.Number)
+            if (payload.TryGetProperty("nonce", out var nonceProp))
             {
-                ts = tsProp.GetInt64();
+                nonce = nonceProp.GetString();
             }
+            ts = ConnectAuthTimestamp.ReadChallengeTimestamp(payload);
         }
 
         _challengeTimestampMs = ts;
@@ -4420,49 +4552,128 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
     {
         try
         {
-            var info = new ModelsListInfo();
-            // Gateway returns { models: [...] } or just an array
-            var modelsArray = payload.ValueKind == JsonValueKind.Array
-                ? payload
-                : payload.TryGetProperty("models", out var m) ? m : default;
-
-            if (modelsArray.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var item in modelsArray.EnumerateArray())
-                {
-                    if (item.ValueKind != JsonValueKind.Object) continue;
-
-                    // Read readiness flags defensively; older gateways may omit
-                    // them, and the UI only uses them for labels/selectability.
-                    var hasConfiguredFlag = item.TryGetProperty("configured", out var cfg)
-                                            && (cfg.ValueKind == JsonValueKind.True || cfg.ValueKind == JsonValueKind.False);
-                    bool available = true;
-                    if (TryReadBool(item, out var av, "available")) available = av;
-                    else if (TryReadBool(item, out var un, "unavailable")) available = !un;
-
-                    var model = new ModelInfo
-                    {
-                        Id = item.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "",
-                        Name = item.TryGetProperty("name", out var name) ? name.GetString() : null,
-                        Provider = item.TryGetProperty("provider", out var prov) ? prov.GetString() : null,
-                        ContextWindow = ReadPositiveInt32(item, "contextWindow"),
-                        ContextTokens = ReadPositiveInt32(item, "contextTokens"),
-                        IsConfigured = hasConfiguredFlag && cfg.ValueKind == JsonValueKind.True,
-                        HasConfiguredFlag = hasConfiguredFlag,
-                        IsDefault = ReadBool(item, "default", "isDefault"),
-                        IsAvailable = available,
-                        RequiresAuth = ReadBool(item, "requiresAuth", "authRequired", "needsAuth", "authNeeded")
-                    };
-                    if (!string.IsNullOrEmpty(model.Id))
-                        info.Models.Add(model);
-                }
-            }
-            ModelsListUpdated?.Invoke(this, info);
+            ModelsListUpdated?.Invoke(this, ParseModelsListPayload(payload));
         }
         catch (Exception ex)
         {
             _logger.Warn($"Failed to parse models.list: {ex.Message}");
         }
+    }
+
+    internal static ModelsListInfo ParseModelsListPayload(JsonElement payload)
+    {
+        var info = new ModelsListInfo();
+        // Gateway returns { models: [...] } or just an array.
+        var modelsArray = payload.ValueKind == JsonValueKind.Array
+            ? payload
+            : payload.TryGetProperty("models", out var m) ? m : default;
+
+        if (modelsArray.ValueKind != JsonValueKind.Array)
+            return info;
+
+        foreach (var item in modelsArray.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object) continue;
+
+            // Read readiness flags defensively; older gateways may omit
+            // them, and the UI only uses them for labels/selectability.
+            var hasConfiguredFlag = item.TryGetProperty("configured", out var cfg)
+                                    && (cfg.ValueKind == JsonValueKind.True || cfg.ValueKind == JsonValueKind.False);
+            bool available = true;
+            if (TryReadBool(item, out var av, "available")) available = av;
+            else if (TryReadBool(item, out var un, "unavailable")) available = !un;
+
+            var model = new ModelInfo
+            {
+                Id = item.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "",
+                Name = item.TryGetProperty("name", out var name) ? name.GetString() : null,
+                Provider = item.TryGetProperty("provider", out var prov) ? prov.GetString() : null,
+                ContextWindow = ReadPositiveInt32(item, "contextWindow"),
+                ContextTokens = ReadPositiveInt32(item, "contextTokens"),
+                IsConfigured = hasConfiguredFlag && cfg.ValueKind == JsonValueKind.True,
+                HasConfiguredFlag = hasConfiguredFlag,
+                IsDefault = ReadBool(item, "default", "isDefault"),
+                IsAvailable = available,
+                RequiresAuth = ReadBool(item, "requiresAuth", "authRequired", "needsAuth", "authNeeded")
+            };
+            if (!string.IsNullOrEmpty(model.Id))
+                info.Models.Add(model);
+        }
+
+        return info;
+    }
+
+    internal static ModelsListInfo MergeModelCatalog(ModelsListInfo configured, ModelsListInfo catalog)
+    {
+        var result = new ModelsListInfo();
+        var byIdentity = new Dictionary<string, ModelInfo>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var source in configured.Models)
+        {
+            if (source is null || string.IsNullOrWhiteSpace(source.Id)) continue;
+
+            var identity = GetModelIdentity(source);
+            if (!byIdentity.TryAdd(identity, CloneModelInfo(source))) continue;
+
+            var configuredModel = byIdentity[identity];
+            configuredModel.HasConfiguredFlag = true;
+            configuredModel.IsConfigured = true;
+            result.Models.Add(configuredModel);
+        }
+
+        foreach (var source in catalog.Models)
+        {
+            if (source is null || string.IsNullOrWhiteSpace(source.Id)) continue;
+            if (!source.IsAvailable && !source.RequiresAuth) continue;
+
+            var identity = GetModelIdentity(source);
+            if (byIdentity.TryGetValue(identity, out var configuredModel))
+            {
+                configuredModel.Name ??= source.Name;
+                configuredModel.Provider ??= source.Provider;
+                configuredModel.ContextWindow ??= source.ContextWindow;
+                configuredModel.ContextTokens ??= source.ContextTokens;
+                configuredModel.IsDefault |= source.IsDefault;
+                configuredModel.RequiresAuth |= source.RequiresAuth;
+                continue;
+            }
+
+            var catalogModel = CloneModelInfo(source);
+            catalogModel.HasConfiguredFlag = true;
+            catalogModel.IsConfigured = false;
+            // Catalog-only entries stay visible for discovery, while the explicit
+            // configuration flag keeps them disabled until they are allowlisted.
+            byIdentity.Add(identity, catalogModel);
+            result.Models.Add(catalogModel);
+        }
+
+        return result;
+    }
+
+    private static ModelInfo CloneModelInfo(ModelInfo source) => new()
+    {
+        Id = source.Id,
+        Name = source.Name,
+        Provider = source.Provider,
+        ContextWindow = source.ContextWindow,
+        ContextTokens = source.ContextTokens,
+        IsConfigured = source.IsConfigured,
+        HasConfiguredFlag = source.HasConfiguredFlag,
+        IsDefault = source.IsDefault,
+        IsAvailable = source.IsAvailable,
+        RequiresAuth = source.RequiresAuth
+    };
+
+    private static string GetModelIdentity(ModelInfo model)
+    {
+        var id = model.Id.Trim();
+        var provider = model.Provider?.Trim();
+        if (string.IsNullOrEmpty(provider)) return id;
+
+        var prefix = provider + "/";
+        return id.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            ? id
+            : prefix + id;
     }
 
     private static int? ReadPositiveInt32(JsonElement obj, string key)
