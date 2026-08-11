@@ -142,15 +142,15 @@ public sealed class MxcSetupAndConnectTests
         var env = GatewayTokenEnv(gateway.SharedGatewayToken);
         var nodeId = _fixture.ReadActiveGatewayDeviceId();
         var logCursor = GetTrayLogCursor();
-        var commandText = $"echo {marker}";
+        var commandText = $"Write-Output '{marker}'";
         var invokeParams = JsonSerializer.Serialize(new
         {
             nodeId,
             command = "system.run",
             @params = new
             {
-                command = new[] { "cmd.exe", "/d", "/s", "/c", commandText },
-                rawCommand = commandText,
+                command = new[] { "powershell.exe", "-NoProfile", "-Command", commandText },
+                rawCommand = $"powershell.exe -NoProfile -Command \"{commandText}\"",
                 timeoutMs = SystemRunProofTimeoutMs
             },
             timeoutMs = NodeInvokeProofTimeoutMs,
@@ -192,7 +192,8 @@ public sealed class MxcSetupAndConnectTests
             "[mxc] system.run sandbox request",
             "executor=mxc-direct-appc",
             "contained=True",
-            "shell=<direct-argv>");
+            "shell=<direct-argv>",
+            "uiAllowWindows=True");
         var resultLog = await WaitForTrayLogLineContainingAsync(
             TimeSpan.FromSeconds(30),
             logCursor,

@@ -705,6 +705,7 @@ public sealed class NodeService : IDisposable, IAsyncDisposable
                 SystemRunSandboxEnabled = true,
                 SystemRunBlockHostFallbackWhenMxcUnavailable = false,
                 SystemRunAllowOutbound = false,
+                SystemRunAllowWindowsUi = false,
             };
 
         return new SettingsData
@@ -712,6 +713,7 @@ public sealed class NodeService : IDisposable, IAsyncDisposable
             SystemRunSandboxEnabled = _settings.SystemRunSandboxEnabled,
             SystemRunBlockHostFallbackWhenMxcUnavailable = _settings.SystemRunBlockHostFallbackWhenMxcUnavailable,
             SystemRunAllowOutbound = _settings.SystemRunAllowOutbound,
+            SystemRunAllowWindowsUi = _settings.SystemRunAllowWindowsUi,
             // Sandbox page fields — read by MxcPolicyBuilder.ForSystemRun.
             SandboxClipboard = _settings.SandboxClipboard,
             SandboxDocumentsAccess = _settings.SandboxDocumentsAccess,
