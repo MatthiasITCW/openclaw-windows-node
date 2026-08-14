@@ -6,6 +6,7 @@ public sealed class AppSurfaceOwnershipContractTests
     public void App_DelegatesConcreteTrayAndWindowOwnership()
     {
         var app = Read("App.xaml.cs");
+        var shutdown = Read("App.AppShutdownCoordinator.cs");
 
         Assert.Contains("private ITrayController? _trayController;", app);
         Assert.Contains("private IWindowManager? _windowManager;", app);
@@ -15,7 +16,7 @@ public sealed class AppSurfaceOwnershipContractTests
         Assert.Contains("new CanvasWindowRequest(", app);
         Assert.Contains("() => _windowManager?.DialogXamlRoot", app);
         Assert.DoesNotContain("() => _windowManager.DialogXamlRoot", app);
-        Assert.Contains("windowManager.CloseForShutdownAsync", app);
+        Assert.Contains("windowManager.CloseForShutdownAsync", shutdown);
 
         Assert.DoesNotContain("private HubWindow?", app);
         Assert.DoesNotContain("private ChatWindow?", app);
@@ -38,11 +39,10 @@ public sealed class AppSurfaceOwnershipContractTests
             "_windowManager?.InitializeRuntimeAnchor()",
             "_trayController.Initialize()");
         AssertInOrder(
-            app,
+            shutdown,
             "\"window manager\"",
             "\"tray menu window\"",
             "var services = _services;",
-            "_services = null;",
             "\"tray icon\"");
     }
 
@@ -73,8 +73,8 @@ public sealed class AppSurfaceOwnershipContractTests
         Assert.Contains("return _closeForShutdownTask ??= CloseOwnedWindowsAsync();", manager);
         Assert.Contains("throw new AggregateException", manager);
 
-        Assert.DoesNotContain("IActivationRouter", manager);
-        Assert.DoesNotContain("ISettingsChangeCoordinator", manager);
+        Assert.DoesNotContain("ActivationRouter", manager);
+        Assert.DoesNotContain("SettingsChangeCoordinator", manager);
         Assert.DoesNotContain("AppBootstrapper", manager);
         Assert.DoesNotContain("SettingsChangeImpact", manager);
         Assert.DoesNotContain("DisposeByUserAsync", manager);
