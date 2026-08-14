@@ -23,7 +23,7 @@ namespace OpenClaw.Shared.Mxc;
 /// <item><c>network.allowOutbound</c> — bound by <see cref="SettingsData.SystemRunAllowOutbound"/>.</item>
 /// <item><c>ui</c> — Win32k access is bound by
 /// <see cref="SettingsData.SystemRunAllowWindowsUi"/> and remains denied by
-/// default. PowerShell-family shells and many console utilities require this
+/// default. PowerShell-family shells and some console utilities require this
 /// opt-in on MXC 0.7.</item>
 /// </list>
 /// </remarks>

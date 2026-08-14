@@ -403,7 +403,7 @@
                                       OnContent="On: PowerShell and similar tools can start"
                                       Toggled="OnWindowsUiToggled" />
                         <TextBlock x:Uid="SandboxPage_WindowsUiCompatibilityDescription"
-                                   Text="PowerShell, whoami, tasklist, and many other console tools use Windows UI APIs during startup."
+                                   Text="PowerShell (all versions) and some console tools use Windows UI APIs during startup. This setting does not provide a supported host-wide process inventory."
                                    TextWrapping="Wrap"
                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                         <InfoBar x:Uid="SandboxPage_WindowsUiWarning"
@@ -412,7 +412,7 @@
                                  IsClosable="False"
                                  Severity="Warning"
                                  Title="Win32k boundary disabled"
-                                 Message="File, network, clipboard, timeout, and command approval controls still apply, but Win32k system calls are allowed." />
+                                 Message="File, network, clipboard, timeout, and command approval controls still apply. Win32k system calls are allowed; clipboard policy and the input-injection denial remain in force." />
                     </StackPanel>
                 </Expander>
 

@@ -4693,19 +4693,19 @@ Commands are blocked while sandboxing is unavailable because strict fallback blo
     <value>Allow Windows UI APIs for sandboxed commands</value>
   </data>
   <data name="SandboxPage_WindowsUiCompatibilityDescription.Text" xml:space="preserve">
-    <value>PowerShell, whoami, tasklist, and many other console tools use Windows UI APIs during startup.</value>
+    <value>PowerShell (all versions) and some console tools use Windows UI APIs during startup. This setting does not provide a supported host-wide process inventory.</value>
   </data>
   <data name="SandboxPage_WindowsUiWarning.Title" xml:space="preserve">
     <value>Win32k boundary disabled</value>
   </data>
   <data name="SandboxPage_WindowsUiWarning.Message" xml:space="preserve">
-    <value>File, network, clipboard, timeout, and command approval controls still apply, but Win32k system calls are allowed.</value>
+    <value>File, network, clipboard, timeout, and command approval controls still apply. Win32k system calls are allowed; clipboard policy and the input-injection denial remain in force.</value>
   </data>
   <data name="SandboxPage_AllowWindowsUiDialogTitle" xml:space="preserve">
     <value>Allow Windows UI APIs?</value>
   </data>
   <data name="SandboxPage_AllowWindowsUiDialogContent" xml:space="preserve">
-    <value>This lets sandboxed commands use Windows UI system calls. PowerShell, whoami, tasklist, and other console tools need this to start on current MXC versions.&#xA;&#xA;File, network, clipboard, timeout, and command approval controls still apply, but Win32k syscall blocking will be disabled. Only enable this if you need broader command compatibility.</value>
+    <value>This lets sandboxed commands use Windows UI system calls. PowerShell (all versions) and some console tools need this to start on current MXC versions. This setting does not grant a supported host-wide process inventory: CIM/WMI host enumeration is not supported and has been observed to fail, tasklist may fail or time out, and Get-Process output should not be treated as complete inventory or a process-metadata secrecy boundary.&#xA;&#xA;File, network, clipboard, timeout, and command approval controls still apply, but Win32k syscall blocking will be disabled. Clipboard policy and the input-injection denial remain in force. Only enable this if you need broader command compatibility.</value>
   </data>
   <data name="SandboxPage_AllowWindowsUiDialogPrimary" xml:space="preserve">
     <value>Allow UI APIs</value>

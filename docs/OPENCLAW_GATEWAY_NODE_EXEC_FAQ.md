@@ -648,11 +648,30 @@ fallback if MXC is unavailable. Enabling **block host fallback when MXC is
 unavailable** changes that case to a deny. The actual result reports whether
 execution used sandbox, host fallback, or host mode.
 
-MXC also blocks Win32k system calls by default. PowerShell, `whoami`, `tasklist`,
-and many other console programs initialize Windows UI APIs even when they do not
-show a window. Enable **Allow Windows UI APIs** on the Node Sandbox page when
-those programs are required. This keeps filesystem, network, clipboard, timeout,
-and command approval controls in force, but removes the Win32k syscall boundary.
+MXC also blocks Win32k system calls by default. PowerShell (all versions) and
+some console programs initialize Windows UI APIs even when they do not show a
+window. Enable **Allow Windows UI APIs** on the Node Sandbox page when those
+programs require Win32k compatibility. This keeps filesystem, network,
+clipboard, timeout, and command approval controls in force, but removes the
+Win32k syscall boundary. Clipboard policy and the input-injection denial remain
+in force.
+
+Windows UI access is not a process-enumeration permission and does not provide a
+supported host-wide process inventory. In the behavior reported in
+[issue #1149](https://github.com/openclaw/openclaw-windows-node/issues/1149),
+`Get-CimInstance Win32_Process` could not connect and `tasklist` failed to
+complete. `Get-Process` output must not be treated as either a complete host
+inventory or a security guarantee that all host process metadata is hidden.
+[PR #1151](https://github.com/openclaw/openclaw-windows-node/pull/1151),
+merged as
+[`36928782`](https://github.com/openclaw/openclaw-windows-node/commit/369287826f3966d67da251a91272dced1132a814),
+bounds cancellation cleanup so a killed or timed-out sandbox invocation
+returns; it does not change process visibility. Host-wide process inspection
+requires uncontained host execution with the applicable approvals.
+
+OpenClaw's `process` tool is a separate abstraction. It lists OpenClaw-managed
+background exec sessions for the same agent, not arbitrary operating-system
+processes.
 
 **Evidence:** local runner wiring is in
 [`NodeService.cs`](https://github.com/openclaw/openclaw-windows-node/blob/d7d153ca5d409487e06ef584b1de1184520e90e6/src/OpenClaw.Tray.WinUI/Services/NodeService.cs#L589-L679).

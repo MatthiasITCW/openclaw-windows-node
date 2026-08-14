@@ -183,7 +183,7 @@ public record class SettingsData
 
     /// <summary>
     /// When sandboxed, allow system.run commands to use Windows UI system calls.
-    /// This is required by PowerShell and many console utilities on current MXC
+    /// This is required by PowerShell and some console utilities on current MXC
     /// processcontainer backends. Default false preserves Win32k syscall blocking.
     /// </summary>
     public bool SystemRunAllowWindowsUi { get; set; } = false;
