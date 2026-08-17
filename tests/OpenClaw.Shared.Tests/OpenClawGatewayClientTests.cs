@@ -16,6 +16,7 @@ public class OpenClawGatewayClientTests
     private class GatewayClientTestHelper
     {
         private readonly OpenClawGatewayClient _client;
+        private bool _pendingRegistryOpened;
 
         public OpenClawGatewayClient Client => _client;
 
@@ -83,31 +84,28 @@ public class OpenClawGatewayClientTests
 
         public Task<ChatSendResult> RegisterPendingChatSend(string requestId)
         {
-            var completion = new TaskCompletionSource<ChatSendResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var method = typeof(OpenClawGatewayClient).GetMethod(
-                "TrackPendingChatSend",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            method!.Invoke(_client, new object[] { requestId, completion });
-            return completion.Task;
+            EnsurePendingRegistryOpen();
+            return GetPendingRegistry().RegisterChatSend(requestId, "chat.send").Task;
         }
 
         public Task<JsonElement> RegisterPendingWizardResponse(string requestId)
         {
-            var completion = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var field = typeof(OpenClawGatewayClient).GetField(
-                "_pendingWizardResponses",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var pending = (System.Collections.Concurrent.ConcurrentDictionary<string, TaskCompletionSource<JsonElement>>)field!.GetValue(_client)!;
-            pending[requestId] = completion;
-            return completion.Task;
+            EnsurePendingRegistryOpen();
+            return GetPendingRegistry().RegisterWizard(requestId, "wizard.next").Task;
+        }
+
+        public Task<bool> RegisterPendingApprovalResolve(string requestId)
+        {
+            EnsurePendingRegistryOpen();
+            return GetPendingRegistry()
+                .RegisterApproval(requestId, "exec.approval.resolve")
+                .Task;
         }
 
         public void ClearPendingRequests()
         {
-            var method = typeof(OpenClawGatewayClient).GetMethod(
-                "ClearPendingRequests",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            method!.Invoke(_client, [null]);
+            GetPendingRegistry().Drain();
+            _pendingRegistryOpened = false;
         }
 
         public void OnDisconnected()
@@ -441,10 +439,28 @@ public class OpenClawGatewayClientTests
         /// <summary>Pre-register a pending request so ProcessRawMessage can resolve the method.</summary>
         public void TrackPendingRequest(string requestId, string method)
         {
-            var methodInfo = typeof(OpenClawGatewayClient).GetMethod(
-                "TrackPendingRequest",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            methodInfo!.Invoke(_client, new object[] { requestId, method });
+            EnsurePendingRegistryOpen();
+            GetPendingRegistry().RegisterTracked(requestId, method);
+            if (string.Equals(method, "connect", StringComparison.Ordinal))
+                AuthorizeCurrentHandshake();
+        }
+
+        private void AuthorizeCurrentHandshake()
+        {
+            var generationProperty = typeof(WebSocketClientBase).GetProperty(
+                "CurrentConnectionGeneration",
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Instance);
+            var generation = (long)generationProperty!.GetValue(_client)!;
+            var gateField = typeof(OpenClawGatewayClient).GetField(
+                "_handshakeChallengeGate",
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Instance);
+            var gate = gateField!.GetValue(_client)!;
+            var gateType = gate.GetType();
+            gateType.GetMethod("Reset")!.Invoke(gate, [generation]);
+            Assert.True((bool)gateType.GetMethod("TryBegin")!.Invoke(gate, [generation])!);
+            Assert.True((bool)gateType.GetMethod("TryAuthorize")!.Invoke(gate, [generation])!);
         }
 
         public bool GetPairingRequiredFlag() =>
@@ -509,20 +525,28 @@ public class OpenClawGatewayClientTests
             return events;
         }
 
-        public (int WizardResponses, int RequestMethods) GetPendingRequestCounts()
+        public int GetPendingRequestCount()
         {
-            var wizardField = typeof(OpenClawGatewayClient).GetField(
-                "_pendingWizardResponses",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var wizardResponses =
-                (System.Collections.Concurrent.ConcurrentDictionary<string, TaskCompletionSource<JsonElement>>)wizardField!.GetValue(_client)!;
+            return GetPendingRegistry().Count;
+        }
 
-            var methodsField = typeof(OpenClawGatewayClient).GetField(
-                "_pendingRequestMethods",
+        private PendingRequestRegistry GetPendingRegistry()
+        {
+            var field = typeof(OpenClawGatewayClient).GetField(
+                "_pendingRequests",
                 System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var requestMethods = (Dictionary<string, string>)methodsField!.GetValue(_client)!;
+            return (PendingRequestRegistry)field!.GetValue(_client)!;
+        }
 
-            return (wizardResponses.Count, requestMethods.Count);
+        private void EnsurePendingRegistryOpen()
+        {
+            if (_pendingRegistryOpened)
+            {
+                return;
+            }
+
+            GetPendingRegistry().OpenConnection();
+            _pendingRegistryOpened = true;
         }
 
     }
@@ -558,10 +582,10 @@ public class OpenClawGatewayClientTests
         var payload = await responseTask.WaitAsync(TimeSpan.FromSeconds(2));
 
         Assert.Equal("welcome", payload.GetProperty("stepId").GetString());
-        Assert.Equal((0, 0), helper.GetPendingRequestCounts());
+        Assert.Equal(0, helper.GetPendingRequestCount());
 
         client.Dispose();
-        Assert.Equal((0, 0), helper.GetPendingRequestCounts());
+        Assert.Equal(0, helper.GetPendingRequestCount());
     }
 
     [Fact]
@@ -593,7 +617,7 @@ public class OpenClawGatewayClientTests
             async () => await responseTask.WaitAsync(TimeSpan.FromSeconds(2)));
 
         Assert.Equal("wizard rejected", exception.Message);
-        Assert.Equal((0, 0), helper.GetPendingRequestCounts());
+        Assert.Equal(0, helper.GetPendingRequestCount());
     }
 
     [Fact]
@@ -614,7 +638,7 @@ public class OpenClawGatewayClientTests
         var exception = await Assert.ThrowsAsync<TimeoutException>(async () => await responseTask);
 
         Assert.Equal("Timed out waiting for wizard.status response", exception.Message);
-        Assert.Equal((0, 0), helper.GetPendingRequestCounts());
+        Assert.Equal(0, helper.GetPendingRequestCount());
     }
 
     [Fact]
@@ -660,7 +684,7 @@ public class OpenClawGatewayClientTests
 
         Assert.Equal("probe", probePayload.GetProperty("stepId").GetString());
         Assert.Same(firstTimeout, repeatedTimeout);
-        Assert.Equal((0, 0), helper.GetPendingRequestCounts());
+        Assert.Equal(0, helper.GetPendingRequestCount());
     }
 
     [Fact]
@@ -682,7 +706,32 @@ public class OpenClawGatewayClientTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             async () => await responseTask.WaitAsync(TimeSpan.FromSeconds(2)));
-        Assert.Equal((0, 0), helper.GetPendingRequestCounts());
+        Assert.Equal(0, helper.GetPendingRequestCount());
+    }
+
+    [Fact]
+    public async Task SendWizardRequestAsync_TransportDisconnect_DrainsPendingRequest()
+    {
+        using var server = new LoopbackWebSocketServer();
+        using var identity = new TempDirectory("wizard-request-");
+        await server.StartAsync();
+        var helper = new GatewayClientTestHelper(
+            gatewayUrl: server.WebSocketUrl,
+            identityPath: identity.Path);
+        using var client = helper.Client;
+        await client.ConnectAsync();
+
+        var responseTask = client.SendWizardRequestAsync("wizard.next", timeoutMs: 10_000);
+        await server.ReceiveTextAsync().WaitAsync(TimeSpan.FromSeconds(2));
+
+        await server.CloseSocketAsync(0);
+
+        var exception = await Assert.ThrowsAsync<GatewayConnectionLostException>(
+            async () => await responseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal(
+            (int)WebSocketCloseStatus.NormalClosure,
+            exception.CloseStatusCode);
+        Assert.Equal(0, helper.GetPendingRequestCount());
     }
 
     [Fact]
@@ -696,6 +745,7 @@ public class OpenClawGatewayClientTests
             identityPath: identity.Path);
         using var client = helper.Client;
         await client.ConnectAsync();
+        helper.TrackPendingRequest("req-hello-restart", "connect");
         helper.ProcessRawMessage("""
         {
             "type": "res",
@@ -720,7 +770,7 @@ public class OpenClawGatewayClientTests
         Assert.Equal(1012, exception.CloseStatusCode);
         Assert.Equal("service restart", exception.CloseStatusDescription);
         Assert.False(client.HasHandshakeSnapshot);
-        Assert.Equal((0, 0), helper.GetPendingRequestCounts());
+        Assert.Equal(0, helper.GetPendingRequestCount());
     }
 
     private static string ReadRequestId(string request)
@@ -893,6 +943,7 @@ public class OpenClawGatewayClientTests
             bootstrapPairAsNode: true,
             identityPath: CreateTempIdentityPath());
         helper.SetDeviceTokenForTest(null);
+        helper.TrackPendingRequest("req-hello-node", "connect");
 
         helper.ProcessRawMessage("""
         {
@@ -921,6 +972,7 @@ public class OpenClawGatewayClientTests
             bootstrapPairAsNode: true,
             identityPath: CreateTempIdentityPath());
         helper.SetDeviceTokenForTest(null);
+        helper.TrackPendingRequest("req-hello-node", "connect");
 
         helper.ProcessRawMessage("""
         {
@@ -1015,7 +1067,7 @@ public class OpenClawGatewayClientTests
                     "listener ownership lost")
                 : ReconnectAuthorizationResult.AllowedResult);
         };
-        helper.Client.AuthenticationFailed += (_, _) => denied.TrySetResult();
+        helper.Client.ConnectionFailure += (_, _) => denied.TrySetResult();
 
         const string challenge = """
             {
@@ -1035,6 +1087,81 @@ public class OpenClawGatewayClientTests
 
         Assert.Equal(1, authorizationCalls);
         Assert.False(helper.GetAuthFailedFlag());
+    }
+
+    [Fact]
+    public async Task DuplicateChallengeWhileAuthorizationActive_IsSuppressed()
+    {
+        var helper = new GatewayClientTestHelper();
+        var authorizationCalls = 0;
+        var authorizationStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseAuthorization = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        helper.Client.HandshakeAuthorizationAsync = async _ =>
+        {
+            Interlocked.Increment(ref authorizationCalls);
+            authorizationStarted.TrySetResult();
+            await releaseAuthorization.Task;
+            return ReconnectAuthorizationResult.AllowedResult;
+        };
+
+        const string challenge = """
+            {
+              "type": "event",
+              "event": "connect.challenge",
+              "payload": {
+                "nonce": "duplicate",
+                "ts": 1785824000000
+              }
+            }
+            """;
+
+        helper.ProcessRawMessage(challenge);
+        await authorizationStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        helper.ProcessRawMessage(challenge);
+        releaseAuthorization.TrySetResult();
+        await Task.Delay(50);
+
+        Assert.Equal(1, authorizationCalls);
+    }
+
+    [Fact]
+    public async Task MalformedChallenge_DoesNotConsumeCurrentSocketGate()
+    {
+        var helper = new GatewayClientTestHelper();
+        var authorizationCalls = 0;
+        var authorizationObserved = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        helper.Client.HandshakeAuthorizationAsync = _ =>
+        {
+            authorizationCalls++;
+            authorizationObserved.TrySetResult();
+            return Task.FromResult(ReconnectAuthorizationResult.AllowedResult);
+        };
+
+        helper.ProcessRawMessage(
+            """
+            {
+              "type": "event",
+              "event": "connect.challenge",
+              "payload": { "nonce": 42 }
+            }
+            """);
+        helper.ProcessRawMessage(
+            """
+            {
+              "type": "event",
+              "event": "connect.challenge",
+              "payload": {
+                "nonce": "valid-after-malformed",
+                "ts": 1785824000000
+              }
+            }
+            """);
+        await authorizationObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(1, authorizationCalls);
     }
 
     [Fact]
@@ -1099,6 +1226,7 @@ public class OpenClawGatewayClientTests
             bootstrapPairAsNode: false,
             identityPath: CreateTempIdentityPath());
         helper.SetDeviceTokenForTest(null);
+        helper.TrackPendingRequest("req-hello-operator", "connect");
 
         helper.ProcessRawMessage("""
         {
@@ -1137,6 +1265,7 @@ public class OpenClawGatewayClientTests
         DeviceTokenReceivedEventArgs? receivedToken = null;
         helper.Client.HandshakeSucceeded += (_, _) => handshakeSucceeded = true;
         helper.Client.DeviceTokenReceived += (_, e) => receivedToken = e;
+        helper.TrackPendingRequest("req-hello-operator", "connect");
 
         using (new FileStream(
             Path.Combine(identityPath, "device-key-ed25519.json"),
@@ -2130,6 +2259,40 @@ public class OpenClawGatewayClientTests
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await task);
         Assert.Contains("operator.write", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PendingApprovalResolve_CompletesOnSuccessfulResponse()
+    {
+        var helper = new GatewayClientTestHelper();
+        var task = helper.RegisterPendingApprovalResolve("approval-1");
+
+        helper.ProcessRawMessage(
+            """{"type":"res","id":"approval-1","ok":true}""");
+
+        Assert.True(await task);
+        Assert.Equal(0, helper.GetPendingRequestCount());
+    }
+
+    [Fact]
+    public async Task PendingApprovalResolve_FailsOnRejectedResponse()
+    {
+        var helper = new GatewayClientTestHelper();
+        var task = helper.RegisterPendingApprovalResolve("approval-2");
+
+        helper.ProcessRawMessage("""
+        {
+            "type": "res",
+            "id": "approval-2",
+            "ok": false,
+            "error": { "message": "approval not found" }
+        }
+        """);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await task);
+        Assert.Equal("approval not found", exception.Message);
+        Assert.Equal(0, helper.GetPendingRequestCount());
     }
 
     [Fact]
@@ -4400,6 +4563,7 @@ public class OpenClawGatewayClientTests
         Assert.True(helper.GetAuthFailedFlag());
 
         // Now receive hello-ok — flag must be cleared
+        helper.TrackPendingRequest("req-hello-1", "connect");
         helper.ProcessRawMessage("""
         {
             "type": "res",

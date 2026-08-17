@@ -15,7 +15,6 @@ namespace OpenClaw.Shared;
 public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatewayClient
 {
     private const string OperatorClientId = "cli";
-    private const string OperatorClientDisplayName = "OpenClaw Windows Tray";
     private const string OperatorClientMode = "cli";
     private const string OperatorRole = "operator";
     private static readonly Regex s_pairingRequestIdRegex = new("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", RegexOptions.Compiled);
@@ -37,12 +36,10 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
     private GatewayUsageInfo? _usage;
     private GatewayUsageStatusInfo? _usageStatus;
     private GatewayCostUsageInfo? _usageCost;
-    private readonly Dictionary<string, string> _pendingRequestMethods = new();
-    private readonly Dictionary<string, TaskCompletionSource<ChatSendResult>> _pendingChatSendRequests = new();
-    private readonly object _pendingRequestLock = new();
-    private readonly object _pendingChatSendLock = new();
+    private readonly PendingRequestRegistry _pendingRequests = new();
     private readonly object _sessionsLock = new();
     private readonly DeviceIdentity _deviceIdentity;
+    private IConnectEnvelopeSigner _connectEnvelopeSigner;
     private readonly string _currentGatewayUrl;
     private string? _mainSessionKey;
     private bool _mainSessionKeyIsCanonical;
@@ -77,6 +74,11 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
 
     /// <summary>Set to true to skip v3 and use v2 signatures directly (for gateways that don't support v3).</summary>
     public bool UseV2Signature { get => _useV2Signature; set => _useV2Signature = value; }
+    internal IConnectEnvelopeSigner ConnectEnvelopeSigner
+    {
+        get => _connectEnvelopeSigner;
+        set => _connectEnvelopeSigner = value;
+    }
     private long? _challengeTimestampMs;
     private string? _currentChallengeNonce;
     private bool _usageStatusUnsupported;
@@ -93,8 +95,7 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
     private bool _pairingRequiredAwaitingApproval;
     private string? _pairingRequiredRequestId;
     private bool _authFailed;
-    private int _handshakeAuthorizationBlocked;
-    private int _handshakeChallengeActive;
+    private readonly HandshakeChallengeGate _handshakeChallengeGate = new();
     private string? _lastSkillsStatusAgentId;
     private readonly bool _tokenIsBootstrapToken;
     private readonly bool _bootstrapPairAsNode;
@@ -114,15 +115,6 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
     public string ConnectAuthToken => _connectAuthToken;
     private IReadOnlyList<UserNotificationRule>? _userRules;
     private bool _preferStructuredCategories = true;
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, TaskCompletionSource<JsonElement>> _pendingWizardResponses = new();
-
-    // Pending exec.approval.resolve requests awaiting an ok:true / ok:false
-    // response. Without this, ResolveExecApprovalAsync would clear the chat
-    // approval banner immediately after the send completes, even if the
-    // gateway later rejects the resolve (ok:false). See ClawSweeper review
-    // on PR #676.
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, TaskCompletionSource<bool>> _pendingApprovalResolves = new();
-
     /// <summary>
     /// Controls whether structured notification metadata (Intent, Channel) takes priority
     /// over keyword-based classification. Call after construction and whenever settings change.
@@ -159,14 +151,22 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
 
     protected override Task ProcessMessageAsync(string json)
     {
-        ProcessMessage(json);
+        ProcessMessageForConnection(json, CurrentConnectionGeneration);
+        return Task.CompletedTask;
+    }
+
+    protected override Task ProcessMessageForConnectionAsync(
+        string json,
+        long sourceConnectionGeneration)
+    {
+        ProcessMessageForConnection(json, sourceConnectionGeneration);
         return Task.CompletedTask;
     }
 
     protected override Task OnConnectedAsync()
     {
-        Volatile.Write(ref _handshakeAuthorizationBlocked, 0);
-        Volatile.Write(ref _handshakeChallengeActive, 0);
+        _handshakeChallengeGate.Reset(CurrentConnectionGeneration);
+        _pendingRequests.OpenConnection();
         ResetUnsupportedMethodFlags();
         RaiseTransportConnected();
         return Task.CompletedTask;
@@ -191,7 +191,7 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         Volatile.Write(ref _mainSessionKey, null);
         Volatile.Write(ref _mainSessionKeyIsCanonical, false);
         Volatile.Write(ref _hasHandshakeSnapshot, false);
-        ClearPendingRequests(
+        _pendingRequests.Drain(
             new GatewayConnectionLostException(
                 RemoteCloseStatusCode,
                 RemoteCloseStatusDescription));
@@ -199,7 +199,12 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
 
     protected override void OnDisposing()
     {
-        ClearPendingRequests();
+        _pendingRequests.Drain();
+    }
+
+    protected override void OnError(Exception ex)
+    {
+        _pendingRequests.Drain();
     }
 
     // Events
@@ -296,6 +301,7 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
 
         _deviceIdentity = new DeviceIdentity(dataPath, _logger);
         _deviceIdentity.Initialize();
+        _connectEnvelopeSigner = new DeviceIdentityConnectEnvelopeSigner(_deviceIdentity);
         _connectAuthToken = HasUsableOperatorDeviceToken ? _deviceIdentity.DeviceToken! : (_tokenIsBootstrapToken ? string.Empty : _token);
         _useV2Signature |= _tokenIsBootstrapToken && !HasUsableOperatorDeviceToken;
     }
@@ -313,7 +319,7 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
                 _logger.Warn($"Error during disconnect: {ex.Message}");
             }
         }
-        ClearPendingRequests();
+        _pendingRequests.Drain();
         RaiseStatusChanged(ConnectionStatus.Disconnected);
         _logger.Info("Disconnected");
     }
@@ -371,8 +377,7 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         var effectiveIdempotencyKey = idempotencyKey?.Trim() ?? Guid.NewGuid().ToString();
 
         var requestId = Guid.NewGuid().ToString();
-        var completion = new TaskCompletionSource<ChatSendResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-        TrackPendingChatSend(requestId, completion);
+        var pending = _pendingRequests.RegisterChatSend(requestId, "chat.send");
 
         // The gateway's `chat.send` validates strictly on (sessionKey, message,
         // idempotencyKey). The spec document mentioned `sessionId` and `text`
@@ -399,12 +404,11 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
             @params = chatParams
         };
 
-        await SendRawAsync(JsonSerializer.Serialize(req));
-
         try
         {
+            await SendRawAsync(JsonSerializer.Serialize(req));
             var result = await WaitForGatewayResponseAsync(
-                completion.Task,
+                pending.Task,
                 TimeSpan.FromSeconds(5),
                 CancellationToken,
                 "Timed out waiting for chat.send response from gateway");
@@ -413,7 +417,7 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         }
         finally
         {
-            RemovePendingChatSend(requestId);
+            _pendingRequests.TryRemove(pending.Handle);
         }
     }
 
@@ -486,45 +490,37 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         if (!IsConnected)
             throw new InvalidOperationException("Cannot resolve exec approval: gateway is not connected.");
 
-        // Register a TaskCompletionSource keyed on the requestId so we can
-        // observe ok:true / ok:false from the gateway's response, instead of
-        // returning the moment the frame leaves the socket. Without this, a
-        // rejected resolve would silently clear the chat approval banner and
-        // leave the agent blocked with no retry path. See ClawSweeper review
-        // on PR #676.
         var requestId = Guid.NewGuid().ToString();
-        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pendingApprovalResolves[requestId] = completion;
-        TrackPendingRequest(requestId, "exec.approval.resolve");
+        var pending = _pendingRequests.RegisterApproval(
+            requestId,
+            "exec.approval.resolve");
 
+        // A lifecycle drain faults this task with OperationCanceledException.
+        // Banner callers must keep catching System.Exception so disconnects
+        // preserve the approval UI and surface a retryable error.
         try
         {
             await SendRawAsync(SerializeRequest(requestId, "exec.approval.resolve", new { id = approvalId, decision }));
         }
         catch
         {
-            _pendingApprovalResolves.TryRemove(requestId, out _);
-            RemovePendingRequest(requestId);
+            _pendingRequests.TryRemove(pending.Handle);
             throw;
         }
 
         // Post-send disconnect re-check. Closes a race where the WebSocket
         // dies between the up-front IsConnected guard and TCS registration:
-        // ClearPendingRequests can fire on an empty _pendingApprovalResolves
-        // snapshot (before our entry was added), then SendRawAsync silently
+        // Drain can run before registration, then SendRawAsync silently
         // succeeds against the now-dead socket, leaving the TCS stranded
         // until the 15s timeout instead of failing fast for retry.
         //
-        // TryRemove-first idiom: if we win the race and pull our TCS out of
-        // the dict, throw immediately — no exception is ever set on the
-        // discarded TCS, so it can never be unobserved by
-        // TaskScheduler.UnobservedTaskException. If TryRemove returns false,
-        // ClearPendingRequests already claimed (and faulted) our entry; fall
+        // TryRemove-first idiom: if we win the race, throw immediately with no
+        // exception set on the discarded task. If TryRemove returns false,
+        // Drain already claimed and faulted our entry; fall
         // through to the WhenAny/await path so the OperationCanceledException
         // it set is observed by the caller.
-        if (!IsConnected && _pendingApprovalResolves.TryRemove(requestId, out _))
+        if (!IsConnected && _pendingRequests.TryRemove(pending.Handle))
         {
-            RemovePendingRequest(requestId);
             throw new InvalidOperationException("Gateway disconnected before exec.approval.resolve was sent.");
         }
 
@@ -535,15 +531,14 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         try
         {
             await WaitForGatewayResponseAsync(
-                completion.Task,
+                pending.Task,
                 TimeSpan.FromSeconds(15),
                 CancellationToken,
                 "Timed out waiting for exec.approval.resolve response from gateway");
         }
         finally
         {
-            _pendingApprovalResolves.TryRemove(requestId, out _);
-            RemovePendingRequest(requestId);
+            _pendingRequests.TryRemove(pending.Handle);
         }
     }
 
@@ -972,14 +967,12 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
 
         _logger.Info($"[GatewayClient] Sending frame: {method}");
         var requestId = Guid.NewGuid().ToString();
-        var completion = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pendingWizardResponses[requestId] = completion;
-        TrackPendingRequest(requestId, method);
+        var pending = _pendingRequests.RegisterWizard(requestId, method);
 
         try
         {
             await SendRawAsync(SerializeRequest(requestId, method, parameters));
-            return await completion.Task.WaitAsync(TimeSpan.FromMilliseconds(timeoutMs), CancellationToken);
+            return await pending.Task.WaitAsync(TimeSpan.FromMilliseconds(timeoutMs), CancellationToken);
         }
         catch (TimeoutException ex)
         {
@@ -987,8 +980,7 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         }
         finally
         {
-            _pendingWizardResponses.TryRemove(requestId, out _);
-            RemovePendingRequest(requestId);
+            _pendingRequests.TryRemove(pending.Handle);
         }
     }
 
@@ -1736,17 +1728,33 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         }
     }
 
-    private async Task SendConnectMessageAsync(string? nonce = null)
+    private async Task<bool> SendConnectMessageAsync(
+        string? nonce,
+        long connectionGeneration,
+        CancellationToken cancellationToken)
     {
         var requestId = Guid.NewGuid().ToString();
-        TrackPendingRequest(requestId, "connect");
+        var pending = IsConnected
+            ? _pendingRequests.RegisterTracked(requestId, "connect")
+            : null;
         var role = GetConnectRole();
         var requestedScopes = GetRequestedScopes(role);
-
-        var signedAt = ConnectAuthTimestamp.ResolveSignedAt(_challengeTimestampMs);
-        var connectNonce = nonce ?? string.Empty;
-        var signatureToken = GetSignatureToken();
-        var authPayload = BuildAuthPayload();
+        var credential = SelectConnectCredential();
+        var appVersion = AppVersionInfo.Version;
+        var envelope = ConnectEnvelopeBuilder.PrepareOperator(
+            new OperatorConnectEnvelopeOptions(
+                requestId,
+                appVersion,
+                role,
+                requestedScopes,
+                credential,
+                nonce,
+                _challengeTimestampMs,
+                _useV2Signature),
+            _connectEnvelopeSigner);
+        var signedAt = envelope.SignedAt;
+        var connectNonce = envelope.Nonce!;
+        var signatureToken = credential.Value;
 
         // Log complete handshake details for diagnostics
         _logger.Info($"[HANDSHAKE] → Sending connect:");
@@ -1759,9 +1767,7 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         _logger.Info($"  sigToken(len)={signatureToken.Length}, preview=[REDACTED]");
         _logger.Info($"  signature format={(_useV2Signature ? "v2" : "v3")}, platform={WindowsClientMetadata.Platform}, family={WindowsClientMetadata.DeviceFamily}");
 
-        var signedPayload = _useV2Signature
-            ? _deviceIdentity.BuildConnectPayloadV2(connectNonce, signedAt, OperatorClientId, OperatorClientMode, role, requestedScopes, signatureToken)
-            : _deviceIdentity.BuildConnectPayloadV3(connectNonce, signedAt, OperatorClientId, OperatorClientMode, role, requestedScopes, signatureToken, WindowsClientMetadata.Platform, WindowsClientMetadata.DeviceFamily);
+        var signedPayload = envelope.SigningArguments.BuildPayload(_deviceIdentity);
         _logger.Info($"[HANDSHAKE] signed: {TokenSanitizer.Sanitize(signedPayload)}");
 
         // Also log what auth field we're sending
@@ -1770,62 +1776,25 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         _logger.Info($"[HANDSHAKE] auth: {RedactAuthPayload(authJson)}");
 
         // Try v3 first (matches reference client). Fall back to v2 if gateway rejects v3.
-        var signature = _useV2Signature
-            ? _deviceIdentity.SignConnectPayloadV2(
-                connectNonce, signedAt, OperatorClientId, OperatorClientMode,
-                role, requestedScopes, signatureToken)
-            : _deviceIdentity.SignConnectPayloadV3(
-                connectNonce, signedAt, OperatorClientId, OperatorClientMode,
-                role, requestedScopes, signatureToken,
-                WindowsClientMetadata.Platform, WindowsClientMetadata.DeviceFamily);
-
-        var appVersion = AppVersionInfo.Version;
-
-        // Use "cli" client ID for native apps - no browser security checks
-        var msg = new
-        {
-            type = "req",
-            id = requestId,
-            method = "connect",
-            @params = new
-            {
-                minProtocol = 3,
-                maxProtocol = 4,
-                client = new
-                {
-                    id = OperatorClientId,  // Native client ID
-                    version = appVersion,
-                    platform = WindowsClientMetadata.Platform,
-                    deviceFamily = WindowsClientMetadata.DeviceFamily,
-                    mode = OperatorClientMode,
-                    displayName = OperatorClientDisplayName
-                },
-                role,
-                scopes = requestedScopes,
-                caps = Array.Empty<string>(),
-                commands = Array.Empty<string>(),
-                permissions = new { },
-                auth = BuildAuthPayload(),
-                locale = "en-US",
-                userAgent = $"openclaw-windows-tray/{appVersion}",
-                device = new
-                {
-                    id = _deviceIdentity.DeviceId,
-                    publicKey = _deviceIdentity.PublicKeyBase64Url,
-                    signature,
-                    signedAt,
-                    nonce = connectNonce
-                }
-            }
-        };
+        var signature = envelope.Sign();
 
         try
         {
-            await SendRawAsync(JsonSerializer.Serialize(msg));
+            var sent = await SendRawAsync(
+                    envelope.Serialize(signature),
+                    connectionGeneration,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (!sent && pending is not null)
+                _pendingRequests.TryRemove(pending);
+            return sent;
         }
         catch
         {
-            RemovePendingRequest(requestId);
+            if (pending is not null)
+            {
+                _pendingRequests.TryRemove(pending);
+            }
             throw;
         }
     }
@@ -1865,32 +1834,22 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
     /// </summary>
     private Dictionary<string, string> BuildAuthPayload()
     {
-        var auth = new Dictionary<string, string>();
+        return SelectConnectCredential().ToAuthPayload();
+    }
 
+    private ConnectCredential SelectConnectCredential()
+    {
         if (HasUsableOperatorDeviceToken)
-        {
-            auth["deviceToken"] = _deviceIdentity.DeviceToken!;
-        }
-        else if (_tokenIsBootstrapToken)
+            return new DeviceTokenConnectCredential(_deviceIdentity.DeviceToken!);
+
+        if (_tokenIsBootstrapToken)
         {
             // Fresh QR/setup-code device: do not also send auth.token, which upstream treats
             // as an explicit gateway token and therefore suppresses bootstrap pairing.
-            auth["bootstrapToken"] = _token;
-        }
-        else
-        {
-            auth["token"] = _connectAuthToken;
+            return new BootstrapTokenConnectCredential(_token);
         }
 
-        return auth;
-    }
-
-    private string GetSignatureToken()
-    {
-        if (HasUsableOperatorDeviceToken)
-            return _deviceIdentity.DeviceToken!;
-
-        return _tokenIsBootstrapToken ? _token : _connectAuthToken;
+        return new TokenConnectCredential(_connectAuthToken);
     }
 
     private bool HasUsableOperatorDeviceToken =>
@@ -1901,14 +1860,14 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         if (!IsConnected) return;
 
         var requestId = Guid.NewGuid().ToString();
-        TrackPendingRequest(requestId, method);
+        var pending = _pendingRequests.RegisterTracked(requestId, method);
         try
         {
             await SendRawAsync(SerializeRequest(requestId, method, parameters));
         }
         catch
         {
-            RemovePendingRequest(requestId);
+            _pendingRequests.TryRemove(pending);
             throw;
         }
     }
@@ -1948,119 +1907,18 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         return JsonSerializer.Serialize(new { type = "req", id = requestId, method, @params = parameters });
     }
 
-    private void TrackPendingRequest(string requestId, string method)
-    {
-        lock (_pendingRequestLock)
-        {
-            _pendingRequestMethods[requestId] = method;
-        }
-    }
-
-    private void RemovePendingRequest(string requestId)
-    {
-        lock (_pendingRequestLock)
-        {
-            _pendingRequestMethods.Remove(requestId);
-        }
-    }
-
-    private string? TakePendingRequestMethod(string? requestId)
-    {
-        if (string.IsNullOrWhiteSpace(requestId)) return null;
-        lock (_pendingRequestLock)
-        {
-            return _pendingRequestMethods.Remove(requestId, out var method) ? method : null;
-        }
-    }
-
-    private void ClearPendingRequests(
-        GatewayConnectionLostException? wizardDisconnect = null)
-    {
-        lock (_pendingRequestLock)
-        {
-            _pendingRequestMethods.Clear();
-        }
-
-        lock (_pendingChatSendLock)
-        {
-            foreach (var completion in _pendingChatSendRequests.Values)
-            {
-                completion.TrySetException(new OperationCanceledException("Request canceled"));
-            }
-
-            _pendingChatSendRequests.Clear();
-        }
-
-        foreach (var completion in _pendingWizardResponses.Values)
-        {
-            completion.TrySetException(
-                wizardDisconnect ??
-                new OperationCanceledException(
-                    "Gateway connection lost while waiting for wizard response"));
-        }
-
-        _pendingWizardResponses.Clear();
-
-        // Fail any in-flight approval resolves so the chat banner is
-        // preserved for retry instead of hanging on the 15s timeout.
-        // Use OperationCanceledException to match the _pendingWizardResponses
-        // cleanup taxonomy: this is a connection-lifecycle cancellation, not a
-        // protocol-level error. The public ResolveExecApprovalAsync still
-        // throws InvalidOperationException from its synchronous IsConnected
-        // pre-check; the cancellation case here only surfaces when reset
-        // races an in-flight request.
-        //
-        // CONTRACT FOR CALLERS: callers of ResolveExecApprovalAsync MUST catch
-        // System.Exception (not just InvalidOperationException/TimeoutException)
-        // to preserve the chat approval banner on disconnect-mid-flight. The
-        // OperationCanceledException thrown here is intentionally a connection
-        // lifecycle signal, NOT a benign cancel. RunFireAndForget in the tray
-        // (OpenClawChatRoot) silently swallows OperationCanceledException —
-        // if a caller forwards the OCE up to RunFireAndForget instead of
-        // catching it locally, the banner will be cleared with no UI feedback.
-        // Today OpenClawChatDataProvider.RespondToPermissionAsync correctly
-        // catches Exception ex; do not narrow that catch.
-        foreach (var completion in _pendingApprovalResolves.Values)
-        {
-            completion.TrySetException(new OperationCanceledException("Gateway connection lost before exec.approval.resolve response"));
-        }
-
-        _pendingApprovalResolves.Clear();
-    }
-
-    private void TrackPendingChatSend(string requestId, TaskCompletionSource<ChatSendResult> completion)
-    {
-        lock (_pendingChatSendLock)
-        {
-            _pendingChatSendRequests[requestId] = completion;
-        }
-    }
-
-    private void RemovePendingChatSend(string requestId)
-    {
-        lock (_pendingChatSendLock)
-        {
-            _pendingChatSendRequests.Remove(requestId);
-        }
-    }
-
-    private TaskCompletionSource<ChatSendResult>? TakePendingChatSend(string? requestId)
-    {
-        if (string.IsNullOrWhiteSpace(requestId))
-        {
-            return null;
-        }
-
-        lock (_pendingChatSendLock)
-        {
-            return _pendingChatSendRequests.Remove(requestId, out var completion) ? completion : null;
-        }
-    }
-
     // --- Message processing ---
 
-    private void ProcessMessage(string json)
+    private void ProcessMessage(string json) =>
+        ProcessMessageForConnection(json, CurrentConnectionGeneration);
+
+    private void ProcessMessageForConnection(
+        string json,
+        long sourceConnectionGeneration)
     {
+        if (!IsCurrentConnectionGeneration(sourceConnectionGeneration))
+            return;
+
         try
         {
             using var doc = JsonDocument.Parse(json);
@@ -2072,10 +1930,13 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
             switch (type)
             {
                 case "res":
-                    HandleResponse(root);
+                    HandleResponseForConnection(root, sourceConnectionGeneration);
                     break;
                 case "event":
-                    HandleEvent(root, json.Length);
+                    HandleEventForConnection(
+                        root,
+                        json.Length,
+                        sourceConnectionGeneration);
                     break;
             }
         }
@@ -2089,74 +1950,79 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         }
     }
 
-    private void HandleResponse(JsonElement root)
+    private void HandleResponseForConnection(
+        JsonElement root,
+        long sourceConnectionGeneration)
     {
-        string? requestMethod = null;
         string? requestId = null;
         if (root.TryGetProperty("id", out var idProp))
         {
             requestId = idProp.GetString();
-            requestMethod = TakePendingRequestMethod(requestId);
         }
 
-        var pendingChatSend = TakePendingChatSend(requestId);
-        if (pendingChatSend != null)
+        _pendingRequests.TryTake(requestId, out var pending);
+        var requestMethod = pending?.Method;
+
+        switch (pending?.Category)
         {
-            if (root.TryGetProperty("ok", out var okChatProp) &&
-                okChatProp.ValueKind == JsonValueKind.False)
+            case PendingRequestCategory.ChatSend:
             {
-                var message = TryGetErrorMessage(root) ?? "request failed";
-                _logger.Warn($"chat.send failed: {message}");
-                pendingChatSend.TrySetException(new InvalidOperationException(message));
+                var pendingChatSend = (ChatSendRequestResolution)pending;
+                if (root.TryGetProperty("ok", out var okChatProp) &&
+                    okChatProp.ValueKind == JsonValueKind.False)
+                {
+                    var message = TryGetErrorMessage(root) ?? "request failed";
+                    _logger.Warn($"chat.send failed: {message}");
+                    pendingChatSend.TryFault(new InvalidOperationException(message));
+                    return;
+                }
+
+                pendingChatSend.TryComplete(ParseChatSendResult(root));
                 return;
             }
 
-            pendingChatSend.TrySetResult(ParseChatSendResult(root));
-            return;
-        }
+            case PendingRequestCategory.Wizard:
+            {
+                var wizardCompletion = (WizardRequestResolution)pending;
+                if (root.TryGetProperty("ok", out var okWiz) &&
+                    okWiz.ValueKind == JsonValueKind.False)
+                {
+                    var message = TryGetErrorMessage(root) ?? "wizard request failed";
+                    wizardCompletion.TryFault(new InvalidOperationException(message));
+                }
+                else if (root.TryGetProperty("payload", out var wizPayload))
+                {
+                    // HIGH: never log the wizard payload body. It can include
+                    // prompts, tool args, and chat content. Log shape only.
+                    var wizardPayloadLen = wizPayload.ValueKind == JsonValueKind.Undefined
+                        ? 0
+                        : wizPayload.GetRawText().Length;
+                    _logger.Info($"Wizard response payload kind={wizPayload.ValueKind} len={wizardPayloadLen}");
+                    wizardCompletion.TryComplete(wizPayload.Clone());
+                }
+                else
+                {
+                    wizardCompletion.TryComplete(root.Clone());
+                }
+                return;
+            }
 
-        // Check for pending wizard response
-        if (requestId != null && _pendingWizardResponses.TryRemove(requestId, out var wizardCompletion))
-        {
-            if (root.TryGetProperty("ok", out var okWiz) && okWiz.ValueKind == JsonValueKind.False)
+            case PendingRequestCategory.Approval:
             {
-                var message = TryGetErrorMessage(root) ?? "wizard request failed";
-                wizardCompletion.TrySetException(new InvalidOperationException(message));
+                var approvalCompletion = (ApprovalRequestResolution)pending;
+                if (root.TryGetProperty("ok", out var okAppr) &&
+                    okAppr.ValueKind == JsonValueKind.False)
+                {
+                    var message = TryGetErrorMessage(root) ?? "exec.approval.resolve rejected";
+                    _logger.Warn($"exec.approval.resolve rejected by gateway: {message}");
+                    approvalCompletion.TryFault(new InvalidOperationException(message));
+                }
+                else
+                {
+                    approvalCompletion.TryComplete(true);
+                }
+                return;
             }
-            else if (root.TryGetProperty("payload", out var wizPayload))
-            {
-                // HIGH: never log the wizard payload body — even after token
-                // sanitisation it can include prompts, tool args, and chat
-                // content. Log shape only; full payload is available in the
-                // gateway's own server-side logs if engineering needs it.
-                var wizardPayloadLen = wizPayload.ValueKind == JsonValueKind.Undefined ? 0 : wizPayload.GetRawText().Length;
-                _logger.Info($"Wizard response payload kind={wizPayload.ValueKind} len={wizardPayloadLen}");
-                wizardCompletion.TrySetResult(wizPayload.Clone());
-            }
-            else
-            {
-                wizardCompletion.TrySetResult(root.Clone());
-            }
-            return;
-        }
-
-        // Approval-resolve completion path. Must run before the generic
-        // HandleRequestError branch below; otherwise an ok:false from the
-        // gateway would only get logged and the awaiting caller would hang
-        // until the 5s timeout. See ClawSweeper review on PR #676.
-        if (requestId != null && _pendingApprovalResolves.TryRemove(requestId, out var approvalCompletion))
-        {
-            if (root.TryGetProperty("ok", out var okAppr) && okAppr.ValueKind == JsonValueKind.False)
-            {
-                var message = TryGetErrorMessage(root) ?? "exec.approval.resolve rejected";
-                _logger.Warn($"exec.approval.resolve rejected by gateway: {message}");
-                approvalCompletion.TrySetException(new InvalidOperationException(message));
-            }
-            else
-            {
-                approvalCompletion.TrySetResult(true);
-            }
-            return;
         }
 
         if (root.TryGetProperty("ok", out var okProp) &&
@@ -2176,10 +2042,11 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         // Handle handshake acknowledgement payload.
         if (payload.TryGetProperty("type", out var t) && t.GetString() == "hello-ok")
         {
-            if (HandshakeAuthorizationAsync is not null &&
+            if (!IsCurrentConnectionGeneration(sourceConnectionGeneration) ||
+                !_handshakeChallengeGate.IsAuthorized(sourceConnectionGeneration) ||
                 !string.Equals(requestMethod, "connect", StringComparison.Ordinal))
             {
-                _logger.Warn("[HANDSHAKE] Ignoring uncorrelated hello-ok on guarded validation connection.");
+                _logger.Warn("[HANDSHAKE] Ignoring stale or uncorrelated hello-ok.");
                 return;
             }
 
@@ -3096,7 +2963,10 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         return null;
     }
 
-    private void HandleEvent(JsonElement root, int rawMessageLength)
+    private void HandleEventForConnection(
+        JsonElement root,
+        int rawMessageLength,
+        long sourceConnectionGeneration)
     {
         if (!root.TryGetProperty("event", out var eventProp)) return;
         var eventType = eventProp.GetString();
@@ -3105,7 +2975,9 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         switch (eventType)
         {
             case "connect.challenge":
-                HandleConnectChallenge(root);
+                HandleConnectChallengeForConnection(
+                    root,
+                    sourceConnectionGeneration);
                 break;
             case "agent":
                 HandleAgentEvent(root, rawMessageLength);
@@ -3338,31 +3210,46 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         }
     }
 
-    private void HandleConnectChallenge(JsonElement root)
+    private void HandleConnectChallenge(JsonElement root) =>
+        HandleConnectChallengeForConnection(root, CurrentConnectionGeneration);
+
+    private void HandleConnectChallengeForConnection(
+        JsonElement root,
+        long sourceConnectionGeneration)
     {
-        if (Volatile.Read(ref _handshakeAuthorizationBlocked) != 0 ||
-            Interlocked.CompareExchange(ref _handshakeChallengeActive, 1, 0) != 0)
+        if (!IsCurrentConnectionGeneration(sourceConnectionGeneration))
+            return;
+
+        if (!root.TryGetProperty("payload", out var payload) ||
+            payload.ValueKind != JsonValueKind.Object)
         {
-            _logger.Warn("[HANDSHAKE] Ignoring duplicate challenge on the current socket.");
+            _logger.Warn("[HANDSHAKE] Ignoring malformed challenge without an object payload.");
             return;
         }
 
         string? nonce = null;
-        long? ts = null;
-        if (root.TryGetProperty("payload", out var payload))
+        if (payload.TryGetProperty("nonce", out var nonceProp))
         {
-            if (payload.TryGetProperty("nonce", out var nonceProp))
+            if (nonceProp.ValueKind != JsonValueKind.String)
             {
-                nonce = nonceProp.GetString();
+                _logger.Warn("[HANDSHAKE] Ignoring malformed challenge with a non-string nonce.");
+                return;
             }
-            ts = ConnectAuthTimestamp.ReadChallengeTimestamp(payload);
+            nonce = nonceProp.GetString();
+        }
+        var ts = ConnectAuthTimestamp.ReadChallengeTimestamp(payload);
+
+        if (!_handshakeChallengeGate.TryBegin(sourceConnectionGeneration))
+        {
+            _logger.Warn("[HANDSHAKE] Ignoring duplicate challenge on the current socket.");
+            return;
         }
 
         _challengeTimestampMs = ts;
         _currentChallengeNonce = nonce;
         
         _logger.Info($"[HANDSHAKE] Received connect.challenge: nonce={nonce}, ts={ts}");
-        _ = SendConnectSafeAsync(nonce, CurrentConnectionGeneration);
+        _ = SendConnectSafeAsync(nonce, sourceConnectionGeneration);
     }
 
     private async Task SendConnectSafeAsync(string? nonce, long connectionGeneration)
@@ -3371,36 +3258,58 @@ public partial class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatew
         {
             if (HandshakeAuthorizationAsync is not null)
             {
-                var authorization = await HandshakeAuthorizationAsync(CancellationToken.None)
+                var authorization = await HandshakeAuthorizationAsync(CancellationToken)
                     .ConfigureAwait(false);
                 if (!IsCurrentConnectionGeneration(connectionGeneration))
                     return;
                 if (!authorization.Allowed)
                 {
-                    Volatile.Write(ref _handshakeAuthorizationBlocked, 1);
+                    if (!_handshakeChallengeGate.TryBlock(connectionGeneration))
+                        return;
+                    _logger.Warn(
+                        $"[HANDSHAKE] Operator credential handoff blocked: {authorization.Detail}");
                     RaiseConnectionFailure(authorization.FailureKind);
-                    RaiseAuthenticationFailed(
-                        authorization.Detail ?? "Connection authorization failed.");
+                    if (authorization.FailureKind is GatewayErrorKind.Auth
+                        or GatewayErrorKind.DeviceTokenMismatch
+                        or GatewayErrorKind.TokenDrift)
+                    {
+                        RaiseAuthenticationFailed(
+                            authorization.Detail ?? "Connection authorization failed.");
+                    }
                     AbortCurrentWebSocket(connectionGeneration);
                     RaiseStatusChanged(ConnectionStatus.Error);
                     return;
                 }
+                if (!_handshakeChallengeGate.TryAuthorize(connectionGeneration))
+                    return;
+            }
+            else if (!_handshakeChallengeGate.TryAuthorize(connectionGeneration))
+            {
+                return;
             }
 
-            if (!IsCurrentConnectionGeneration(connectionGeneration) ||
-                Volatile.Read(ref _handshakeAuthorizationBlocked) != 0)
-                return;
-
-            await SendConnectMessageAsync(nonce);
+            var sent = await SendConnectMessageAsync(
+                    nonce,
+                    connectionGeneration,
+                    CancellationToken)
+                .ConfigureAwait(false);
+            if (!sent && IsCurrentConnectionGeneration(connectionGeneration))
+                AbortCurrentWebSocket(connectionGeneration);
+        }
+        catch (OperationCanceledException) when (
+            CancellationToken.IsCancellationRequested ||
+            !IsCurrentConnectionGeneration(connectionGeneration))
+        {
         }
         catch (Exception ex)
         {
             _logger.Error($"[HANDSHAKE] FATAL: SendConnectMessageAsync threw: {ex}");
-        }
-        finally
-        {
-            if (IsCurrentConnectionGeneration(connectionGeneration))
-                Volatile.Write(ref _handshakeChallengeActive, 0);
+            if (_handshakeChallengeGate.TryBlock(connectionGeneration))
+            {
+                RaiseConnectionFailure(GatewayErrorKind.Network);
+                AbortCurrentWebSocket(connectionGeneration);
+                RaiseStatusChanged(ConnectionStatus.Error);
+            }
         }
     }
 
